@@ -1,0 +1,12 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.vs/
+*.suo
+*.wsuo
+*.sqlite
+old_erp.sqlite
+erp_database.sqlite
+~$*.xlsx
