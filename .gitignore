@@ -10,3 +10,5 @@ __pycache__/
 old_erp.sqlite
 erp_database.sqlite
 ~$*.xlsx
+legacy_import_status.json
+.legacy_import_once.marker

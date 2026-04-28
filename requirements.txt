@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+google-generativeai
+PyJWT
+python-multipart
+openpyxl
+requests

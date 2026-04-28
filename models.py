@@ -16,6 +16,8 @@ class Client(Base):
     name = Column(String, unique=True, index=True, nullable=False)
     active = Column(Boolean, default=True)
     excess_funds = Column(Float, default=0.0)
+    display_currency = Column(String, default="INR")
+    exchange_rate = Column(Float, default=83.0)
     
     invoices = relationship("Invoice", back_populates="client", cascade="all, delete-orphan")
     purchase_orders = relationship("PurchaseOrder", back_populates="client", cascade="all, delete-orphan")
@@ -26,6 +28,11 @@ class PurchaseOrder(Base):
     id = Column(Integer, primary_key=True, index=True)
     client_id = Column(Integer, ForeignKey("clients.id"), index=True)
     po_no = Column(String, index=True, nullable=False, unique=True)
+    contact_person = Column(String, nullable=True)
+    project_name = Column(String, nullable=True)
+    is_completed = Column(Boolean, default=False)
+    is_hidden = Column(Boolean, default=False)
+    completed_at = Column(Date, nullable=True)
     
     adv_pct = Column(Float, default=0.0)
     ret_pct = Column(Float, default=0.0)
@@ -49,6 +56,7 @@ class PoBaselineItem(Base):
     ordered_qty = Column(Float, default=0.0)
     inspected_qty = Column(Float, default=0.0) # NEW COLUMN
     uom = Column(String, nullable=True)
+    material_type = Column(String, nullable=True)  # brick | castable_mortar
     
     purchase_order = relationship("PurchaseOrder", back_populates="baseline_items")
 
@@ -121,8 +129,35 @@ class PaymentAllocation(Base):
 
     payment = relationship("PaymentHistory", back_populates="allocations")
 
+
+class UnallocatedPaymentRegister(Base):
+    __tablename__ = "unallocated_payment_register"
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), index=True, nullable=False)
+    source_payment_id = Column(String, ForeignKey("payment_history.id"), index=True, nullable=True)
+    created_on = Column(Date, nullable=False)
+    amount = Column(Float, default=0.0)
+    balance = Column(Float, default=0.0)
+    status = Column(String, default="open")
+    note = Column(Text, nullable=True)
+
+
+class UnallocatedAdvanceRegister(Base):
+    __tablename__ = "unallocated_advance_register"
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), index=True, nullable=False)
+    source_payment_id = Column(String, ForeignKey("payment_history.id"), index=True, nullable=True)
+    po_no = Column(String, nullable=True)
+    created_on = Column(Date, nullable=False)
+    amount = Column(Float, default=0.0)
+    balance = Column(Float, default=0.0)
+    status = Column(String, default="open")
+    note = Column(Text, nullable=True)
+
 class SystemSettings(Base):
     __tablename__ = "system_settings"
     id = Column(Integer, primary_key=True, index=True)
     exchange_rate = Column(Float, default=83.0)
     custom_columns = Column(Text, default="[]") # Stored safely as a JSON string
+    fy_start_month = Column(Integer, default=4)
+    fy_start_day = Column(Integer, default=1)

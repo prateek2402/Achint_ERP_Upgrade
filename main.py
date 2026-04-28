@@ -8,13 +8,18 @@ import hashlib
 import hmac
 import base64
 import secrets
+import sqlite3
+import shutil
+import threading
+import io
+from pathlib import Path
 from collections import defaultdict, deque
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Security, Request, Response, Query
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, func
+from sqlalchemy import create_engine, func, or_
 from sqlalchemy.orm import sessionmaker, Session, joinedload, selectinload
 from pydantic import BaseModel
 import google.generativeai as genai
@@ -22,11 +27,18 @@ import jwt
 import datetime
 from typing import Optional
 import json
+from decimal import Decimal, ROUND_HALF_UP
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+except Exception:
+    Workbook = None
+    Font = PatternFill = Alignment = None
 
 from models import (
     Base, User, Client, PurchaseOrder, PoBaselineItem, 
     InvoiceDispatchItem, Invoice, PaymentHistory, 
-    PaymentAllocation, SystemSettings
+    PaymentAllocation, SystemSettings, UnallocatedPaymentRegister, UnallocatedAdvanceRegister
 )
 
 def load_local_env_file():
@@ -59,8 +71,83 @@ if GEMINI_API_KEY:
 DATABASE_URL = "sqlite:///./erp_database.sqlite"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+LEGACY_IMPORT_STATUS_PATH = Path("legacy_import_status.json")
+DB_FILE_PATH = Path("erp_database.sqlite")
+BACKUP_DIR = Path(os.getenv("DB_BACKUP_DIR", "db_backups"))
+BACKUP_INTERVAL_SECONDS = int(os.getenv("DB_BACKUP_INTERVAL_SECONDS", str(24 * 60 * 60)))
+_backup_thread_started = False
+_write_serialization_lock = threading.Lock()
 
 Base.metadata.create_all(bind=engine)
+
+
+def ensure_schema_columns():
+    conn = sqlite3.connect(str(DB_FILE_PATH))
+    cur = conn.cursor()
+    try:
+        cur.execute("PRAGMA table_info(clients)")
+        client_cols = {row[1] for row in cur.fetchall()}
+        if "display_currency" not in client_cols:
+            cur.execute("ALTER TABLE clients ADD COLUMN display_currency TEXT DEFAULT 'INR'")
+        if "exchange_rate" not in client_cols:
+            cur.execute("ALTER TABLE clients ADD COLUMN exchange_rate REAL DEFAULT 83.0")
+
+        cur.execute("PRAGMA table_info(purchase_orders)")
+        cols = {row[1] for row in cur.fetchall()}
+        if "contact_person" not in cols:
+            cur.execute("ALTER TABLE purchase_orders ADD COLUMN contact_person TEXT")
+        if "project_name" not in cols:
+            cur.execute("ALTER TABLE purchase_orders ADD COLUMN project_name TEXT")
+        if "is_completed" not in cols:
+            cur.execute("ALTER TABLE purchase_orders ADD COLUMN is_completed INTEGER DEFAULT 0")
+        if "is_hidden" not in cols:
+            cur.execute("ALTER TABLE purchase_orders ADD COLUMN is_hidden INTEGER DEFAULT 0")
+        if "completed_at" not in cols:
+            cur.execute("ALTER TABLE purchase_orders ADD COLUMN completed_at TEXT")
+
+        cur.execute("PRAGMA table_info(po_baseline_items)")
+        baseline_cols = {row[1] for row in cur.fetchall()}
+        if "material_type" not in baseline_cols:
+            cur.execute("ALTER TABLE po_baseline_items ADD COLUMN material_type TEXT")
+
+        cur.execute("PRAGMA table_info(system_settings)")
+        settings_cols = {row[1] for row in cur.fetchall()}
+        if "fy_start_month" not in settings_cols:
+            cur.execute("ALTER TABLE system_settings ADD COLUMN fy_start_month INTEGER DEFAULT 4")
+        if "fy_start_day" not in settings_cols:
+            cur.execute("ALTER TABLE system_settings ADD COLUMN fy_start_day INTEGER DEFAULT 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def perform_database_backup():
+    try:
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
+        backup_path = BACKUP_DIR / f"erp_database_{ts}.sqlite"
+        if DB_FILE_PATH.exists():
+            shutil.copy2(DB_FILE_PATH, backup_path)
+            print(f"[INFO] Daily backup created: {backup_path}")
+    except Exception as exc:
+        print(f"[WARN] Daily backup failed: {exc}")
+
+
+def start_daily_backup_worker():
+    global _backup_thread_started
+    if _backup_thread_started:
+        return
+    _backup_thread_started = True
+
+    def _worker():
+        while True:
+            perform_database_backup()
+            time.sleep(max(3600, BACKUP_INTERVAL_SECONDS))
+
+    threading.Thread(target=_worker, name="daily-db-backup", daemon=True).start()
+
+
+ensure_schema_columns()
 
 APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
 ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", "1" if APP_ENV != "production" else "0").strip() == "1"
@@ -195,7 +282,12 @@ def record_login_failure(user_key: str):
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
-    response: Response = await call_next(request)
+    write_methods = {"POST", "PUT", "PATCH", "DELETE"}
+    if request.method.upper() in write_methods:
+        with _write_serialization_lock:
+            response: Response = await call_next(request)
+    else:
+        response: Response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -240,6 +332,8 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Security(securi
 # --- App Startup: Default Admin ---
 @app.on_event("startup")
 def startup_event():
+    ensure_schema_columns()
+    start_daily_backup_worker()
     db = SessionLocal()
     bootstrap_username = os.getenv("BOOTSTRAP_ADMIN_USERNAME", "").strip()
     bootstrap_password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "").strip()
@@ -288,6 +382,7 @@ class BaselineItemCreate(BaseModel):
     ordered_qty: float
     inspected_qty: Optional[float] = 0.0 # NEW COLUMN
     uom: str
+    material_type: Optional[str] = None
 
 class DispatchItemCreate(BaseModel):
     description: str
@@ -298,6 +393,8 @@ class DispatchItemCreate(BaseModel):
 class POCreate(BaseModel):
     client_id: int
     po_no: str
+    contact_person: Optional[str] = None
+    project_name: Optional[str] = None
     adv_pct: float = 0.0
     ret_pct: float = 0.0
     ret_base: str = "total"
@@ -331,6 +428,47 @@ class InvoiceCreate(BaseModel):
 class InvoiceUpdate(InvoiceCreate):
     pass
 
+
+class LedgerExportRequest(BaseModel):
+    invoice_nos: list[str]
+
+
+class DispatchItemUpdate(BaseModel):
+    description: str
+    qty: float
+    inspected_qty: Optional[float] = 0.0
+    uom: Optional[str] = "Nos"
+    merge_on_match: bool = True
+
+
+class DispatchCellUpsert(BaseModel):
+    invoice_no: str
+    description: str
+    uom: Optional[str] = "Nos"
+    qty: float
+
+
+class DispatchColumnDeleteRequest(BaseModel):
+    po_no: str
+    description: str
+    uom: Optional[str] = None
+    client_id: Optional[int] = None
+
+
+class DispatchColumnRenameRequest(BaseModel):
+    po_no: str
+    old_description: str
+    old_uom: Optional[str] = None
+    new_description: str
+    new_uom: Optional[str] = None
+    client_id: Optional[int] = None
+
+
+class InvoiceInlineUpdate(BaseModel):
+    inv_date: Optional[str] = None
+    lr_no: Optional[str] = None
+    total: Optional[float] = None
+
 class PaymentUpdate(BaseModel):
     amount: float
     note: str
@@ -356,6 +494,7 @@ class PaymentAllocateRequest(BaseModel):
     move_to_po: Optional[str] = None
     po_no: Optional[str] = None
     clear_po_pool: bool = False
+    excess_action: str = "park"  # park | allocate_pending
 
 class TransferRequest(BaseModel):
     new_client_id: int
@@ -478,16 +617,37 @@ class SettingsSchema(BaseModel):
     exchangeRate: float
     customColumns: list
 
+
+class FiscalYearConfigSchema(BaseModel):
+    startMonth: int
+    startDay: int
+
+
+class ClientCurrencySchema(BaseModel):
+    displayCurrency: str
+    exchangeRate: float
+
+
+class POStatusSchema(BaseModel):
+    is_completed: bool
+    is_hidden: bool = False
+
 # --- PHASE 4: GLOBAL SETTINGS ---
 @app.get("/api/settings")
-def get_settings(db: Session = Depends(get_db)):
+def get_settings(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role == "logistics":
+        raise HTTPException(status_code=403, detail="Logistics role cannot access financial settings.")
     settings = db.query(SystemSettings).first()
     if not settings:
         settings = SystemSettings(exchange_rate=83.0, custom_columns="[]")
         db.add(settings)
         db.commit()
         db.refresh(settings)
-    return {"exchangeRate": settings.exchange_rate, "customColumns": json.loads(settings.custom_columns)}
+    return {
+        "exchangeRate": settings.exchange_rate,
+        "customColumns": json.loads(settings.custom_columns),
+        "fiscalYearStart": {"month": int(settings.fy_start_month or 4), "day": int(settings.fy_start_day or 1)}
+    }
 
 @app.post("/api/settings")
 def update_settings(data: SettingsSchema, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -504,11 +664,65 @@ def update_settings(data: SettingsSchema, current_user: User = Depends(get_curre
     db.commit()
     return {"success": True}
 
+
+@app.put("/api/settings/fiscal-year")
+def update_fiscal_year_settings(data: FiscalYearConfigSchema, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if data.startMonth < 1 or data.startMonth > 12 or data.startDay < 1 or data.startDay > 31:
+        raise HTTPException(status_code=400, detail="Invalid fiscal year start date.")
+    settings = db.query(SystemSettings).first()
+    if not settings:
+        settings = SystemSettings()
+        db.add(settings)
+    settings.fy_start_month = data.startMonth
+    settings.fy_start_day = data.startDay
+    db.commit()
+    return {"success": True}
+
+
+@app.put("/api/clients/{client_id}/currency")
+def update_client_currency(client_id: int, data: ClientCurrencySchema, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    currency = (data.displayCurrency or "INR").upper().strip()
+    if currency not in ("INR", "USD"):
+        raise HTTPException(status_code=400, detail="Currency must be INR or USD.")
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    client.display_currency = currency
+    client.exchange_rate = max(0.0001, float(data.exchangeRate or 83.0))
+    db.commit()
+    return {"success": True}
+
+
+@app.get("/api/admin/legacy-import-status")
+def get_legacy_import_status(current_user: User = Depends(get_current_user)):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if not LEGACY_IMPORT_STATUS_PATH.exists():
+        return {"available": False}
+    try:
+        payload = json.loads(LEGACY_IMPORT_STATUS_PATH.read_text(encoding="utf-8"))
+        return {"available": True, "status": payload}
+    except Exception:
+        raise HTTPException(status_code=500, detail="Legacy import status file is unreadable.")
+
 # --- PHASE 3: STRICT RELATIONAL CLIENT ENDPOINTS ---
 @app.get("/api/clients")
 def get_clients(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role == "logistics":
+        raise HTTPException(status_code=403, detail="Logistics role cannot access client financial records.")
     clients = db.query(Client).all()
-    return [{"id": c.id, "name": c.name, "active": c.active, "excess_funds": c.excess_funds} for c in clients]
+    return [{
+        "id": c.id,
+        "name": c.name,
+        "active": c.active,
+        "excess_funds": c.excess_funds,
+        "display_currency": c.display_currency or "INR",
+        "exchange_rate": c.exchange_rate or 83.0
+    } for c in clients]
 
 @app.post("/api/clients")
 def create_client(client: ClientCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -517,10 +731,10 @@ def create_client(client: ClientCreate, current_user: User = Depends(get_current
     existing = db.query(Client).filter(Client.name == client.name).first()
     if existing:
         raise HTTPException(status_code=400, detail="Account already exists.")
-    new_client = Client(name=client.name, active=True, excess_funds=0.0)
+    new_client = Client(name=client.name, active=True, excess_funds=0.0, display_currency="INR", exchange_rate=83.0)
     db.add(new_client)
     db.commit()
-    return {"success": True, "id": new_client.id, "name": new_client.name}
+    return {"success": True, "id": new_client.id, "name": new_client.name, "display_currency": "INR", "exchange_rate": 83.0}
 
 @app.delete("/api/clients/{client_id}")
 def delete_client(client_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -534,15 +748,33 @@ def delete_client(client_id: int, current_user: User = Depends(get_current_user)
     return {"success": True}
 
 @app.get("/api/purchase-orders")
-def get_purchase_orders(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    pos = db.query(PurchaseOrder).options(selectinload(PurchaseOrder.baseline_items)).all()
+def get_purchase_orders(include_completed: bool = True, include_hidden: bool = False, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role == "logistics":
+        raise HTTPException(status_code=403, detail="Logistics role cannot access PO financial configuration.")
+    query = db.query(PurchaseOrder).options(selectinload(PurchaseOrder.baseline_items))
+    if not include_completed:
+        query = query.filter(PurchaseOrder.is_completed == False)
+    if not include_hidden:
+        query = query.filter(PurchaseOrder.is_hidden == False)
+    pos = query.all()
     result = []
     for po in pos:
-        items = [{"description": item.description, "ordered_qty": item.ordered_qty, "uom": item.uom} for item in po.baseline_items]
+        items = [{
+            "description": item.description,
+            "ordered_qty": item.ordered_qty,
+            "inspected_qty": item.inspected_qty,
+            "uom": item.uom,
+            "material_type": item.material_type
+        } for item in po.baseline_items]
         result.append({
             "id": po.id,
             "client_id": po.client_id,
             "po_no": po.po_no,
+            "contact_person": po.contact_person,
+            "project_name": po.project_name,
+            "is_completed": bool(po.is_completed),
+            "is_hidden": bool(po.is_hidden),
+            "completed_at": po.completed_at.isoformat() if po.completed_at else None,
             "adv_pct": po.adv_pct,
             "ret_pct": po.ret_pct,
             "ret_base": po.ret_base,
@@ -555,27 +787,33 @@ def get_purchase_orders(current_user: User = Depends(get_current_user), db: Sess
 
 @app.post("/api/purchase-orders")
 def create_purchase_order(po: POCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # ALLOW BOTH ADMIN AND LOGISTICS TO SAVE DATA TO POs
-    if current_user.role not in ["admin", "logistics"]:
-        raise HTTPException(status_code=403, detail="Admin or Logistics access required")
+    if current_user.role not in ["admin", "logistics", "user"]:
+        raise HTTPException(status_code=403, detail="Authorized operations access required")
     
     existing_po = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po.po_no).first()
     
     if existing_po:
         # UPSERT: Update the existing lazily-created PO with strict financial terms
-        existing_po.adv_pct = po.adv_pct
-        existing_po.ret_pct = po.ret_pct
-        existing_po.ret_base = po.ret_base
-        existing_po.tds_enabled = po.tds_enabled
-        existing_po.tds_rate = po.tds_rate
-        existing_po.tds_threshold = po.tds_threshold
+        existing_po.contact_person = po.contact_person
+        existing_po.project_name = po.project_name
+        if current_user.role == "admin":
+            existing_po.adv_pct = po.adv_pct
+            existing_po.ret_pct = po.ret_pct
+            existing_po.ret_base = po.ret_base
+            existing_po.tds_enabled = po.tds_enabled
+            existing_po.tds_rate = po.tds_rate
+            existing_po.tds_threshold = po.tds_threshold
         po_id = existing_po.id
     else:
         # INSERT: Brand new PO from the terms configurator
         new_po = PurchaseOrder(
-            client_id=po.client_id, po_no=po.po_no, adv_pct=po.adv_pct,
-            ret_pct=po.ret_pct, ret_base=po.ret_base, tds_enabled=po.tds_enabled,
-            tds_rate=po.tds_rate, tds_threshold=po.tds_threshold
+            client_id=po.client_id, po_no=po.po_no, contact_person=po.contact_person, project_name=po.project_name,
+            adv_pct=(po.adv_pct if current_user.role == "admin" else 0.0),
+            ret_pct=(po.ret_pct if current_user.role == "admin" else 0.0),
+            ret_base=(po.ret_base if current_user.role == "admin" else "total"),
+            tds_enabled=(po.tds_enabled if current_user.role == "admin" else False),
+            tds_rate=(po.tds_rate if current_user.role == "admin" else 0.0),
+            tds_threshold=(po.tds_threshold if current_user.role == "admin" else 0.0)
         )
         db.add(new_po)
         db.flush()
@@ -585,17 +823,47 @@ def create_purchase_order(po: POCreate, current_user: User = Depends(get_current
     db.query(PoBaselineItem).filter(PoBaselineItem.po_id == po_id).delete()
     
     for item in po.baseline_items:
-        new_item = PoBaselineItem(po_id=po_id, description=item.description, ordered_qty=item.ordered_qty, inspected_qty=item.inspected_qty, uom=item.uom)
+        mt = (item.material_type or "").strip().lower() if item.material_type else None
+        if mt not in ("brick", "castable_mortar"):
+            mt = None
+        new_item = PoBaselineItem(
+            po_id=po_id,
+            description=item.description,
+            ordered_qty=item.ordered_qty,
+            inspected_qty=item.inspected_qty,
+            uom=item.uom,
+            material_type=mt
+        )
         db.add(new_item)
         
     db.commit()
     return {"success": True, "po_id": po_id}
 
+
+@app.put("/api/purchase-orders/{po_no:path}/status")
+def update_purchase_order_status(po_no: str, status: POStatusSchema, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
+    if payload.client_id:
+        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
+    po = po_query.first()
+    if not po:
+        raise HTTPException(status_code=404, detail="PO not found")
+    po.is_completed = bool(status.is_completed)
+    po.is_hidden = bool(status.is_hidden)
+    po.completed_at = datetime.date.today() if po.is_completed else None
+    db.commit()
+    return {"success": True}
+
 @app.delete("/api/purchase-orders/{po_no:path}")
 def delete_purchase_order(po_no: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    po = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no).first()
+    po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
+    if payload.client_id:
+        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
+    po = po_query.first()
     if po:
         client_id = po.client_id
         db.delete(po)
@@ -629,7 +897,7 @@ def get_logistics_dispatch_summary(
             "rows": []
         }
 
-    active_clients = db.query(Client).filter(Client.active == True).all()
+    active_clients = db.query(Client).filter(or_(Client.active == True, Client.active.is_(None))).all()
     if not active_clients:
         return _empty_dispatch_summary()
 
@@ -651,6 +919,9 @@ def get_logistics_dispatch_summary(
     ).all()
 
     dispatch_map: dict[tuple[int, str], float] = defaultdict(float)
+    dispatch_inspected_map: dict[tuple[int, str], float] = defaultdict(float)
+    po_dispatch_totals: dict[int, float] = defaultdict(float)
+    po_dispatch_descriptions: dict[int, set[str]] = defaultdict(set)
     for inv in invoices:
         if not inv.po_id:
             continue
@@ -658,6 +929,9 @@ def get_logistics_dispatch_summary(
             key = (inv.po_id, (item.description or "").strip().upper())
             if key[1]:
                 dispatch_map[key] += float(item.dispatched_qty or 0.0)
+                dispatch_inspected_map[key] += float(item.inspected_qty or 0.0)
+                po_dispatch_totals[inv.po_id] += float(item.dispatched_qty or 0.0)
+                po_dispatch_descriptions[inv.po_id].add(key[1])
 
     rows = []
     total_ordered_qty = 0.0
@@ -668,6 +942,25 @@ def get_logistics_dispatch_summary(
     for po in pos:
         baseline_items = po.baseline_items or []
         if not baseline_items:
+            # Legacy-safe fallback: show statement rows even when baseline lines are missing.
+            dispatched_fallback = float(po_dispatch_totals.get(po.id, 0.0))
+            if dispatched_fallback <= 0.0001:
+                continue
+            rows.append({
+                "client": client_by_id.get(po.client_id, "Unknown"),
+                "po_no": po.po_no,
+                "project_name": po.project_name,
+                "contact_person": po.contact_person,
+                "material_lines": len(po_dispatch_descriptions.get(po.id, set())),
+                "pending_lines": 0,
+                "ordered_qty": dispatched_fallback,
+                "dispatched_qty": dispatched_fallback,
+                "inspected_qty": 0.0,
+                "pending_qty": 0.0,
+                "completion": 100.0
+            })
+            total_ordered_qty += dispatched_fallback
+            total_dispatched_qty += dispatched_fallback
             continue
 
         ordered_qty = 0.0
@@ -681,11 +974,12 @@ def get_logistics_dispatch_summary(
             inspected = float(base.inspected_qty or 0.0)
             desc_key = (base.description or "").strip().upper()
             dispatched = dispatch_map.get((po.id, desc_key), 0.0) if desc_key else 0.0
+            inspected_actual = dispatch_inspected_map.get((po.id, desc_key), 0.0) if desc_key else 0.0
             pending = max(0.0, ordered - dispatched)
 
             ordered_qty += ordered
             dispatched_qty += dispatched
-            inspected_qty += inspected
+            inspected_qty += max(inspected, inspected_actual)
             pending_qty += pending
             if pending > 0.0001:
                 pending_lines += 1
@@ -701,6 +995,8 @@ def get_logistics_dispatch_summary(
         rows.append({
             "client": client_by_id.get(po.client_id, "Unknown"),
             "po_no": po.po_no,
+            "project_name": po.project_name,
+            "contact_person": po.contact_person,
             "material_lines": len(baseline_items),
             "pending_lines": pending_lines,
             "ordered_qty": ordered_qty,
@@ -748,6 +1044,440 @@ def get_logistics_dispatch_summary(
     }
 
 
+@app.get("/api/logistics/dispatch-detail")
+def get_logistics_dispatch_detail(
+    client: str = Query(..., description="Client name"),
+    po_no: str = Query(..., description="Purchase order number"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role not in ["admin", "logistics"]:
+        raise HTTPException(status_code=403, detail="Admin or Logistics access required")
+
+    client_name = (client or "").strip()
+    po_no_val = (po_no or "").strip()
+    if not client_name or not po_no_val:
+        raise HTTPException(status_code=400, detail="client and po_no are required")
+
+    po = db.query(PurchaseOrder).options(selectinload(PurchaseOrder.baseline_items)).join(Client).filter(
+        Client.name == client_name,
+        Client.active == True,
+        PurchaseOrder.po_no == po_no_val
+    ).first()
+    if not po:
+        raise HTTPException(status_code=404, detail="Dispatch statement not found")
+
+    invoices = db.query(Invoice).options(selectinload(Invoice.dispatch_items)).filter(
+        Invoice.po_id == po.id,
+        Invoice.is_note == False
+    ).all()
+
+    dispatch_by_desc: dict[str, float] = defaultdict(float)
+    invoice_rows = []
+    for inv in invoices:
+        for item in inv.dispatch_items:
+            key = (item.description or "").strip().upper()
+            qty = float(item.dispatched_qty or 0.0)
+            if key:
+                dispatch_by_desc[key] += qty
+            invoice_rows.append({
+                "dispatch_item_id": item.id,
+                "invoice_no": inv.invoice_no,
+                "invoice_date": inv.inv_date.isoformat() if inv.inv_date else None,
+                "description": item.description or "",
+                "dispatched_qty": qty,
+                "inspected_qty": float(item.inspected_qty or 0.0),
+                "uom": item.uom or ""
+            })
+
+    summary_rows = []
+    total_ordered = 0.0
+    total_dispatched = 0.0
+    for base in (po.baseline_items or []):
+        ordered = float(base.ordered_qty or 0.0)
+        dispatched = float(dispatch_by_desc.get((base.description or "").strip().upper(), 0.0))
+        pending = max(0.0, ordered - dispatched)
+        total_ordered += ordered
+        total_dispatched += dispatched
+        summary_rows.append({
+            "description": base.description or "",
+            "uom": base.uom or "",
+            "ordered_qty": ordered,
+            "inspected_qty": float(base.inspected_qty or 0.0),
+            "material_type": base.material_type or None,
+            "dispatched_qty": dispatched,
+            "pending_qty": pending
+        })
+
+    invoice_rows.sort(key=lambda r: (r["invoice_date"] or "9999-12-31", r["invoice_no"], r["dispatch_item_id"]))
+    completion = min(100.0, (total_dispatched / total_ordered) * 100.0) if total_ordered > 0 else 0.0
+    return {
+        "overview": {
+            "client": client_name,
+            "po_no": po_no_val,
+            "project_name": po.project_name,
+            "contact_person": po.contact_person,
+            "ordered_qty": total_ordered,
+            "dispatched_qty": total_dispatched,
+            "pending_qty": max(0.0, total_ordered - total_dispatched),
+            "completion_pct": completion
+        },
+        "summary_rows": summary_rows,
+        "invoice_rows": invoice_rows
+    }
+
+
+@app.get("/api/dispatch/export-xlsx")
+def export_dispatch_detail_xlsx(
+    client: str = Query(..., description="Client name"),
+    po_no: str = Query(..., description="Purchase order number"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if Workbook is None:
+        raise HTTPException(status_code=500, detail="Excel export dependency missing. Install openpyxl.")
+    if current_user.role not in ["admin", "logistics", "user"]:
+        raise HTTPException(status_code=403, detail="Authorized operations access required")
+
+    client_name = (client or "").strip()
+    po_no_val = (po_no or "").strip()
+    if not client_name or not po_no_val:
+        raise HTTPException(status_code=400, detail="client and po_no are required")
+
+    po = db.query(PurchaseOrder).options(selectinload(PurchaseOrder.baseline_items)).join(Client).filter(
+        Client.name == client_name,
+        PurchaseOrder.po_no == po_no_val
+    ).first()
+    if not po:
+        raise HTTPException(status_code=404, detail="Dispatch statement not found")
+
+    invoices = db.query(Invoice).options(selectinload(Invoice.dispatch_items)).filter(
+        Invoice.po_id == po.id,
+        Invoice.is_note == False
+    ).all()
+
+    dispatch_by_desc: dict[str, float] = defaultdict(float)
+    invoice_rows = []
+    for inv in invoices:
+        for item in inv.dispatch_items:
+            key = (item.description or "").strip().upper()
+            qty = float(item.dispatched_qty or 0.0)
+            if key:
+                dispatch_by_desc[key] += qty
+            invoice_rows.append({
+                "invoice_no": inv.invoice_no,
+                "invoice_date": inv.inv_date.isoformat() if inv.inv_date else "",
+                "description": item.description or "",
+                "dispatched_qty": qty,
+                "inspected_qty": float(item.inspected_qty or 0.0),
+                "uom": item.uom or ""
+            })
+
+    summary_rows = []
+    total_ordered = 0.0
+    total_dispatched = 0.0
+    for base in (po.baseline_items or []):
+        ordered = float(base.ordered_qty or 0.0)
+        dispatched = float(dispatch_by_desc.get((base.description or "").strip().upper(), 0.0))
+        pending = max(0.0, ordered - dispatched)
+        total_ordered += ordered
+        total_dispatched += dispatched
+        summary_rows.append({
+            "description": base.description or "",
+            "uom": base.uom or "",
+            "ordered_qty": ordered,
+            "inspected_qty": float(base.inspected_qty or 0.0),
+            "material_type": base.material_type or None,
+            "dispatched_qty": dispatched,
+            "pending_qty": pending
+        })
+
+    wb = Workbook()
+    ws_summary = wb.active
+    ws_summary.title = "Summary"
+    ws_invoice = wb.create_sheet("InvoiceWise")
+
+    header_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    title_font = Font(bold=True, size=12)
+
+    ws_summary["A1"] = f"Dispatch Statement: {client_name} | PO: {po_no_val}"
+    ws_summary["A1"].font = title_font
+    ws_summary.merge_cells("A1:F1")
+    ws_summary.append(["Material Description", "UOM", "Ordered Qty", "Dispatched Qty", "Inspected Qty", "Pending Qty"])
+    for c in ws_summary[2]:
+        c.fill = header_fill
+        c.font = header_font
+        c.alignment = Alignment(horizontal="center")
+    for row in summary_rows:
+        ws_summary.append([
+            row["description"],
+            row["uom"],
+            round(row["ordered_qty"], 2),
+            round(row["dispatched_qty"], 2),
+            round(row["inspected_qty"], 2),
+            round(row["pending_qty"], 2),
+        ])
+    ws_summary.append(["TOTAL", "", round(total_ordered, 2), round(total_dispatched, 2), "", round(max(0.0, total_ordered - total_dispatched), 2)])
+    for c in ws_summary[ws_summary.max_row]:
+        c.font = Font(bold=True)
+
+    ws_invoice["A1"] = f"Invoice-wise Dispatch: {client_name} | PO: {po_no_val}"
+    ws_invoice["A1"].font = title_font
+    ws_invoice.merge_cells("A1:F1")
+    ws_invoice.append(["Invoice No", "Invoice Date", "Material Description", "Dispatched Qty", "Inspected Qty", "UOM"])
+    for c in ws_invoice[2]:
+        c.fill = header_fill
+        c.font = header_font
+        c.alignment = Alignment(horizontal="center")
+    for row in invoice_rows:
+        ws_invoice.append([
+            row["invoice_no"],
+            row["invoice_date"],
+            row["description"],
+            round(row["dispatched_qty"], 2),
+            round(row["inspected_qty"], 2),
+            row["uom"],
+        ])
+
+    for ws in [ws_summary, ws_invoice]:
+        ws.column_dimensions["A"].width = 48
+        ws.column_dimensions["B"].width = 14
+        ws.column_dimensions["C"].width = 16
+        ws.column_dimensions["D"].width = 16
+        ws.column_dimensions["E"].width = 16
+        ws.column_dimensions["F"].width = 16
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    safe_client = re.sub(r"[^A-Za-z0-9._-]+", "_", client_name)
+    safe_po = re.sub(r"[^A-Za-z0-9._-]+", "_", po_no_val)
+    filename = f"dispatch_{safe_client}_{safe_po}.xlsx"
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+@app.post("/api/ledger/export-xlsx")
+def export_ledger_xlsx(
+    payload: LedgerExportRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if Workbook is None:
+        raise HTTPException(status_code=500, detail="Excel export dependency missing. Install openpyxl.")
+    if current_user.role == "logistics":
+        raise HTTPException(status_code=403, detail="Logistics role cannot access financial invoice data.")
+
+    invoice_nos = [str(x or "").strip() for x in (payload.invoice_nos or []) if str(x or "").strip()]
+    if not invoice_nos:
+        raise HTTPException(status_code=400, detail="No invoice numbers provided for export.")
+
+    invoices = db.query(Invoice).options(joinedload(Invoice.client), joinedload(Invoice.purchase_order)).filter(
+        Invoice.invoice_no.in_(invoice_nos)
+    ).all()
+    if not invoices:
+        raise HTTPException(status_code=404, detail="No matching invoices found for export.")
+
+    invoice_map = {inv.invoice_no: inv for inv in invoices}
+    ordered_invoices = [invoice_map[i] for i in invoice_nos if i in invoice_map]
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "FinancialLedger"
+
+    header_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    title_font = Font(bold=True, size=12)
+
+    ws["A1"] = f"Financial Ledger Export | Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    ws["A1"].font = title_font
+    ws.merge_cells("A1:Q1")
+
+    headers = [
+        "Client", "Sub Entity", "PO No", "Invoice No", "Invoice Date", "Due Date", "Status",
+        "LR No", "Basic", "GST", "Gross", "Advance", "TDS", "Retention", "Net Payable",
+        "Payment Received", "Balance"
+    ]
+    ws.append(headers)
+    for c in ws[2]:
+        c.fill = header_fill
+        c.font = header_font
+        c.alignment = Alignment(horizontal="center")
+
+    today = datetime.date.today()
+    totals = {
+        "basic": 0.0, "gst": 0.0, "gross": 0.0, "advance": 0.0, "tds": 0.0,
+        "retention": 0.0, "net": 0.0, "paid": 0.0, "balance": 0.0
+    }
+    for inv in ordered_invoices:
+        inv_date = inv.inv_date.isoformat() if inv.inv_date else ""
+        due_date = inv.due_date.isoformat() if inv.due_date else ""
+        balance = float(inv.balance or 0.0)
+        status = "CLEARED"
+        if balance > 0.0001:
+            if inv.due_date and inv.due_date < today:
+                status = "OVERDUE"
+            else:
+                status = "PENDING"
+
+        basic = float(inv.basic or 0.0)
+        gst = float(inv.gst or 0.0)
+        gross = float(inv.total or 0.0)
+        advance = float(inv.advance_adj or 0.0)
+        tds = float(inv.tds_ded or 0.0)
+        retention = float(inv.retention_held or 0.0)
+        net = float(inv.net_payable or 0.0)
+        paid = float(inv.paid or 0.0)
+
+        totals["basic"] += basic
+        totals["gst"] += gst
+        totals["gross"] += gross
+        totals["advance"] += advance
+        totals["tds"] += tds
+        totals["retention"] += retention
+        totals["net"] += net
+        totals["paid"] += paid
+        totals["balance"] += balance
+
+        ws.append([
+            inv.client.name if inv.client else "",
+            inv.sub_entity or "",
+            inv.purchase_order.po_no if inv.purchase_order else "UNASSIGNED",
+            inv.invoice_no,
+            inv_date,
+            due_date,
+            status,
+            inv.lr_no or "",
+            round(basic, 2),
+            round(gst, 2),
+            round(gross, 2),
+            round(advance, 2),
+            round(tds, 2),
+            round(retention, 2),
+            round(net, 2),
+            round(paid, 2),
+            round(balance, 2),
+        ])
+
+    ws.append([
+        "TOTAL", "", "", "", "", "", "", "",
+        round(totals["basic"], 2),
+        round(totals["gst"], 2),
+        round(totals["gross"], 2),
+        round(totals["advance"], 2),
+        round(totals["tds"], 2),
+        round(totals["retention"], 2),
+        round(totals["net"], 2),
+        round(totals["paid"], 2),
+        round(totals["balance"], 2),
+    ])
+    for c in ws[ws.max_row]:
+        c.font = Font(bold=True)
+
+    widths = [24, 18, 16, 18, 14, 14, 12, 16, 12, 10, 12, 12, 10, 12, 12, 16, 12]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[chr(64 + i)].width = w
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    filename = f"financial_ledger_export_{datetime.date.today().isoformat()}.xlsx"
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+@app.get("/api/logistics/client-dispatch-workspace")
+def get_logistics_client_dispatch_workspace(
+    client: str = Query(..., description="Client name"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role not in ["admin", "logistics"]:
+        raise HTTPException(status_code=403, detail="Admin or Logistics access required")
+
+    client_name = (client or "").strip()
+    if not client_name:
+        raise HTTPException(status_code=400, detail="client is required")
+
+    db_client = db.query(Client).filter(Client.name == client_name).first()
+    if not db_client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    pos = db.query(PurchaseOrder).options(selectinload(PurchaseOrder.baseline_items)).filter(
+        PurchaseOrder.client_id == db_client.id
+    ).all()
+
+    po_terms = []
+    po_by_id = {}
+    for po in pos:
+        po_by_id[po.id] = po
+        po_terms.append({
+            "po_no": po.po_no,
+            "project_name": po.project_name or "",
+            "contact_person": po.contact_person or "",
+            "is_completed": bool(po.is_completed),
+            "is_hidden": bool(po.is_hidden),
+            "completed_at": po.completed_at.isoformat() if po.completed_at else None,
+            "baseline_items": [
+                {
+                    "description": item.description or "",
+                    "ordered_qty": float(item.ordered_qty or 0.0),
+                    "inspected_qty": float(item.inspected_qty or 0.0),
+                    "uom": item.uom or "Nos",
+                    "material_type": item.material_type or None
+                } for item in (po.baseline_items or [])
+            ]
+        })
+
+    invoices = db.query(Invoice).options(selectinload(Invoice.dispatch_items)).filter(
+        Invoice.client_id == db_client.id,
+        Invoice.is_note == False
+    ).all()
+
+    invoices_payload = []
+    for inv in invoices:
+        po_no = ""
+        if inv.po_id and inv.po_id in po_by_id:
+            po_no = po_by_id[inv.po_id].po_no
+        invoices_payload.append({
+            "id": inv.invoice_no,
+            "invoice_no": inv.invoice_no,
+            "po_no": po_no or "UNASSIGNED",
+            "sub_entity": inv.sub_entity or "",
+            "lr_no": inv.lr_no or "",
+            "inv_date": inv.inv_date.isoformat() if inv.inv_date else None,
+            "due_date": inv.due_date.isoformat() if inv.due_date else None,
+            "total": float(inv.total or 0.0),
+            "dispatch_items": [
+                {
+                    "id": d.id,
+                    "description": d.description or "",
+                    "qty": float(d.dispatched_qty or 0.0),
+                    "inspected_qty": float(d.inspected_qty or 0.0),
+                    "uom": d.uom or "Nos"
+                } for d in (inv.dispatch_items or [])
+            ]
+        })
+
+    return {
+        "client": {
+            "id": db_client.id,
+            "name": db_client.name,
+            "active": bool(db_client.active if db_client.active is not None else True)
+        },
+        "po_terms": po_terms,
+        "invoices": invoices_payload
+    }
+
+
+
 def normalize_dispatch_description(value: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]+", " ", (value or "").upper())).strip()
 
@@ -781,6 +1511,41 @@ def prune_orphan_baseline_items_for_po(po_id: int, db: Session) -> int:
             deleted += 1
 
     return deleted
+
+
+def ensure_baseline_from_dispatch(po_id: Optional[int], dispatch_items: list[DispatchItemCreate], db: Session) -> int:
+    if not po_id:
+        return 0
+    po = db.query(PurchaseOrder).options(selectinload(PurchaseOrder.baseline_items)).filter(PurchaseOrder.id == po_id).first()
+    if not po:
+        return 0
+
+    existing_by_key: dict[tuple[str, str], PoBaselineItem] = {}
+    for base in (po.baseline_items or []):
+        key = (normalize_dispatch_description(base.description or ""), (base.uom or "").strip().upper())
+        existing_by_key[key] = base
+
+    inserted = 0
+    for item in (dispatch_items or []):
+        desc = (item.description or "").strip()
+        if not desc:
+            continue
+        norm = normalize_dispatch_description(desc)
+        uom = (item.uom or "Nos").strip()
+        key = (norm, uom.upper())
+        if key in existing_by_key:
+            continue
+        new_base = PoBaselineItem(
+            po_id=po.id,
+            description=desc,
+            ordered_qty=0.0,
+            inspected_qty=float(item.inspected_qty or 0.0),
+            uom=uom
+        )
+        db.add(new_base)
+        existing_by_key[key] = new_base
+        inserted += 1
+    return inserted
 
 
 def best_dispatch_description_match(raw_desc: str, candidates: list[str]) -> Optional[str]:
@@ -926,22 +1691,78 @@ def recalculate_client_ledger(client_id: int, db: Session):
             # This log consumes previously accumulated unallocated funds.
             total_excess -= alloc_sum
 
+    # Auto-clear tiny residuals to avoid operational noise in ledger.
+    for inv in invoices:
+        bal = float(inv.balance or 0.0)
+        if 0.0 < bal < 5.0:
+            inv.paid = float(inv.paid or 0.0) + bal
+            inv.balance = 0.0
+
     client.excess_funds = max(0.0, total_excess)
     db.commit()
 
 
+def round_inr_nearest(value: Optional[float]) -> float:
+    amt = Decimal(str(float(value or 0.0)))
+    return float(amt.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def fiscal_year_label(inv_date: Optional[datetime.date], start_month: int, start_day: int) -> Optional[str]:
+    if not inv_date:
+        return None
+    pivot = datetime.date(inv_date.year, start_month, start_day)
+    start_year = inv_date.year if inv_date >= pivot else inv_date.year - 1
+    return f"FY{start_year}-{str(start_year + 1)[-2:]}"
+
+
+def parse_fy_filters(raw: Optional[str]) -> set[str]:
+    if not raw:
+        return set()
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
 
 @app.get("/api/invoices")
-def get_invoices(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_invoices(fiscal_years: Optional[str] = Query(default=None, description="Comma separated FY labels"), include_completed_po: bool = True, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role == "logistics":
+        raise HTTPException(status_code=403, detail="Logistics role cannot access financial invoice data.")
     invoices = db.query(Invoice).options(
         joinedload(Invoice.purchase_order),
         selectinload(Invoice.dispatch_items)
     ).all()
+    settings = db.query(SystemSettings).first()
+    fy_start_month = int((settings.fy_start_month if settings else 4) or 4)
+    fy_start_day = int((settings.fy_start_day if settings else 1) or 1)
+    fy_filters = parse_fy_filters(fiscal_years)
+    note_invoice_nos = [inv.invoice_no for inv in invoices if inv.is_note]
+    note_target_by_note_id: dict[str, str] = {}
+    if note_invoice_nos:
+        note_allocs = db.query(PaymentAllocation).filter(
+            PaymentAllocation.alloc_type == "note_allocation",
+            PaymentAllocation.note_id.in_(note_invoice_nos)
+        ).all()
+        for alloc in note_allocs:
+            note_id = (alloc.note_id or "").strip()
+            target_inv = (alloc.target_inv_id or "").strip()
+            if note_id and target_inv and note_id not in note_target_by_note_id:
+                note_target_by_note_id[note_id] = target_inv
     result = []
     for inv in invoices:
         po_str = 'UNASSIGNED'
+        po_completed = False
         if inv.purchase_order:
             po_str = inv.purchase_order.po_no
+            po_completed = bool(inv.purchase_order.is_completed)
+        elif inv.po_id:
+            po_obj = db.query(PurchaseOrder).filter(PurchaseOrder.id == inv.po_id).first()
+            if po_obj:
+                po_str = po_obj.po_no
+                po_completed = bool(po_obj.is_completed)
+        if (not include_completed_po) and po_completed:
+            continue
+        inv_fy = fiscal_year_label(inv.inv_date, fy_start_month, fy_start_day)
+        if fy_filters and inv_fy not in fy_filters:
+            continue
 
         # --- FETCH ATTACHED DISPATCH ITEMS ---
         d_items = []
@@ -975,15 +1796,17 @@ def get_invoices(current_user: User = Depends(get_current_user), db: Session = D
             "isNote": inv.is_note,
             "noteType": inv.note_type,
             "noteReason": inv.note_reason,
+            "noteTargetInvoice": note_target_by_note_id.get(inv.invoice_no),
             "migratedV3": True,
+            "fiscalYear": inv_fy,
             "dispatchItems": d_items # CRITICAL: Sends items to frontend memory
         })
     return result
 
 @app.post("/api/invoices")
 def create_invoice(inv: InvoiceCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    if current_user.role not in ["admin", "logistics", "user"]:
+        raise HTTPException(status_code=403, detail="Authorized operations access required")
     
     existing = db.query(Invoice).filter(Invoice.invoice_no == inv.invoice_no).first()
     if existing:
@@ -1000,13 +1823,23 @@ def create_invoice(inv: InvoiceCreate, current_user: User = Depends(get_current_
 
     inv_d = datetime.datetime.strptime(inv.inv_date, '%Y-%m-%d').date() if inv.inv_date else None
     due_d = datetime.datetime.strptime(inv.due_date, '%Y-%m-%d').date() if inv.due_date else None
+    rounded_basic = round_inr_nearest(inv.basic)
+    rounded_total = round_inr_nearest(inv.total)
+    server_net_payable = max(
+        0.0,
+        float(rounded_total or 0.0)
+        - float(inv.advance_adj or 0.0)
+        - float(inv.tds_ded or 0.0)
+        - float(inv.retention_held or 0.0)
+    )
+    server_balance = max(0.0, server_net_payable - float(inv.paid or 0.0))
 
     new_inv = Invoice(
         client_id=inv.client_id, po_id=po_id, invoice_no=inv.invoice_no,
         sub_entity=inv.sub_entity, lr_no=inv.lr_no, inv_date=inv_d, due_date=due_d,
-        basic=inv.basic, gst=inv.gst, total=inv.total, advance_adj=inv.advance_adj,
-        tds_ded=inv.tds_ded, retention_held=inv.retention_held, net_payable=inv.net_payable,
-        paid=inv.paid, balance=inv.balance, is_note=inv.is_note, note_type=inv.note_type, note_reason=inv.note_reason
+        basic=rounded_basic, gst=inv.gst, total=rounded_total, advance_adj=inv.advance_adj,
+        tds_ded=inv.tds_ded, retention_held=inv.retention_held, net_payable=server_net_payable,
+        paid=inv.paid, balance=server_balance, is_note=inv.is_note, note_type=inv.note_type, note_reason=inv.note_reason
     )
     db.add(new_inv)
     
@@ -1022,15 +1855,72 @@ def create_invoice(inv: InvoiceCreate, current_user: User = Depends(get_current_
             uom=item.uom
         )
         db.add(new_dispatch)
+    ensure_baseline_from_dispatch(po_id, inv.dispatch_items, db)
         
     db.commit()
+    auto_advance_applied = 0.0
+    if po_id:
+        po_obj = db.query(PurchaseOrder).filter(PurchaseOrder.id == po_id).first()
+        if po_obj:
+            historical_allocs = db.query(PaymentAllocation).join(PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id).filter(
+                PaymentHistory.client_id == inv.client_id,
+                PaymentAllocation.target_po_no == po_obj.po_no
+            ).all()
+            po_pool = 0.0
+            for al in historical_allocs:
+                if al.alloc_type == "po_advance":
+                    po_pool += float(al.amount or 0.0)
+                elif al.alloc_type == "po_advance_applied":
+                    po_pool -= float(al.amount or 0.0)
+            po_pool = max(0.0, po_pool)
+            adv_pct = float(po_obj.adv_pct or 0.0)
+            if adv_pct > 0:
+                base_amt = float(new_inv.basic or 0.0) if (po_obj.ret_base or "total") == "basic" else float(new_inv.total or 0.0)
+                allowed_remaining = max(0.0, (base_amt * (adv_pct / 100.0)) - float(new_inv.advance_adj or 0.0))
+            else:
+                # If no explicit advance cap is configured, still auto-apply available PO advance pool.
+                allowed_remaining = float(new_inv.balance or 0.0)
+            to_apply = min(allowed_remaining, po_pool, float(new_inv.balance or 0.0))
+            if to_apply > 0:
+                before_adv = float(new_inv.advance_adj or 0.0)
+                pay_id = str(int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000))
+                db.add(PaymentHistory(
+                    id=pay_id,
+                    client_id=inv.client_id,
+                    date=datetime.date.today(),
+                    type="ADVANCE_APPLIED",
+                    amount=float(to_apply),
+                    details=f"Auto-applied PO advance to {new_inv.invoice_no}",
+                    note="Auto apply on invoice creation"
+                ))
+                db.flush()
+                db.add(PaymentAllocation(
+                    payment_id=pay_id,
+                    alloc_type="po_advance_applied",
+                    target_inv_id=new_inv.invoice_no,
+                    target_po_no=po_obj.po_no,
+                    amount=float(to_apply)
+                ))
+                # Reflect auto-applied PO advance directly on the invoice advance column.
+                new_inv.advance_adj = float(new_inv.advance_adj or 0.0) + float(to_apply)
+                new_inv.net_payable = max(
+                    0.0,
+                    float(new_inv.total or 0.0)
+                    - float(new_inv.advance_adj or 0.0)
+                    - float(new_inv.tds_ded or 0.0)
+                    - float(new_inv.retention_held or 0.0)
+                )
+                new_inv.balance = max(0.0, float(new_inv.net_payable or 0.0) - float(new_inv.paid or 0.0))
+                db.commit()
+                auto_advance_applied = float(to_apply)
+                
     recalculate_client_ledger(new_inv.client_id, db)
-    return {"success": True, "id": new_inv.id}
+    return {"success": True, "id": new_inv.id, "auto_advance_applied": auto_advance_applied}
 
 @app.put("/api/invoices/{invoice_no:path}")
 def update_invoice(invoice_no: str, inv: InvoiceUpdate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    if current_user.role not in ["admin", "logistics", "user"]:
+        raise HTTPException(status_code=403, detail="Authorized operations access required")
     
     db_inv = db.query(Invoice).filter(Invoice.invoice_no == invoice_no).first()
     if not db_inv:
@@ -1050,15 +1940,21 @@ def update_invoice(invoice_no: str, inv: InvoiceUpdate, current_user: User = Dep
     db_inv.lr_no = inv.lr_no
     db_inv.inv_date = datetime.datetime.strptime(inv.inv_date, '%Y-%m-%d').date() if inv.inv_date else None
     db_inv.due_date = datetime.datetime.strptime(inv.due_date, '%Y-%m-%d').date() if inv.due_date else None
-    db_inv.basic = inv.basic
+    db_inv.basic = round_inr_nearest(inv.basic)
     db_inv.gst = inv.gst
-    db_inv.total = inv.total
+    db_inv.total = round_inr_nearest(inv.total)
     db_inv.advance_adj = inv.advance_adj
     db_inv.tds_ded = inv.tds_ded
     db_inv.retention_held = inv.retention_held
-    db_inv.net_payable = inv.net_payable
+    db_inv.net_payable = max(
+        0.0,
+        float(db_inv.total or 0.0)
+        - float(db_inv.advance_adj or 0.0)
+        - float(db_inv.tds_ded or 0.0)
+        - float(db_inv.retention_held or 0.0)
+    )
     db_inv.paid = inv.paid
-    db_inv.balance = inv.balance
+    db_inv.balance = max(0.0, float(db_inv.net_payable or 0.0) - float(db_inv.paid or 0.0))
     db_inv.is_note = inv.is_note
     db_inv.note_type = inv.note_type
     db_inv.note_reason = inv.note_reason
@@ -1074,6 +1970,7 @@ def update_invoice(invoice_no: str, inv: InvoiceUpdate, current_user: User = Dep
             uom=item.uom
         )
         db.add(new_dispatch)
+    ensure_baseline_from_dispatch(po_id, inv.dispatch_items, db)
         
     db.commit()
     recalculate_client_ledger(db_inv.client_id, db)
@@ -1086,6 +1983,22 @@ def delete_invoice(invoice_no: str, current_user: User = Depends(get_current_use
     db_inv = db.query(Invoice).filter(Invoice.invoice_no == invoice_no).first()
     if db_inv:
         client_id = db_inv.client_id
+        allocs = db.query(PaymentAllocation).filter(
+            PaymentAllocation.target_inv_id == db_inv.invoice_no,
+            PaymentAllocation.alloc_type == "po_advance_applied"
+        ).all()
+        # Revert PO advance consumption when deleting an invoice that had auto-applied advance.
+        linked_payment_ids = {a.payment_id for a in allocs if a.payment_id}
+        for al in allocs:
+            db.delete(al)
+        # Cleanup dangling ADVANCE_APPLIED logs that no longer have allocations.
+        for pid in linked_payment_ids:
+            remaining = db.query(PaymentAllocation).filter(PaymentAllocation.payment_id == pid).count()
+            if remaining == 0:
+                ph = db.query(PaymentHistory).filter(PaymentHistory.id == pid, PaymentHistory.type == "ADVANCE_APPLIED").first()
+                if ph:
+                    db.delete(ph)
+        db.flush()
         db.delete(db_inv)
         db.commit()
         recalculate_client_ledger(client_id, db)
@@ -1108,6 +2021,295 @@ def delete_dispatch_item(dispatch_item_id: int, current_user: User = Depends(get
         pruned = prune_orphan_baseline_items_for_po(po_id, db)
     db.commit()
     return {"success": True, "baseline_rows_pruned": pruned}
+
+
+@app.put("/api/dispatch-items/{dispatch_item_id}")
+def update_dispatch_item(dispatch_item_id: int, payload: DispatchItemUpdate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role not in ["admin", "logistics", "user"]:
+        raise HTTPException(status_code=403, detail="Authorized operations access required")
+
+    item = db.query(InvoiceDispatchItem).filter(InvoiceDispatchItem.id == dispatch_item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Dispatch entry not found.")
+
+    invoice = db.query(Invoice).filter(Invoice.id == item.invoice_id).first()
+    po_id = invoice.po_id if invoice else None
+
+    desc = (payload.description or "").strip()
+    if not desc:
+        raise HTTPException(status_code=400, detail="Description is required.")
+
+    item.description = desc
+    item.dispatched_qty = max(0.0, float(payload.qty or 0.0))
+    item.inspected_qty = max(0.0, float(payload.inspected_qty or 0.0))
+    item.uom = (payload.uom or "Nos").strip() or "Nos"
+
+    merged = False
+    merged_into_id = None
+    if payload.merge_on_match:
+        norm_desc = normalize_dispatch_description(item.description)
+        norm_uom = (item.uom or "").strip().upper()
+        siblings = db.query(InvoiceDispatchItem).filter(
+            InvoiceDispatchItem.invoice_id == item.invoice_id,
+            InvoiceDispatchItem.id != item.id
+        ).all()
+        for sibling in siblings:
+            if normalize_dispatch_description(sibling.description or "") == norm_desc and (sibling.uom or "").strip().upper() == norm_uom:
+                sibling.dispatched_qty = float(sibling.dispatched_qty or 0.0) + float(item.dispatched_qty or 0.0)
+                sibling.inspected_qty = float(sibling.inspected_qty or 0.0) + float(item.inspected_qty or 0.0)
+                merged = True
+                merged_into_id = sibling.id
+                db.delete(item)
+                break
+
+    if po_id:
+        ensure_baseline_from_dispatch(
+            po_id,
+            [DispatchItemCreate(description=desc, qty=max(0.0, float(payload.qty or 0.0)), inspected_qty=max(0.0, float(payload.inspected_qty or 0.0)), uom=(payload.uom or "Nos"))],
+            db
+        )
+        prune_orphan_baseline_items_for_po(po_id, db)
+
+    db.commit()
+    return {"success": True, "merged": merged, "merged_into_id": merged_into_id}
+
+
+@app.post("/api/dispatch-items/upsert-cell")
+def upsert_dispatch_cell(payload: DispatchCellUpsert, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role not in ["admin", "logistics", "user"]:
+        raise HTTPException(status_code=403, detail="Authorized operations access required")
+
+    invoice_no = (payload.invoice_no or "").strip()
+    desc = (payload.description or "").strip()
+    if not invoice_no:
+        raise HTTPException(status_code=400, detail="invoice_no is required.")
+    if not desc:
+        raise HTTPException(status_code=400, detail="description is required.")
+
+    inv = db.query(Invoice).filter(Invoice.invoice_no == invoice_no).first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found.")
+
+    qty = max(0.0, float(payload.qty or 0.0))
+    uom = (payload.uom or "Nos").strip() or "Nos"
+    norm_desc = normalize_dispatch_description(desc)
+    norm_uom = uom.upper()
+
+    matches = db.query(InvoiceDispatchItem).filter(InvoiceDispatchItem.invoice_id == inv.id).all()
+    matched = [m for m in matches if normalize_dispatch_description(m.description or "") == norm_desc and (m.uom or "").strip().upper() == norm_uom]
+
+    if matched:
+        keeper = matched[0]
+        keeper.description = desc
+        keeper.uom = uom
+        keeper.dispatched_qty = qty
+        # Keep inspected qty bounded to dispatched qty.
+        keeper.inspected_qty = min(float(keeper.inspected_qty or 0.0), qty)
+        for extra in matched[1:]:
+            db.delete(extra)
+        dispatch_item_id = keeper.id
+        created = False
+    else:
+        new_item = InvoiceDispatchItem(
+            invoice_id=inv.id,
+            description=desc,
+            dispatched_qty=qty,
+            inspected_qty=0.0,
+            uom=uom
+        )
+        db.add(new_item)
+        db.flush()
+        dispatch_item_id = new_item.id
+        created = True
+
+    if inv.po_id:
+        ensure_baseline_from_dispatch(
+            inv.po_id,
+            [DispatchItemCreate(description=desc, qty=qty, inspected_qty=0.0, uom=uom)],
+            db
+        )
+        prune_orphan_baseline_items_for_po(inv.po_id, db)
+
+    db.commit()
+    return {"success": True, "created": created, "dispatch_item_id": dispatch_item_id}
+
+
+@app.patch("/api/invoices/{invoice_no:path}/inline")
+def update_invoice_inline_fields(invoice_no: str, payload: InvoiceInlineUpdate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role not in ["admin", "logistics", "user"]:
+        raise HTTPException(status_code=403, detail="Authorized operations access required")
+    inv = db.query(Invoice).filter(Invoice.invoice_no == invoice_no).first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found.")
+
+    if payload.inv_date is not None:
+        inv.inv_date = datetime.datetime.strptime(payload.inv_date, "%Y-%m-%d").date() if str(payload.inv_date).strip() else None
+    if payload.lr_no is not None:
+        inv.lr_no = (payload.lr_no or "").strip()
+    if payload.total is not None:
+        inv.total = max(0.0, round_inr_nearest(payload.total))
+        # Keep payable consistency when total is edited inline.
+        inv.net_payable = max(0.0, float(inv.total or 0.0) - float(inv.advance_adj or 0.0) - float(inv.tds_ded or 0.0) - float(inv.retention_held or 0.0))
+        inv.balance = max(0.0, float(inv.net_payable or 0.0) - float(inv.paid or 0.0))
+
+    db.commit()
+    recalculate_client_ledger(inv.client_id, db)
+    return {"success": True}
+
+
+@app.delete("/api/dispatch-row/{invoice_no:path}")
+def delete_dispatch_row(invoice_no: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role not in ["admin", "logistics", "user"]:
+        raise HTTPException(status_code=403, detail="Authorized operations access required")
+    inv = db.query(Invoice).filter(Invoice.invoice_no == invoice_no).first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found.")
+    po_id = inv.po_id
+    deleted = db.query(InvoiceDispatchItem).filter(InvoiceDispatchItem.invoice_id == inv.id).delete()
+    if po_id:
+        prune_orphan_baseline_items_for_po(po_id, db)
+    db.commit()
+    return {"success": True, "deleted_dispatch_lines": int(deleted or 0)}
+
+
+@app.post("/api/dispatch-columns/delete")
+def delete_dispatch_column(payload: DispatchColumnDeleteRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role not in ["admin", "logistics", "user"]:
+        raise HTTPException(status_code=403, detail="Authorized operations access required")
+    po_no = (payload.po_no or "").strip()
+    desc = (payload.description or "").strip()
+    if not po_no or not desc:
+        raise HTTPException(status_code=400, detail="po_no and description are required.")
+    po = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no).first()
+    if not po:
+        raise HTTPException(status_code=404, detail="PO not found.")
+
+    norm_desc = normalize_dispatch_description(desc)
+    norm_uom = (payload.uom or "").strip().upper() if payload.uom else ""
+
+    baseline_deleted = 0
+    for base in list(po.baseline_items or []):
+        if normalize_dispatch_description(base.description or "") != norm_desc:
+            continue
+        if norm_uom and (base.uom or "").strip().upper() != norm_uom:
+            continue
+        db.delete(base)
+        baseline_deleted += 1
+
+    invoices = db.query(Invoice).options(selectinload(Invoice.dispatch_items)).filter(
+        Invoice.po_id == po.id,
+        Invoice.is_note == False
+    ).all()
+    dispatch_deleted = 0
+    for inv in invoices:
+        for item in list(inv.dispatch_items or []):
+            if normalize_dispatch_description(item.description or "") != norm_desc:
+                continue
+            if norm_uom and (item.uom or "").strip().upper() != norm_uom:
+                continue
+            db.delete(item)
+            dispatch_deleted += 1
+
+    prune_orphan_baseline_items_for_po(po.id, db)
+    db.commit()
+    return {"success": True, "baseline_deleted": baseline_deleted, "dispatch_deleted": dispatch_deleted}
+
+
+@app.post("/api/dispatch-columns/rename")
+def rename_dispatch_column(payload: DispatchColumnRenameRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Rename a dispatch material column on a PO and migrate every dispatch_item that
+    used the old description to the new one. If the new description matches an
+    existing column for the same UOM, quantities are merged so multiple items
+    can share the same material description."""
+    if current_user.role not in ["admin", "logistics", "user"]:
+        raise HTTPException(status_code=403, detail="Authorized operations access required")
+    po_no = (payload.po_no or "").strip()
+    old_desc_raw = (payload.old_description or "").strip()
+    new_desc_raw = (payload.new_description or "").strip()
+    if not po_no or not old_desc_raw or not new_desc_raw:
+        raise HTTPException(status_code=400, detail="po_no, old_description and new_description are required.")
+
+    po = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no).first()
+    if not po:
+        raise HTTPException(status_code=404, detail="PO not found.")
+
+    old_norm = normalize_dispatch_description(old_desc_raw)
+    new_norm = normalize_dispatch_description(new_desc_raw)
+    old_uom = (payload.old_uom or "Nos").strip() or "Nos"
+    new_uom = (payload.new_uom or old_uom or "Nos").strip() or "Nos"
+    old_uom_key = old_uom.upper()
+    new_uom_key = new_uom.upper()
+
+    baseline_renamed = 0
+    baseline_merged = 0
+    keeper_baseline = None
+    target_baseline = None
+    other_baselines: list = []
+    for base in list(po.baseline_items or []):
+        norm = normalize_dispatch_description(base.description or "")
+        u = (base.uom or "Nos").strip().upper()
+        if norm == new_norm and u == new_uom_key:
+            keeper_baseline = base
+        elif norm == old_norm and u == old_uom_key:
+            other_baselines.append(base)
+
+    if keeper_baseline is None and other_baselines:
+        target_baseline = other_baselines.pop(0)
+        target_baseline.description = new_desc_raw
+        target_baseline.uom = new_uom
+        if hasattr(target_baseline, "material_type") and not target_baseline.material_type:
+            target_baseline.material_type = target_baseline.material_type
+        keeper_baseline = target_baseline
+        baseline_renamed += 1
+
+    if keeper_baseline is not None:
+        for base in other_baselines:
+            keeper_baseline.ordered_qty = float(keeper_baseline.ordered_qty or 0.0) + float(base.ordered_qty or 0.0)
+            keeper_baseline.inspected_qty = float(keeper_baseline.inspected_qty or 0.0) + float(base.inspected_qty or 0.0)
+            if not keeper_baseline.material_type and getattr(base, "material_type", None):
+                keeper_baseline.material_type = base.material_type
+            db.delete(base)
+            baseline_merged += 1
+
+    invoices = db.query(Invoice).options(selectinload(Invoice.dispatch_items)).filter(
+        Invoice.po_id == po.id,
+        Invoice.is_note == False
+    ).all()
+    dispatch_renamed = 0
+    dispatch_merged = 0
+    for inv in invoices:
+        keeper_item = None
+        renames: list = []
+        for item in list(inv.dispatch_items or []):
+            norm = normalize_dispatch_description(item.description or "")
+            u = (item.uom or "Nos").strip().upper()
+            if norm == new_norm and u == new_uom_key:
+                keeper_item = item
+            elif norm == old_norm and u == old_uom_key:
+                renames.append(item)
+        if not renames:
+            continue
+        if keeper_item is None:
+            keeper_item = renames.pop(0)
+            keeper_item.description = new_desc_raw
+            keeper_item.uom = new_uom
+            dispatch_renamed += 1
+        for extra in renames:
+            keeper_item.dispatched_qty = float(keeper_item.dispatched_qty or 0.0) + float(extra.dispatched_qty or 0.0)
+            keeper_item.inspected_qty = float(keeper_item.inspected_qty or 0.0) + float(extra.inspected_qty or 0.0)
+            db.delete(extra)
+            dispatch_merged += 1
+
+    prune_orphan_baseline_items_for_po(po.id, db)
+    db.commit()
+    return {
+        "success": True,
+        "baseline_renamed": baseline_renamed,
+        "baseline_merged": baseline_merged,
+        "dispatch_renamed": dispatch_renamed,
+        "dispatch_merged": dispatch_merged,
+    }
+
 
 @app.post("/api/payments/allocate")
 def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -1259,6 +2461,23 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
             log_details.append(f"{inv.invoice_no} ({amount_to_apply:.2f})")
             remaining -= amount_to_apply
 
+    if remaining > 0 and payment.fund_source == "receipt" and payment.excess_action == "allocate_pending":
+        selected_ids = {inv.invoice_no for inv, _ in selected}
+        pending_invoices = sorted(
+            [i for i in invoices if (i.balance or 0) > 0 and i.invoice_no not in selected_ids],
+            key=lambda x: x.inv_date or datetime.date(9999, 12, 31)
+        )
+        for inv in pending_invoices:
+            if remaining <= 0:
+                break
+            inv_balance = float(inv.balance or 0.0)
+            if inv_balance <= 0:
+                continue
+            amount_to_apply = min(inv_balance, remaining)
+            allocs_for_db.append((inv.invoice_no, amount_to_apply))
+            log_details.append(f"{inv.invoice_no} ({amount_to_apply:.2f})")
+            remaining -= amount_to_apply
+
     if payment.clear_po_pool:
         payment_type = 'ADVANCE_APPLIED'
         payment_amount = po_advance_allocs[0][1] if po_advance_allocs else 0.0
@@ -1285,8 +2504,31 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
     db.add(new_pay)
     db.flush()
 
+    if payment.fund_source == "receipt" and remaining > 0:
+        db.add(UnallocatedPaymentRegister(
+            client_id=payment.client_id,
+            source_payment_id=new_pay.id,
+            created_on=date_obj,
+            amount=float(remaining),
+            balance=float(remaining),
+            status="open",
+            note=payment.note
+        ))
+
     for inv_no, amt in allocs_for_db:
         if inv_no == "__PO__":
+            moved_amt = float(amt or 0.0)
+            if moved_amt > 0:
+                db.add(UnallocatedAdvanceRegister(
+                    client_id=payment.client_id,
+                    source_payment_id=new_pay.id,
+                    po_no=payment.move_to_po.strip() if payment.move_to_po else None,
+                    created_on=date_obj,
+                    amount=moved_amt,
+                    balance=moved_amt,
+                    status="open",
+                    note=payment.note
+                ))
             db.add(PaymentAllocation(
                 payment_id=new_pay.id,
                 alloc_type='po_advance',
@@ -1329,11 +2571,20 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
     }
 
 @app.get("/api/payments")
-def get_payments(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_payments(fiscal_years: Optional[str] = Query(default=None, description="Comma separated FY labels"), current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role == "logistics":
+        raise HTTPException(status_code=403, detail="Logistics role cannot access payment data.")
     payments = db.query(PaymentHistory).options(selectinload(PaymentHistory.allocations)).all()
+    settings = db.query(SystemSettings).first()
+    fy_start_month = int((settings.fy_start_month if settings else 4) or 4)
+    fy_start_day = int((settings.fy_start_day if settings else 1) or 1)
+    fy_filters = parse_fy_filters(fiscal_years)
     result = []
     
     for p in payments:
+        pay_fy = fiscal_year_label(p.date, fy_start_month, fy_start_day)
+        if fy_filters and pay_fy not in fy_filters:
+            continue
         alloc_list = []
         for a in p.allocations:
             alloc_list.append({
@@ -1352,10 +2603,76 @@ def get_payments(current_user: User = Depends(get_current_user), db: Session = D
             "amount": p.amount,
             "details": p.details,
             "note": p.note,
+            "fiscalYear": pay_fy,
             "allocations": alloc_list
         })
         
     return result
+
+
+@app.get("/api/registers/unallocated-payments")
+def get_unallocated_payment_register(client_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role == "logistics":
+        raise HTTPException(status_code=403, detail="Logistics role cannot access payment data.")
+    rows = db.query(UnallocatedPaymentRegister).filter(
+        UnallocatedPaymentRegister.client_id == client_id
+    ).order_by(UnallocatedPaymentRegister.id.desc()).all()
+    return [{
+        "id": r.id,
+        "created_on": r.created_on.isoformat() if r.created_on else None,
+        "amount": float(r.amount or 0.0),
+        "balance": float(r.balance or 0.0),
+        "status": r.status,
+        "source_payment_id": r.source_payment_id,
+        "note": r.note
+    } for r in rows]
+
+
+@app.post("/api/registers/unallocated-payments/{entry_id}/reverse")
+def reverse_unallocated_payment_entry(entry_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    row = db.query(UnallocatedPaymentRegister).filter(UnallocatedPaymentRegister.id == entry_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Register entry not found.")
+    row.status = "reversed"
+    row.balance = 0.0
+    db.commit()
+    recalculate_client_ledger(row.client_id, db)
+    return {"success": True}
+
+
+@app.get("/api/registers/unallocated-advances")
+def get_unallocated_advance_register(client_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role == "logistics":
+        raise HTTPException(status_code=403, detail="Logistics role cannot access financial advance data.")
+    rows = db.query(UnallocatedAdvanceRegister).filter(
+        UnallocatedAdvanceRegister.client_id == client_id
+    ).order_by(UnallocatedAdvanceRegister.id.desc()).all()
+    return [{
+        "id": r.id,
+        "created_on": r.created_on.isoformat() if r.created_on else None,
+        "amount": float(r.amount or 0.0),
+        "balance": float(r.balance or 0.0),
+        "status": r.status,
+        "po_no": r.po_no,
+        "source_payment_id": r.source_payment_id,
+        "note": r.note
+    } for r in rows]
+
+
+@app.post("/api/registers/unallocated-advances/{entry_id}/reverse")
+def reverse_unallocated_advance_entry(entry_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    row = db.query(UnallocatedAdvanceRegister).filter(UnallocatedAdvanceRegister.id == entry_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Register entry not found.")
+    row.status = "reversed"
+    row.balance = 0.0
+    db.commit()
+    recalculate_client_ledger(row.client_id, db)
+    return {"success": True}
 
 @app.delete("/api/payments/{payment_id}")
 def delete_payment(payment_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -1456,10 +2773,27 @@ def issue_note(req: NoteIssueRequest, current_user: User = Depends(get_current_u
 
     note_date = datetime.datetime.strptime(req.date, '%Y-%m-%d').date() if req.date else datetime.date.today()
     total_amt = -req.amount if req.note_type == "CN" else req.amount
+    target_invoice = None
+    note_po_id = None
+    note_target_po_no = None
+    if req.target_invoice_id:
+        target_invoice = db.query(Invoice).filter(
+            Invoice.invoice_no == req.target_invoice_id,
+            Invoice.client_id == req.client_id
+        ).first()
+        if not target_invoice:
+            raise HTTPException(status_code=404, detail="Target invoice not found for the selected client.")
+        note_po_id = target_invoice.po_id
+        if target_invoice.purchase_order:
+            note_target_po_no = target_invoice.purchase_order.po_no
+        elif note_po_id:
+            po_obj = db.query(PurchaseOrder).filter(PurchaseOrder.id == note_po_id).first()
+            if po_obj:
+                note_target_po_no = po_obj.po_no
 
     new_note = Invoice(
         client_id=req.client_id,
-        po_id=None,
+        po_id=note_po_id,
         invoice_no=req.note_no,
         sub_entity='-',
         lr_no='-',
@@ -1497,7 +2831,7 @@ def issue_note(req: NoteIssueRequest, current_user: User = Depends(get_current_u
             payment_id=db_pay.id,
             alloc_type='note_allocation',
             target_inv_id=req.target_invoice_id,
-            target_po_no=None,
+            target_po_no=note_target_po_no,
             note_id=req.note_no,
             amount=float(req.amount)
         ))
@@ -1514,8 +2848,8 @@ def issue_note(req: NoteIssueRequest, current_user: User = Depends(get_current_u
 # --- AI PDF Extraction Route ---
 @app.post("/api/upload-invoice")
 async def upload_invoice(invoice_pdf: list[UploadFile] = File(...), current_user: User = Depends(get_current_user)):
-    if current_user.role not in ["admin", "logistics"]:
-        raise HTTPException(status_code=403, detail="Admin or Logistics access required")
+    if current_user.role not in ["admin", "logistics", "user"]:
+        raise HTTPException(status_code=403, detail="Authorized operations access required")
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=503, detail="AI extraction is not configured.")
     enforce_upload_rate_limit(f"{current_user.id}:upload_invoice")
@@ -1530,8 +2864,10 @@ async def upload_invoice(invoice_pdf: list[UploadFile] = File(...), current_user
         prompt = """
         Extract details from this invoice. 
         CRITICAL INSTRUCTION FOR ITEMS: For the 'desc' field, you MUST capture the ENTIRE paragraph and full multi-line description corresponding to each serial number exactly as written. Do not summarize, truncate, or shorten the description.
+        CRITICAL INSTRUCTION FOR CLIENT: For the 'clientName' field, capture the BUYER / CONSIGNEE / "Bill To" company name from the invoice (the customer who is receiving the goods, NOT the seller). Return the full registered company name exactly as printed (e.g., "Vedanta Limited - BALCO"). If not present, return an empty string.
         Return strictly JSON matching this structure:
         {
+          "clientName": "Buyer / Bill-To company name exactly as printed",
           "invNo": "Invoice Number",
           "poNo": "PO Number",
           "lrNo": "LR Number",
@@ -1551,8 +2887,8 @@ async def upload_invoice(invoice_pdf: list[UploadFile] = File(...), current_user
     return {"success": True, "results": results}
 @app.post("/api/upload-po")
 async def upload_po(po_pdf: list[UploadFile] = File(...), current_user: User = Depends(get_current_user)):
-    if current_user.role not in ["admin", "logistics"]:
-        raise HTTPException(status_code=403, detail="Admin or Logistics access required")
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=503, detail="AI extraction is not configured.")
     enforce_upload_rate_limit(f"{current_user.id}:upload_po")
@@ -1592,4 +2928,4 @@ def serve_frontend():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=3000)
+    uvicorn.run(app, host="192.168.0.143", port=3000)
