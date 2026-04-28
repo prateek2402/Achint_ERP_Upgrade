@@ -1983,19 +1983,25 @@ def delete_invoice(invoice_no: str, current_user: User = Depends(get_current_use
     db_inv = db.query(Invoice).filter(Invoice.invoice_no == invoice_no).first()
     if db_inv:
         client_id = db_inv.client_id
+        # Remove every allocation linked to this invoice (all alloc types), so if the
+        # same invoice number is added again it starts clean without retained payment map.
         allocs = db.query(PaymentAllocation).filter(
-            PaymentAllocation.target_inv_id == db_inv.invoice_no,
-            PaymentAllocation.alloc_type == "po_advance_applied"
+            or_(
+                PaymentAllocation.target_inv_id == db_inv.invoice_no,
+                PaymentAllocation.note_id == db_inv.invoice_no
+            )
         ).all()
-        # Revert PO advance consumption when deleting an invoice that had auto-applied advance.
         linked_payment_ids = {a.payment_id for a in allocs if a.payment_id}
         for al in allocs:
             db.delete(al)
-        # Cleanup dangling ADVANCE_APPLIED logs that no longer have allocations.
+        # Cleanup any auto-generated payment logs that no longer have allocations.
         for pid in linked_payment_ids:
             remaining = db.query(PaymentAllocation).filter(PaymentAllocation.payment_id == pid).count()
             if remaining == 0:
-                ph = db.query(PaymentHistory).filter(PaymentHistory.id == pid, PaymentHistory.type == "ADVANCE_APPLIED").first()
+                ph = db.query(PaymentHistory).filter(
+                    PaymentHistory.id == pid,
+                    PaymentHistory.type.in_(["ADVANCE_APPLIED", "NOTE_APPLIED", "UNALLOCATED_APPLIED"])
+                ).first()
                 if ph:
                     db.delete(ph)
         db.flush()

@@ -2567,6 +2567,39 @@
         </div>
     </div>
 
+    <div class="modal-overlay" id="poExcessAppletModal">
+        <div class="modal-content" style="width: 900px; max-width: 96vw;">
+            <div class="modal-header">
+                <h3>PO Excess Payment Applet</h3>
+                <button class="close-btn" onclick="document.getElementById('poExcessAppletModal').style.display='none'">×</button>
+            </div>
+            <div class="modal-body" style="padding: 0;">
+                <div style="display:flex; gap:10px; align-items:center; padding:12px 16px; border-bottom:1px solid var(--border); background:#f8fafc;">
+                    <span style="font-size:0.78rem; font-weight:700; color:var(--text-muted);">PO Filter</span>
+                    <select id="poExcessFilter" style="min-width:220px;" onchange="renderExcessPoAppletRows()">
+                        <option value="">All PO Excess Entries</option>
+                    </select>
+                    <span id="poExcessAppletHint" style="font-size:0.75rem; color:var(--text-muted); margin-left:auto;">Shows PO-excess receipts and history. You can delete the source payment record directly.</span>
+                </div>
+                <div class="table-wrapper" style="border: none; border-radius: 0; box-shadow: none; max-height: 500px;">
+                    <table style="min-width: 100%;">
+                        <thead style="position: sticky; top: 0; z-index: 20;">
+                            <tr>
+                                <th style="text-align: left; padding: 12px 16px;">Date</th>
+                                <th style="text-align: left; padding: 12px 16px;">PO</th>
+                                <th style="text-align: left; padding: 12px 16px;">Type</th>
+                                <th style="text-align: right; padding: 12px 16px;">Amount</th>
+                                <th style="text-align: left; padding: 12px 16px;">Details</th>
+                                <th style="text-align: center; padding: 12px 16px;">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="poExcessAppletBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div class="modal-overlay" id="poTermsModal">
         <div class="modal-content" style="width: 700px; max-width: 95vw;">
             <div class="modal-header">
@@ -2645,6 +2678,8 @@
                             <th style="text-align:left;">LR No</th>
                             <th style="text-align:left;">Date</th>
                             <th style="text-align:right;">Basic (₹)</th>
+                            <th style="text-align:center;">GST</th>
+                            <th style="text-align:center;">TDS</th>
                         </tr>
                     </thead>
                     <tbody id="bulkReviewTableBody"></tbody>
@@ -3312,7 +3347,7 @@
                                     Apply 18% GST
                                 </label>
                                 <label style="cursor:pointer; display:flex; align-items:center; gap:8px; margin:0; color:var(--text-dark);">
-                                    <input type="checkbox" id="applyTds" checked style="width:16px; height:16px; accent-color:var(--brand-primary);" onchange="autoCalculateTerms()">
+                                    <input type="checkbox" id="applyTds" style="width:16px; height:16px; accent-color:var(--brand-primary);" onchange="autoCalculateTerms()">
                                     Auto-Deduct 0.1% TDS
                                 </label>
                             </div>
@@ -3329,7 +3364,10 @@
                     <div class="card" style="margin-bottom: 0;">
                         <h3 class="section-title" style="display: flex; justify-content: space-between; align-items: center;">
                             <span id="paymentSectionTitle">Record Payment Receipt</span>
-                            <button type="button" class="btn-outline btn-sm" onclick="openPaymentHistory()" style="font-weight: 600; font-size: 0.75rem;">Ledger History</button>
+                            <div style="display:flex; gap:8px;">
+                                <button type="button" class="btn-outline btn-sm" onclick="openExcessPoApplet()" style="font-weight: 600; font-size: 0.75rem;">PO Excess Applet</button>
+                                <button type="button" class="btn-outline btn-sm" onclick="openPaymentHistory()" style="font-weight: 600; font-size: 0.75rem;">Ledger History</button>
+                            </div>
                         </h3>
                         <div class="form-group" style="margin-bottom: 16px;">
                             <label>Amount Received (Bank / RTGS)</label>
@@ -6552,6 +6590,7 @@
             document.getElementById('entryRate').value = inv.entryRate || 1;
             document.getElementById('entryRate').disabled = (inv.entryCur || 'INR') === 'INR';
             document.getElementById('applyGst').checked = inv.gst > 0;
+            if (document.getElementById('applyTds')) document.getElementById('applyTds').checked = Number(inv.tds || 0) > 0;
 
             document.getElementById('basicVal').value = inv.basic;
             document.getElementById('advanceVal').value = inv.advance;
@@ -6737,7 +6776,7 @@
             document.getElementById('entryRate').value = '1';
             document.getElementById('entryRate').disabled = true;
             document.getElementById('applyGst').checked = true;
-            if (document.getElementById('applyTds')) document.getElementById('applyTds').checked = true;
+            if (document.getElementById('applyTds')) document.getElementById('applyTds').checked = false;
             appData._settings.customColumns.forEach(cc => {
                 if (cc.type === 'text') {
                     let el = document.getElementById('custom_field_' + cc.id);
@@ -6986,14 +7025,39 @@
             await customApplet({ title: "Balance Cleared", message: `The remaining advance for PO ${poNo} has been written off successfully.` });
         }
 
+        function getSelectedLedgerPoFilterSet() {
+            const selected = getMultiSelectValues('poSelectOptions') || [];
+            if (!selected.length) return null;
+            return new Set(selected.map(v => String(v || '').trim()).filter(Boolean));
+        }
+
+        function paymentLogMatchesPoFilter(log, poFilterSet, invoicePoById) {
+            if (!poFilterSet) return true;
+            const allocs = Array.isArray(log.allocations) ? log.allocations : [];
+            if (!allocs.length) return false;
+            return allocs.some(a => {
+                const poFromAlloc = String(a.po || '').trim();
+                if (poFromAlloc && poFilterSet.has(poFromAlloc)) return true;
+                const invId = String(a.invId || a.id || '').trim();
+                const poFromInvoice = invId ? String(invoicePoById[invId] || '').trim() : '';
+                return poFromInvoice ? poFilterSet.has(poFromInvoice) : false;
+            });
+        }
+
         function openPaymentHistory() {
             if (!currentClient || currentClient === 'ALL') return alert("Please open a specific client account first.");
             const tbody = document.getElementById('paymentHistoryTableBody');
             tbody.innerHTML = '';
 
             if (!appData[currentClient].paymentHistory) appData[currentClient].paymentHistory = [];
-
-            const history = [...appData[currentClient].paymentHistory].reverse();
+            const poFilterSet = getSelectedLedgerPoFilterSet();
+            const invoicePoById = {};
+            (appData[currentClient].invoices || []).forEach(inv => {
+                invoicePoById[String(inv.id || '')] = String(inv.poNo || '');
+            });
+            const history = [...appData[currentClient].paymentHistory]
+                .reverse()
+                .filter(log => paymentLogMatchesPoFilter(log, poFilterSet, invoicePoById));
             history.forEach(log => {
                 let typeBadge = '';
                 if (log.type === 'RECEIPT') typeBadge = '<span class="status-pill pill-success">Bank Receipt</span>';
@@ -7034,8 +7098,78 @@
                                 </tr>
                             `;
             });
-            if (history.length === 0) tbody.innerHTML = `<tr><td colspan="5" style="text-align:center; padding: 20px; color:var(--text-muted); font-size:0.8rem;">No transactions recorded yet.</td></tr>`;
+            if (history.length === 0) {
+                const msg = poFilterSet ? 'No transactions found for selected PO filter.' : 'No transactions recorded yet.';
+                tbody.innerHTML = `<tr><td colspan="5" style="text-align:center; padding: 20px; color:var(--text-muted); font-size:0.8rem;">${msg}</td></tr>`;
+            }
             document.getElementById('paymentHistoryModal').style.display = 'flex';
+        }
+
+        function openExcessPoApplet() {
+            if (!currentClient || currentClient === 'ALL') return customApplet({ title: "Open Client Account", message: "Please open a specific client account first." });
+            const sel = document.getElementById('poExcessFilter');
+            if (!sel) return;
+            const pool = getPoAdvancePool(currentClient);
+            const poSet = new Set(Object.keys(pool || {}).filter(po => Number(pool[po] || 0) > 0.000001));
+            (appData[currentClient].paymentHistory || []).forEach(log => {
+                (log.allocations || []).forEach(a => {
+                    if ((a.type === 'po_advance' || a.type === 'po_advance_applied') && a.po) poSet.add(String(a.po));
+                });
+            });
+            const prev = sel.value || '';
+            sel.innerHTML = '<option value="">All PO Excess Entries</option>';
+            Array.from(poSet).sort((a, b) => a.localeCompare(b)).forEach(po => {
+                sel.innerHTML += `<option value="${esc(po)}">${escHtml(po)}</option>`;
+            });
+            if (prev && Array.from(poSet).includes(prev)) sel.value = prev;
+            renderExcessPoAppletRows();
+            document.getElementById('poExcessAppletModal').style.display = 'flex';
+        }
+
+        function renderExcessPoAppletRows() {
+            const tbody = document.getElementById('poExcessAppletBody');
+            if (!tbody || !currentClient || !appData[currentClient]) return;
+            const selectedPo = (document.getElementById('poExcessFilter')?.value || '').trim();
+            tbody.innerHTML = '';
+            const rows = [];
+            (appData[currentClient].paymentHistory || []).forEach(log => {
+                const allocs = Array.isArray(log.allocations) ? log.allocations : [];
+                allocs.forEach(a => {
+                    if (!(a.type === 'po_advance' || a.type === 'po_advance_applied')) return;
+                    const po = String(a.po || '').trim();
+                    if (!po) return;
+                    if (selectedPo && po !== selectedPo) return;
+                    rows.push({
+                        paymentId: log.id,
+                        date: log.date || '-',
+                        po,
+                        amount: Number(a.amount || 0),
+                        allocType: a.type,
+                        payType: log.type || '-',
+                        details: log.details || '',
+                        note: log.note || ''
+                    });
+                });
+            });
+            rows.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+            if (!rows.length) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:20px; color:var(--text-muted);">No PO excess payment history found for this filter.</td></tr>';
+                return;
+            }
+            rows.forEach(r => {
+                const kind = r.allocType === 'po_advance' ? 'Excess Parked' : 'Excess Applied';
+                const color = r.allocType === 'po_advance' ? 'var(--success)' : 'var(--warning)';
+                tbody.innerHTML += `
+                    <tr style="border-bottom:1px solid var(--border);">
+                        <td style="padding:12px 16px; font-weight:600;">${escHtml(r.date)}<br><span style="font-size:0.65rem; color:var(--text-muted);">ID: ${escHtml(r.paymentId)}</span></td>
+                        <td style="padding:12px 16px; font-weight:700;">${escHtml(r.po)}</td>
+                        <td style="padding:12px 16px;"><span class="status-pill" style="background:#f8fafc; color:#334155; border:1px solid #cbd5e1;">${kind}</span></td>
+                        <td style="padding:12px 16px; text-align:right; font-weight:800; color:${color};">${formatCur(r.amount)}</td>
+                        <td style="padding:12px 16px; font-size:0.8rem;">${escHtml(r.details || '-')} ${r.note ? `<br><span style="color:var(--brand-primary);">✎ ${escHtml(r.note)}</span>` : ''}</td>
+                        <td style="padding:12px 16px; text-align:center;"><button class="btn-outline btn-sm text-danger" style="border:none;" onclick="deletePaymentHistory('${esc(r.paymentId)}')" title="Delete payment record altogether">🗑️ Delete</button></td>
+                    </tr>
+                `;
+            });
         }
 
         async function deletePaymentHistory(historyId) {
@@ -7060,7 +7194,8 @@
                     }
                 await customApplet({ title: "Transaction Reversed", message: "The transaction was successfully deleted from the SQL database and ledger balances have been restored." });
                     await silentDataRefresh();
-                openPaymentHistory();
+                if (document.getElementById('paymentHistoryModal')?.style.display === 'flex') openPaymentHistory();
+                if (document.getElementById('poExcessAppletModal')?.style.display === 'flex') renderExcessPoAppletRows();
                 triggerUpdate();
 
             } catch (e) {
@@ -7595,6 +7730,14 @@
             }
         }
 
+        function getInvoiceMetricValue(inv, metricKey) {
+            if (!inv) return 0;
+            if (metricKey === 'gross') return Number(inv.total || 0);
+            if (metricKey === 'realized') return Number(inv.paid || 0);
+            if (metricKey === 'netPayable') return Number(inv.netPayable || 0);
+            return Number(inv[metricKey] || 0);
+        }
+
         function renderTableAndDashboard() {
             const thead = document.getElementById('dynamicTableHeader');
             const tbody = document.getElementById('invoiceTableBody');
@@ -7640,7 +7783,7 @@
             }
 
             let sumBilled = 0, sumReceived = 0, sumOut = 0;
-            let aggGross = 0, aggRet = 0, aggDue = 0, aggPaid = 0, aggAdv = 0, aggTds = 0;
+            let aggBasic = 0, aggGst = 0, aggGross = 0, aggRet = 0, aggDue = 0, aggPaid = 0, aggAdv = 0, aggTds = 0;
             let flatInvoices = [];
 
             clientsToRender.forEach(client => {
@@ -7685,11 +7828,27 @@
             });
 
             flatInvoices.forEach(inv => {
-                let totalPaid = (inv.paid || 0);
+                const totalPaid = getInvoiceMetricValue(inv, 'realized');
+                const netPayable = getInvoiceMetricValue(inv, 'netPayable');
+                const basicVal = getInvoiceMetricValue(inv, 'basic');
+                const gstVal = getInvoiceMetricValue(inv, 'gst');
+                const grossVal = getInvoiceMetricValue(inv, 'gross');
+                const advanceVal = getInvoiceMetricValue(inv, 'advance');
+                const tdsVal = getInvoiceMetricValue(inv, 'tds');
+                const retentionVal = getInvoiceMetricValue(inv, 'retention');
+                const balanceVal = getInvoiceMetricValue(inv, 'balance');
 
-                sumBilled += inv.netPayable; sumReceived += totalPaid; sumOut += inv.balance;
-                aggGross += inv.total || 0; aggRet += inv.retention || 0; aggDue += inv.balance || 0;
-                aggPaid += totalPaid; aggAdv += inv.advance || 0; aggTds += inv.tds || 0;
+                sumBilled += netPayable;
+                sumReceived += totalPaid;
+                sumOut += balanceVal;
+                aggBasic += basicVal;
+                aggGst += gstVal;
+                aggGross += grossVal;
+                aggRet += retentionVal;
+                aggDue += balanceVal;
+                aggPaid += totalPaid;
+                aggAdv += advanceVal;
+                aggTds += tdsVal;
 
                 let rowHtml = `<tr><td style="text-align:center;"><input type="checkbox" class="export-row-chk" onchange="updateAggregates()" data-client="${esc(inv.clientName)}" data-id="${esc(inv.id)}"></td>`;
                 userColumns.forEach(col => {
@@ -7711,8 +7870,8 @@
                 let footHtml = '<tr><td style="text-align:center;">-</td>';
                 userColumns.forEach(col => {
                     if (col.visible) {
-                        if (col.id === 'basic') footHtml += `<td style="color:var(--text-dark); text-align: right; font-weight:800;">${formatCur(sumBilled)}</td>`;
-                        else if (col.id === 'gst') footHtml += `<td style="color:var(--text-dark); text-align: right; font-weight:800;">-</td>`;
+                        if (col.id === 'basic') footHtml += `<td style="color:var(--text-dark); text-align: right; font-weight:800;">${formatCur(aggBasic)}</td>`;
+                        else if (col.id === 'gst') footHtml += `<td style="color:var(--text-dark); text-align: right; font-weight:800;">${formatCur(aggGst)}</td>`;
                         else if (col.id === 'gross') footHtml += `<td style="color:var(--text-dark); text-align: right; font-weight:800;">${formatCur(aggGross)}</td>`;
                         else if (col.id === 'advance') footHtml += `<td style="color:var(--warning); text-align: right; font-weight:800;">${formatCur(aggAdv)}</td>`;
                         else if (col.id === 'tds') footHtml += `<td style="color:var(--text-dark); text-align: right; font-weight:800;">${formatCur(aggTds)}</td>`;
@@ -8413,14 +8572,14 @@
                 let invId = box.getAttribute('data-id');
                 let inv = appData[clientName].invoices.find(i => i.id === invId);
                 if (inv) {
-                    sumGross += inv.total;
-                    let realized = (inv.paid || 0) + (inv.advance || 0);
+                    const gross = getInvoiceMetricValue(inv, 'gross');
+                    const realized = getInvoiceMetricValue(inv, 'realized');
+                    const balance = getInvoiceMetricValue(inv, 'balance');
+                    sumGross += gross;
                     sumPaid += realized;
-                    sumBal += inv.balance;
+                    sumBal += balance;
 
-                    let dynVal = 0;
-                    if (colName === 'realized') dynVal = realized;
-                    else dynVal = inv[colName] || 0;
+                    const dynVal = getInvoiceMetricValue(inv, colName);
                     dynValues.push(dynVal);
                 }
             });
@@ -8904,6 +9063,8 @@
                                         <td><input type="text" id="bulk_lr_${index}" value="${esc(inv.lrNo || '')}" style="width:90px; height: 30px;"></td>
                                         <td><input type="date" id="bulk_date_${index}" value="${esc(inv.date || '')}" style="width:110px; height: 30px;"></td>
                                         <td><input type="number" id="bulk_basic_${index}" value="${esc(inv.basic || 0)}" style="width:100px; text-align:right; font-weight:bold; color:var(--brand-primary); height: 30px;"></td>
+                                        <td style="text-align:center;"><input type="checkbox" id="bulk_gst_${index}" checked style="width:16px; height:16px; accent-color:var(--brand-primary);"></td>
+                                        <td style="text-align:center;"><input type="checkbox" id="bulk_tds_${index}" style="width:16px; height:16px; accent-color:var(--brand-primary);"></td>
                                     </tr>
                                 `;
             });
@@ -8927,10 +9088,12 @@
                 const lrNo = document.getElementById(`bulk_lr_${i}`).value.trim();
                 const invDate = document.getElementById(`bulk_date_${i}`).value;
                 const basic = parseFloat(document.getElementById(`bulk_basic_${i}`).value) || 0;
+                const applyGst = !!document.getElementById(`bulk_gst_${i}`)?.checked;
+                const applyTds = !!document.getElementById(`bulk_tds_${i}`)?.checked;
 
                 if (!invNo || basic <= 0) continue;
 
-                const gst = basic * 0.18;
+                const gst = applyGst ? basic * 0.18 : 0;
                 const total = basic + gst;
                 let tds = 0;
                 let retention = 0;
@@ -8940,12 +9103,12 @@
                     let baseAmt = terms.base === 'basic' ? basic : total;
                     retention = baseAmt * (terms.ret / 100);
 
-                    if (terms.tdsEnabled) {
+                    if (applyTds && terms.tdsEnabled) {
                         let baseAmtForTds = terms.tdsBase === 'total' ? total : basic;
                         tds = baseAmtForTds * (terms.dynamicTdsRate || 0);
                     }
                 } else {
-                    tds = basic * 0.001;
+                    tds = applyTds ? (basic * 0.001) : 0;
                 }
 
                 const netPayable = total - tds;
