@@ -8032,7 +8032,7 @@
                 Array.from(uniquePOs).sort().forEach(po => {
                     let isChecked = currentSelections.includes(po) ? 'checked' : '';
                     // CRITICAL FIX: Changed onchange to call triggerUpdate()
-                    poContainer.innerHTML += `<label class="multi-option"><input type="checkbox" value="${esc(po)}" ${isChecked} onchange="triggerUpdate()"> ${po}</label>`;
+                    poContainer.innerHTML += `<label class="multi-option"><input type="checkbox" value="${esc(po)}" ${isChecked} onchange="triggerUpdate()"> ${escHtml(po)}</label>`;
                 });
                 updateMultiSelectLabel('poSelectOptions', 'poSelectLabel', 'Filter by POs...');
             }
@@ -8041,7 +8041,7 @@
                 Array.from(uniqueSubs).sort().forEach(sub => {
                     let isChecked = currentSubSelections.includes(sub) ? 'checked' : '';
                     // CRITICAL FIX: Changed onchange to call triggerUpdate()
-                    subContainer.innerHTML += `<label class="multi-option"><input type="checkbox" value="${esc(sub)}" ${isChecked} onchange="triggerUpdate()"> ${sub}</label>`;
+                    subContainer.innerHTML += `<label class="multi-option"><input type="checkbox" value="${esc(sub)}" ${isChecked} onchange="triggerUpdate()"> ${escHtml(sub)}</label>`;
                 });
                 updateMultiSelectLabel('subSelectOptions', 'subSelectLabel', 'Sub-Entities...');
             }
