@@ -1,0 +1,38 @@
+# Run with:
+#   pip install pre-commit
+#   pre-commit install        (sets up the git hook)
+#   pre-commit run --all-files (one-off run across the whole repo)
+#
+# Hooks deliberately stay in CHECK-ONLY mode (no autofix) so a human always
+# decides what changes. Bump rev pins together with the test suite.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.7.4
+    hooks:
+      - id: ruff           # lint (config in pyproject.toml)
+      - id: ruff-format    # format check only; does not rewrite files
+
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v4.0.0-alpha.8
+    hooks:
+      - id: prettier
+        types_or: [css, javascript, html, json, yaml, markdown]
+        args: ["--check"]   # report only; do not auto-rewrite
+        exclude: |
+          (?x)^(
+            venv/.*|
+            db_backups/.*|
+            public/index\.html  # too large to format reliably until module split
+          )$

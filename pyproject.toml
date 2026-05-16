@@ -1,0 +1,33 @@
+# Centralised tool configuration for AchintERP. Keep this file conservative -
+# we do NOT enable auto-fixes by default; pre-commit invokes ruff in --check
+# mode so a developer is always in the loop.
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [
+    "venv",
+    ".venv",
+    "alembic/versions",
+    "db_backups",
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+# Start small: pycodestyle (E/W), pyflakes (F), bugbear (B), isort (I),
+# pyupgrade (UP). Pick more rules over time once the codebase is clean.
+select = ["E", "F", "W", "B", "I", "UP"]
+ignore = [
+    "E501",   # line too long - we already pin line-length above; some long lines are intentional
+    "B008",   # function call in argument default - FastAPI's Depends() pattern
+    "UP006",  # use list[] over List[] - some legacy spots still use typing.List for clarity
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B"]   # asserts and fixture patterns trigger noisy bugbear hits
+
+[tool.ruff.format]
+quote-style = "preserve"
+indent-style = "space"
+
+# pytest config lives in pytest.ini for backward compatibility.

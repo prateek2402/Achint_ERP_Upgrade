@@ -12,3 +12,7 @@ erp_database.sqlite
 ~$*.xlsx
 legacy_import_status.json
 .legacy_import_once.marker
+
+# Backup restore drill (transient sandbox copies + JSON reports)
+db_backups/_drill_sandbox/
+db_backups/drill_report_*.json

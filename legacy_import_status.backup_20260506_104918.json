@@ -1,0 +1,135 @@
+{
+  "started_at": "2026-04-24T07:13:42.354015Z",
+  "source_db": "old_erp.sqlite",
+  "source_payload_id": 1,
+  "mode": "one_time_full_replace",
+  "counts": {
+    "users": {
+      "read": 5,
+      "inserted": 5,
+      "skipped": 0
+    },
+    "clients": {
+      "read": 11,
+      "inserted": 11,
+      "skipped": 0
+    },
+    "purchase_orders": {
+      "read": 8,
+      "inserted": 24,
+      "skipped": 0
+    },
+    "po_baseline_items": {
+      "read": 0,
+      "inserted": 0,
+      "skipped": 0
+    },
+    "invoices": {
+      "read": 216,
+      "inserted": 216,
+      "skipped": 0
+    },
+    "dispatch_items": {
+      "read": 0,
+      "inserted": 0,
+      "skipped": 0
+    },
+    "payments": {
+      "read": 108,
+      "inserted": 108,
+      "skipped": 0
+    },
+    "allocations": {
+      "read": 364,
+      "inserted": 364,
+      "skipped": 0
+    }
+  },
+  "warnings": [],
+  "client_totals": [
+    {
+      "client": "RHI Magnesita",
+      "invoice_count": 0,
+      "payment_total": 0,
+      "open_balance": 0,
+      "excess_funds": 0.0
+    },
+    {
+      "client": "AM/NS Gujarat",
+      "invoice_count": 24,
+      "payment_total": 5959333.56,
+      "open_balance": 8508949.3,
+      "excess_funds": 0.0
+    },
+    {
+      "client": "JSW",
+      "invoice_count": 0,
+      "payment_total": 0,
+      "open_balance": 0,
+      "excess_funds": 0.0
+    },
+    {
+      "client": "TRL Krosaki",
+      "invoice_count": 11,
+      "payment_total": 6164952.52,
+      "open_balance": 2439269.72,
+      "excess_funds": 2.2
+    },
+    {
+      "client": "SLR Metaliks",
+      "invoice_count": 31,
+      "payment_total": 38638921.65,
+      "open_balance": 8272.8,
+      "excess_funds": 0.0
+    },
+    {
+      "client": "Rashmi",
+      "invoice_count": 24,
+      "payment_total": 24956072.87,
+      "open_balance": 13105135.71,
+      "excess_funds": 0.0
+    },
+    {
+      "client": "BALCO",
+      "invoice_count": 112,
+      "payment_total": 80167910.61,
+      "open_balance": 13297096.98,
+      "excess_funds": 1832962.2
+    },
+    {
+      "client": "Adithya Power",
+      "invoice_count": 5,
+      "payment_total": 2498218.0,
+      "open_balance": 2609135.18,
+      "excess_funds": 0.94
+    },
+    {
+      "client": "Ciria India",
+      "invoice_count": 3,
+      "payment_total": 0,
+      "open_balance": 3305021.73,
+      "excess_funds": 0.0
+    },
+    {
+      "client": "EMERGE RENEWABLES PVT LTD",
+      "invoice_count": 4,
+      "payment_total": 0,
+      "open_balance": 3391355.78,
+      "excess_funds": 0.0
+    },
+    {
+      "client": "Arvind IND",
+      "invoice_count": 2,
+      "payment_total": 141600.0,
+      "open_balance": 318330.0,
+      "excess_funds": 0.0
+    }
+  ],
+  "integrity": {
+    "orphan_dispatch_rows": 0,
+    "orphan_allocation_payment_rows": 0,
+    "invoice_allocation_missing_invoice_refs": 0
+  },
+  "success": true,
+  "completed_at": "2026-04-24T07:13:44.318373Z"
+}

@@ -1,9 +1,27 @@
-fastapi
-uvicorn[standard]
-sqlalchemy
-pydantic
-google-generativeai
-PyJWT
-python-multipart
-openpyxl
-requests
+# --- Runtime dependencies ---
+# Pinned for reproducible installs. Bump deliberately and re-run the test suite
+# (pytest + Playwright) before merging any change here.
+
+fastapi==0.136.0
+uvicorn[standard]==0.44.0
+starlette==1.0.0
+
+sqlalchemy==2.0.49
+alembic==1.18.4
+pydantic==2.13.2
+
+# Gemini: we now use google-genai (modern SDK). google-generativeai stays pinned
+# as a fallback so existing callers keep working until every site is migrated.
+google-genai==1.73.1
+google-generativeai==0.8.6
+
+PyJWT==2.12.1
+# Never install PyPI package `jwt` (Gehirn); it merges into site-packages/jwt and breaks PyJWT.login.
+python-multipart==0.0.26
+openpyxl==3.1.5
+requests==2.33.1
+
+# --- Test / QA dependencies ---
+pytest==9.0.3
+playwright==1.59.0
+pytest-playwright==0.7.2

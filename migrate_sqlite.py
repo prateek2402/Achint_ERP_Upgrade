@@ -74,7 +74,7 @@ def recalculate_client_ledger(client_id: int, db):
     inv_map = {inv.invoice_no: inv for inv in invoices}
 
     for inv in invoices:
-        inv.net_payable = (inv.total or 0.0) - (inv.advance_adj or 0.0) - (inv.tds_ded or 0.0) - (inv.retention_held or 0.0)
+        inv.net_payable = (inv.total or 0.0) - (inv.advance_adj or 0.0)
         inv.paid = 0.0
         inv.balance = inv.net_payable
 
@@ -242,21 +242,54 @@ def run_import(force: bool = False):
                     report["counts"]["purchase_orders"]["skipped"] += 1
                     continue
                 terms = terms or {}
+                imported_pool = to_float(po_advance_map.get(po_no, 0.0), 0.0)
                 po = PurchaseOrder(
                     client_id=client.id,
                     po_no=str(po_no).strip(),
                     adv_pct=to_float(terms.get("advPct", terms.get("adv", 0.0)), 0.0),
                     ret_pct=to_float(terms.get("retPct", terms.get("ret", 0.0)), 0.0),
                     ret_base=str(terms.get("retBase", terms.get("base", "basic")) or "basic"),
+                    tds_base=str(terms.get("tdsBase", terms.get("tds_base", "basic")) or "basic"),
                     tds_enabled=bool(terms.get("tdsEnabled", False)),
                     tds_rate=to_float(terms.get("tdsRate", 0.0), 0.0),
                     tds_threshold=to_float(terms.get("tdsThreshold", 0.0), 0.0),
-                    advance_pool=to_float(po_advance_map.get(po_no, 0.0), 0.0),
+                    # Legacy snapshot kept a separate PO advance wallet map.
+                    # Runtime allocator consumes wallets from payment_allocations
+                    # (alloc_type='po_advance'), so we materialize those rows below.
+                    # Keep column at 0 to avoid dual-source drift.
+                    advance_pool=0.0,
                 )
                 db.add(po)
                 db.flush()
                 po_id_map[po.po_no] = po.id
                 report["counts"]["purchase_orders"]["inserted"] += 1
+
+                if imported_pool > 0:
+                    adv_pay_id = ensure_unique_payment_id(f"LEGACY_PO_ADV_{client.id}_{po.po_no}", used_payment_ids)
+                    db.add(
+                        PaymentHistory(
+                            id=adv_pay_id,
+                            client_id=client.id,
+                            date=datetime.date.today(),
+                            type="RECEIPT",
+                            amount=float(imported_pool),
+                            details=f"Legacy PO advance wallet import ({po.po_no})",
+                            note="Imported from legacy poAdvances map",
+                        )
+                    )
+                    db.flush()
+                    db.add(
+                        PaymentAllocation(
+                            payment_id=adv_pay_id,
+                            alloc_type="po_advance",
+                            target_inv_id=None,
+                            target_po_no=po.po_no,
+                            note_id=None,
+                            amount=float(imported_pool),
+                        )
+                    )
+                    report["counts"]["payments"]["inserted"] += 1
+                    report["counts"]["allocations"]["inserted"] += 1
 
                 baseline_items = terms.get("baselineItems") or []
                 report["counts"]["po_baseline_items"]["read"] += len(baseline_items)
