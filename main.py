@@ -2177,7 +2177,7 @@ def recalculate_client_ledger(client_id: int, db: Session, preserve_manual_paid:
     }
     # Ensure PO advance wallet is always distributed to eligible invoices before
     # ledger math is recalculated (covers new invoices and term changes).
-    _auto_apply_po_advance(client_id, db)
+    _auto_apply_po_advance(client_id, db, respect_manual_paid=preserve_manual_paid)
     db.flush()
 
     payments = db.query(PaymentHistory).filter(PaymentHistory.client_id == client_id).all()
@@ -2311,7 +2311,13 @@ def _strip_po_advance_applied_for_po(client_id: int, po_no: str, db: Session) ->
     return len(rows)
 
 
-def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = None, invoice_no: Optional[str] = None):
+def _auto_apply_po_advance(
+    client_id: int,
+    db: Session,
+    po_no: Optional[str] = None,
+    invoice_no: Optional[str] = None,
+    respect_manual_paid: bool = False,
+):
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.client_id == client_id)
     if po_no:
         po_query = po_query.filter(PurchaseOrder.po_no == po_no)
@@ -2403,7 +2409,7 @@ def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = N
             paid_for_cap = (
                 float(paid_by_invoice.get(inv.invoice_no, 0.0))
                 if inv.invoice_no in invoices_with_paid_allocs
-                else float(inv.paid or 0.0)
+                else (float(inv.paid or 0.0) if respect_manual_paid else 0.0)
             )
             tds_for_cap = invoice_tds_for_po_terms(inv, po)
             room_before_credit = max(
