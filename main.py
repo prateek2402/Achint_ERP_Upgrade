@@ -970,60 +970,6 @@ def create_user(user_data: UserCreate, current_user: User = Depends(get_current_
     new_user = User(username=username, hashed_password=hash_password(user_data.password), role=normalized_role)
     db.add(new_user)
     db.commit()
-    if inv.po_no and inv.po_no != "UNASSIGNED":
-        po_obj = db.query(PurchaseOrder).filter(
-            PurchaseOrder.client_id == inv.client_id,
-            PurchaseOrder.po_no == inv.po_no
-        ).first()
-        if po_obj and float(po_obj.adv_pct or 0.0) > 0:
-            added_by_payment: dict[str, float] = defaultdict(float)
-            consumed_by_payment: dict[str, float] = defaultdict(float)
-            po_allocs = db.query(PaymentAllocation).join(
-                PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id
-            ).filter(
-                PaymentHistory.client_id == inv.client_id,
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.alloc_type.in_(["po_advance", "po_advance_applied"]),
-            ).all()
-            for al in po_allocs:
-                pid = str(al.payment_id or "").strip()
-                if not pid:
-                    continue
-                if al.alloc_type == "po_advance":
-                    added_by_payment[pid] += float(al.amount or 0.0)
-                elif al.alloc_type == "po_advance_applied":
-                    consumed_by_payment[pid] += float(al.amount or 0.0)
-
-            base_amt = float(new_inv.basic or 0.0) if (po_obj.ret_base or "total") == "basic" else float(new_inv.total or 0.0)
-            max_allowed = max(0.0, base_amt * (float(po_obj.adv_pct or 0.0) / 100.0))
-            existing_applied = db.query(PaymentAllocation).filter(
-                PaymentAllocation.alloc_type == "po_advance_applied",
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.target_inv_id == new_inv.invoice_no
-            ).all()
-            already_applied = sum(float(a.amount or 0.0) for a in existing_applied)
-            shortfall = max(0.0, max_allowed - already_applied)
-
-            if shortfall > 0:
-                for pid, added_amt in added_by_payment.items():
-                    remaining_amt = float(added_amt) - float(consumed_by_payment.get(pid, 0.0))
-                    if remaining_amt <= 0:
-                        continue
-                    take = min(shortfall, remaining_amt)
-                    if take <= 0:
-                        continue
-                    db.add(PaymentAllocation(
-                        payment_id=pid,
-                        alloc_type="po_advance_applied",
-                        target_inv_id=new_inv.invoice_no,
-                        target_po_no=inv.po_no,
-                        note_id=None,
-                        amount=float(take),
-                    ))
-                    shortfall -= take
-                    if shortfall <= 0:
-                        break
-        db.commit()
     return {"success": True, "id": new_user.id}
 
 
@@ -2231,7 +2177,7 @@ def recalculate_client_ledger(client_id: int, db: Session, preserve_manual_paid:
     }
     # Ensure PO advance wallet is always distributed to eligible invoices before
     # ledger math is recalculated (covers new invoices and term changes).
-    _auto_apply_po_advance(client_id, db)
+    _auto_apply_po_advance(client_id, db, respect_manual_paid=preserve_manual_paid)
     db.flush()
 
     payments = db.query(PaymentHistory).filter(PaymentHistory.client_id == client_id).all()
@@ -2365,13 +2311,38 @@ def _strip_po_advance_applied_for_po(client_id: int, po_no: str, db: Session) ->
     return len(rows)
 
 
-def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = None, invoice_no: Optional[str] = None):
+def _auto_apply_po_advance(
+    client_id: int,
+    db: Session,
+    po_no: Optional[str] = None,
+    invoice_no: Optional[str] = None,
+    respect_manual_paid: bool = False,
+):
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.client_id == client_id)
     if po_no:
         po_query = po_query.filter(PurchaseOrder.po_no == po_no)
     po_rows = po_query.all()
     if not po_rows:
         return
+
+    paid_by_invoice: dict[str, float] = defaultdict(float)
+    invoices_with_paid_allocs: set[str] = set()
+    paid_rows = db.query(
+        PaymentAllocation.target_inv_id,
+        func.sum(PaymentAllocation.amount),
+    ).join(
+        PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id
+    ).filter(
+        PaymentHistory.client_id == client_id,
+        PaymentAllocation.alloc_type == "invoice",
+        PaymentAllocation.target_inv_id.isnot(None),
+    ).group_by(PaymentAllocation.target_inv_id).all()
+    for inv_id, paid_amt in paid_rows:
+        inv_key = str(inv_id or "").strip()
+        if not inv_key:
+            continue
+        invoices_with_paid_allocs.add(inv_key)
+        paid_by_invoice[inv_key] = float(paid_amt or 0.0)
 
     for po in po_rows:
         adv_pct = float(po.adv_pct or 0.0)
@@ -2435,6 +2406,17 @@ def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = N
             max_allowed = max(0.0, base_amt * (adv_pct / 100.0))
             current_applied = float(applied_by_invoice.get(inv.invoice_no, 0.0))
             shortfall = max(0.0, max_allowed - current_applied)
+            paid_for_cap = (
+                float(paid_by_invoice.get(inv.invoice_no, 0.0))
+                if inv.invoice_no in invoices_with_paid_allocs
+                else (float(inv.paid or 0.0) if respect_manual_paid else 0.0)
+            )
+            tds_for_cap = invoice_tds_for_po_terms(inv, po)
+            room_before_credit = max(
+                0.0,
+                float(inv.total or 0.0) - tds_for_cap - current_applied - paid_for_cap,
+            )
+            shortfall = min(shortfall, room_before_credit)
             if shortfall <= 0:
                 continue
 
@@ -2469,6 +2451,24 @@ def invoice_amount_for_po_base(inv: Invoice, base_kind: Optional[str]) -> float:
     if kind == "basic":
         return float(inv.basic or 0.0)
     return float(inv.total or 0.0)
+
+
+def invoice_tds_for_po_terms(inv: Invoice, po: Optional[PurchaseOrder]) -> float:
+    if po is None:
+        return float(inv.tds_ded or 0.0)
+    tds_base_kind = (getattr(po, "tds_base", None) or po.ret_base or "basic")
+    tds_base_amount = invoice_amount_for_po_base(inv, tds_base_kind)
+    tds_fraction = max(0.0, float(po.tds_rate or 0.0)) / 100.0
+    tds_threshold = float(po.tds_threshold or 0.0)
+    if not (bool(po.tds_enabled) and tds_base_amount >= tds_threshold and tds_fraction > 0.0):
+        return 0.0
+    return max(0.0, tds_base_amount * tds_fraction)
+
+
+def invoice_effective_balance(inv: Invoice, paid_amount: Optional[float] = None) -> float:
+    paid = float(inv.paid or 0.0) if paid_amount is None else float(paid_amount or 0.0)
+    net_payable = max(0.0, float(inv.total or 0.0) - float(inv.advance_adj or 0.0) - float(inv.tds_ded or 0.0))
+    return net_payable - paid
 
 
 def round_qty_total(value: Optional[float]) -> float:
@@ -3283,7 +3283,7 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
                     max_allowed = base_amt * (adv_pct / 100.0)
                     current_advance = float(inv.advance_adj or 0.0)
                     shortfall = max(0.0, max_allowed - current_advance)
-                    inv_balance_for_adv = float(inv.balance or 0.0)
+                    inv_balance_for_adv = max(0.0, invoice_effective_balance(inv))
                     to_apply_adv = min(shortfall, available_pool, inv_balance_for_adv)
                     if to_apply_adv > 0:
                         inv.advance_adj = current_advance + to_apply_adv
@@ -3295,7 +3295,7 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
                 continue
             if remaining <= 0:
                 break
-            inv_balance = float(inv.balance or 0.0)
+            inv_balance = invoice_effective_balance(inv)
 
             # Overpayment: only honoured when mode=targeted and a specific
             # positive amount was requested for this invoice. Cascade mode
@@ -3344,7 +3344,7 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
         for inv in pending_invoices:
             if remaining <= 0:
                 break
-            inv_balance = float(inv.balance or 0.0)
+            inv_balance = invoice_effective_balance(inv)
             if inv_balance <= 0:
                 continue
             amount_to_apply = min(inv_balance, remaining)
