@@ -110,6 +110,61 @@ def create_client_po_invoice(client: TestClient, token: str):
     return client_id
 
 
+def create_simple_po_invoice(client: TestClient, token: str, po_no: str, invoice_no: str, adv_pct: float = 20.0):
+    c = client.post("/api/clients", json={"name": f"CLIENT-{invoice_no}"}, headers=auth_header(token))
+    assert c.status_code == 200, c.text
+    client_id = c.json()["id"]
+
+    po = client.post(
+        "/api/purchase-orders",
+        json={
+            "client_id": client_id,
+            "po_no": po_no,
+            "contact_person": "Ops",
+            "project_name": "Advance cap",
+            "adv_pct": adv_pct,
+            "ret_pct": 0.0,
+            "ret_base": "total",
+            "tds_base": "basic",
+            "tds_enabled": False,
+            "tds_rate": 0.0,
+            "tds_threshold": 0.0,
+            "baseline_items": [],
+        },
+        headers=auth_header(token),
+    )
+    assert po.status_code == 200, po.text
+
+    inv = client.post(
+        "/api/invoices",
+        json={
+            "client_id": client_id,
+            "po_no": po_no,
+            "invoice_no": invoice_no,
+            "sub_entity": "",
+            "lr_no": "",
+            "inv_date": "2026-04-01",
+            "due_date": None,
+            "basic": 1000.0,
+            "gst": 0.0,
+            "total": 1000.0,
+            "advance_adj": 0.0,
+            "tds_ded": 0.0,
+            "retention_held": 0.0,
+            "net_payable": 0.0,
+            "paid": 0.0,
+            "balance": 0.0,
+            "is_note": False,
+            "note_type": None,
+            "note_reason": None,
+            "dispatch_items": [],
+        },
+        headers=auth_header(token),
+    )
+    assert inv.status_code == 200, inv.text
+    return client_id
+
+
 def test_invoice_ledger_sort_key_orders_by_date_fy_then_sequence():
     import datetime
 
@@ -180,6 +235,21 @@ def test_auth_and_permission_guards(client: TestClient):
     # Admin happy path still works.
     as_admin = client.post("/api/clients", json={"name": "OK-CLIENT"}, headers=auth_header(admin_token))
     assert as_admin.status_code == 200
+
+
+def test_admin_can_create_user_without_server_error(client: TestClient):
+    admin_token = login(client, "admin", "Admin@1234")
+
+    created = client.post(
+        "/api/users",
+        json={"username": "new.finance", "password": "Finance@12345", "role": "user"},
+        headers=auth_header(admin_token),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["success"] is True
+
+    new_token = login(client, "new.finance", "Finance@12345")
+    assert new_token
 
 
 def test_payment_allocations_use_invid_field(client: TestClient):
@@ -257,6 +327,21 @@ def test_duplicate_invoice_rejected(client: TestClient):
     dup = client.post("/api/invoices", json=dup_payload, headers=auth_header(token))
     assert dup.status_code == 400
     assert "already exists" in dup.json()["detail"].lower()
+
+
+def test_purchase_order_status_update_and_delete_do_not_crash(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    create_client_po_invoice(client, token)
+
+    status = client.put(
+        "/api/purchase-orders/PO-001/status",
+        json={"is_completed": True, "is_hidden": False},
+        headers=auth_header(token),
+    )
+    assert status.status_code == 200, status.text
+
+    deleted = client.delete("/api/purchase-orders/PO-001", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
 
 
 def test_delete_then_readd_invoice_drops_old_allocations(client: TestClient):
@@ -594,6 +679,114 @@ def test_po_advance_auto_apply_existing_and_new_invoices(client: TestClient):
     invs2 = client.get("/api/invoices", headers=auth_header(token)).json()
     inv3 = next(i for i in invs2 if i["id"] == "INV-ADV-3")
     assert inv3["advance"] == pytest.approx(40.0, abs=0.05)
+
+
+def test_po_advance_auto_apply_cannot_create_implicit_invoice_credit(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_simple_po_invoice(client, token, "PO-ADV-CAP-AUTO", "INV-ADV-CAP-AUTO", adv_pct=20.0)
+
+    receipt = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-ADV-CAP-RECEIPT",
+        "date": datetime.date.today().isoformat(),
+        "amount": 950.0,
+        "note": "almost full receipt",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-ADV-CAP-AUTO", "amount": 950.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "move_to_po": None,
+        "po_no": None,
+        "clear_po_pool": False,
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert receipt.status_code == 200, receipt.text
+
+    advance = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-ADV-CAP-POOL",
+        "date": datetime.date.today().isoformat(),
+        "amount": 200.0,
+        "note": "po advance add",
+        "mode": "targeted",
+        "targets": [],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "move_to_po": "PO-ADV-CAP-AUTO",
+        "po_no": "PO-ADV-CAP-AUTO",
+        "clear_po_pool": False,
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert advance.status_code == 200, advance.text
+
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    inv = next(i for i in invs if i["id"] == "INV-ADV-CAP-AUTO")
+    assert inv["advance"] == pytest.approx(50.0)
+    assert inv["paid"] == pytest.approx(950.0)
+    assert inv["balance"] == pytest.approx(0.0)
+
+
+def test_apply_adv_receipt_allocation_uses_post_advance_balance(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_simple_po_invoice(client, token, "PO-ADV-CAP-MANUAL", "INV-ADV-CAP-MANUAL", adv_pct=20.0)
+
+    db = app_module.SessionLocal()
+    try:
+        db.add(app_module.PaymentHistory(
+            id="PAY-SEEDED-ADV",
+            client_id=client_id,
+            date=datetime.date.today(),
+            type="RECEIPT",
+            amount=100.0,
+            details="seeded unapplied PO advance",
+        ))
+        db.flush()
+        db.add(app_module.PaymentAllocation(
+            payment_id="PAY-SEEDED-ADV",
+            alloc_type="po_advance",
+            target_inv_id=None,
+            target_po_no="PO-ADV-CAP-MANUAL",
+            note_id=None,
+            amount=100.0,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    alloc = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-ADV-CAP-MANUAL",
+        "date": datetime.date.today().isoformat(),
+        "amount": 1000.0,
+        "note": "apply advance plus receipt",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-ADV-CAP-MANUAL", "amount": 1000.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": True,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "move_to_po": None,
+        "po_no": "PO-ADV-CAP-MANUAL",
+        "clear_po_pool": False,
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert alloc.status_code == 200, alloc.text
+
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    inv = next(i for i in invs if i["id"] == "INV-ADV-CAP-MANUAL")
+    assert inv["advance"] == pytest.approx(100.0)
+    assert inv["paid"] == pytest.approx(900.0)
+    assert inv["balance"] == pytest.approx(0.0)
 
 
 def test_po_advance_pools_api_and_manual_recalculate(client: TestClient):
