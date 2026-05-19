@@ -250,6 +250,8 @@ def ensure_schema_columns():
 
         cur.execute("PRAGMA table_info(po_baseline_items)")
         baseline_cols = {row[1] for row in cur.fetchall()}
+        if "inspected_qty" not in baseline_cols:
+            cur.execute("ALTER TABLE po_baseline_items ADD COLUMN inspected_qty REAL DEFAULT 0")
         if "material_type" not in baseline_cols:
             cur.execute("ALTER TABLE po_baseline_items ADD COLUMN material_type TEXT")
         if "dispatch_alias" not in baseline_cols:
@@ -259,6 +261,8 @@ def ensure_schema_columns():
 
         cur.execute("PRAGMA table_info(invoice_dispatch_items)")
         dispatch_cols = {row[1] for row in cur.fetchall()}
+        if "inspected_qty" not in dispatch_cols:
+            cur.execute("ALTER TABLE invoice_dispatch_items ADD COLUMN inspected_qty REAL DEFAULT 0")
         if "rate_per_uom" not in dispatch_cols:
             cur.execute("ALTER TABLE invoice_dispatch_items ADD COLUMN rate_per_uom REAL DEFAULT 0")
 
@@ -1322,8 +1326,6 @@ def update_purchase_order_status(po_no: str, status: POStatusSchema, current_use
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
     po = po_query.first()
     if not po:
         raise HTTPException(status_code=404, detail="PO not found")
@@ -1338,8 +1340,6 @@ def delete_purchase_order(po_no: str, current_user: User = Depends(get_current_u
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
     po = po_query.first()
     if po:
         client_id = po.client_id
@@ -3941,10 +3941,61 @@ def transfer_invoice(invoice_no: str, req: TransferRequest, request: Request, cu
         db.commit()
         recalculate_client_ledger(req.new_client_id, db)
     elif req.action == "move":
+        old_po_no = db_inv.purchase_order.po_no if db_inv.purchase_order else None
+        reopened_unallocated_by_payment: dict[str, float] = defaultdict(float)
+        linked_allocs = db.query(PaymentAllocation).filter(
+            or_(
+                PaymentAllocation.target_inv_id == db_inv.invoice_no,
+                PaymentAllocation.note_id == db_inv.invoice_no,
+            )
+        ).all()
+        pay_map = {}
+        if linked_allocs:
+            pids = list({a.payment_id for a in linked_allocs if a.payment_id})
+            if pids:
+                pay_rows = db.query(PaymentHistory).filter(PaymentHistory.id.in_(pids)).all()
+                pay_map = {p.id: p for p in pay_rows}
+        linked_payment_ids = {a.payment_id for a in linked_allocs if a.payment_id}
+        for al in linked_allocs:
+            pay_obj = pay_map.get(al.payment_id)
+            if pay_obj and pay_obj.type == "RECEIPT" and al.alloc_type == "invoice":
+                reopened_unallocated_by_payment[al.payment_id] += float(al.amount or 0.0)
+            db.delete(al)
+        db.flush()
+        for pid in linked_payment_ids:
+            remaining = db.query(PaymentAllocation).filter(PaymentAllocation.payment_id == pid).count()
+            if remaining == 0:
+                ph = db.query(PaymentHistory).filter(
+                    PaymentHistory.id == pid,
+                    PaymentHistory.type.in_(["ADVANCE_APPLIED", "NOTE_APPLIED", "UNALLOCATED_APPLIED"])
+                ).first()
+                if ph:
+                    db.delete(ph)
+        for pay_id, reopened_amt in reopened_unallocated_by_payment.items():
+            reopened_amt = round_inr_nearest(reopened_amt)
+            if reopened_amt <= 0:
+                continue
+            db.add(UnallocatedPaymentRegister(
+                client_id=old_client_id,
+                source_payment_id=pay_id,
+                created_on=datetime.date.today(),
+                amount=float(reopened_amt),
+                balance=float(reopened_amt),
+                status="open",
+                note=_build_unallocated_register_note(
+                    "invoice_deleted",
+                    f"Invoice {invoice_no} moved to client {req.new_client_id}; allocation reopened.",
+                    invoice_no=invoice_no,
+                    po_no=old_po_no or "UNASSIGNED",
+                ),
+            ))
         db_inv.client_id = req.new_client_id
         db_inv.po_id = None
         db_inv.advance_adj = 0
         db_inv.paid = 0
+        db.flush()
+        if old_po_no:
+            _auto_apply_po_advance(old_client_id, db, old_po_no)
         db.commit()
         recalculate_client_ledger(old_client_id, db)
         recalculate_client_ledger(req.new_client_id, db)
