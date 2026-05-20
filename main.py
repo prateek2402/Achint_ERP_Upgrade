@@ -813,7 +813,10 @@ class InvoiceCreate(BaseModel):
     dispatch_items: list[DispatchItemCreate] = [] # Ensure this matches the frontend key
 
 class InvoiceUpdate(InvoiceCreate):
-    pass
+    is_note: Optional[bool] = None
+    note_type: Optional[str] = None
+    note_reason: Optional[str] = None
+    dispatch_items: Optional[list[DispatchItemCreate]] = None
 
 
 class LedgerExportRequest(BaseModel):
@@ -970,60 +973,6 @@ def create_user(user_data: UserCreate, current_user: User = Depends(get_current_
     new_user = User(username=username, hashed_password=hash_password(user_data.password), role=normalized_role)
     db.add(new_user)
     db.commit()
-    if inv.po_no and inv.po_no != "UNASSIGNED":
-        po_obj = db.query(PurchaseOrder).filter(
-            PurchaseOrder.client_id == inv.client_id,
-            PurchaseOrder.po_no == inv.po_no
-        ).first()
-        if po_obj and float(po_obj.adv_pct or 0.0) > 0:
-            added_by_payment: dict[str, float] = defaultdict(float)
-            consumed_by_payment: dict[str, float] = defaultdict(float)
-            po_allocs = db.query(PaymentAllocation).join(
-                PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id
-            ).filter(
-                PaymentHistory.client_id == inv.client_id,
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.alloc_type.in_(["po_advance", "po_advance_applied"]),
-            ).all()
-            for al in po_allocs:
-                pid = str(al.payment_id or "").strip()
-                if not pid:
-                    continue
-                if al.alloc_type == "po_advance":
-                    added_by_payment[pid] += float(al.amount or 0.0)
-                elif al.alloc_type == "po_advance_applied":
-                    consumed_by_payment[pid] += float(al.amount or 0.0)
-
-            base_amt = float(new_inv.basic or 0.0) if (po_obj.ret_base or "total") == "basic" else float(new_inv.total or 0.0)
-            max_allowed = max(0.0, base_amt * (float(po_obj.adv_pct or 0.0) / 100.0))
-            existing_applied = db.query(PaymentAllocation).filter(
-                PaymentAllocation.alloc_type == "po_advance_applied",
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.target_inv_id == new_inv.invoice_no
-            ).all()
-            already_applied = sum(float(a.amount or 0.0) for a in existing_applied)
-            shortfall = max(0.0, max_allowed - already_applied)
-
-            if shortfall > 0:
-                for pid, added_amt in added_by_payment.items():
-                    remaining_amt = float(added_amt) - float(consumed_by_payment.get(pid, 0.0))
-                    if remaining_amt <= 0:
-                        continue
-                    take = min(shortfall, remaining_amt)
-                    if take <= 0:
-                        continue
-                    db.add(PaymentAllocation(
-                        payment_id=pid,
-                        alloc_type="po_advance_applied",
-                        target_inv_id=new_inv.invoice_no,
-                        target_po_no=inv.po_no,
-                        note_id=None,
-                        amount=float(take),
-                    ))
-                    shortfall -= take
-                    if shortfall <= 0:
-                        break
-        db.commit()
     return {"success": True, "id": new_user.id}
 
 
@@ -1322,8 +1271,6 @@ def update_purchase_order_status(po_no: str, status: POStatusSchema, current_use
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
     po = po_query.first()
     if not po:
         raise HTTPException(status_code=404, detail="PO not found")
@@ -1338,8 +1285,6 @@ def delete_purchase_order(po_no: str, current_user: User = Depends(get_current_u
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
     po = po_query.first()
     if po:
         client_id = po.client_id
@@ -2238,10 +2183,21 @@ def recalculate_client_ledger(client_id: int, db: Session, preserve_manual_paid:
     advance_applied_by_inv: dict[str, float] = defaultdict(float)
     alloc_paid_by_inv: dict[str, float] = defaultdict(float)
     payment_alloc_sum: dict[str, float] = defaultdict(float)
+    note_type_by_no: dict[str, Optional[str]] = {
+        inv.invoice_no: inv.note_type
+        for inv in invoices
+        if inv.is_note
+    }
     for pay in payments:
         allocations = db.query(PaymentAllocation).filter(PaymentAllocation.payment_id == pay.id).all()
         for al in allocations:
             if al.alloc_type == 'invoice' and al.target_inv_id in inv_map:
+                alloc_paid_by_inv[al.target_inv_id] += float(al.amount or 0.0)
+            if (
+                al.alloc_type == 'note_allocation'
+                and al.target_inv_id in inv_map
+                and note_type_by_no.get(al.note_id) == "CN"
+            ):
                 alloc_paid_by_inv[al.target_inv_id] += float(al.amount or 0.0)
             if al.alloc_type == 'po_advance_applied' and al.target_inv_id in inv_map:
                 advance_applied_by_inv[al.target_inv_id] += float(al.amount or 0.0)
@@ -2728,23 +2684,28 @@ def update_invoice(invoice_no: str, inv: InvoiceUpdate, request: Request, curren
     db_inv.net_payable = max(0.0, float(db_inv.total or 0.0) - float(db_inv.advance_adj or 0.0))
     db_inv.paid = inv.paid
     db_inv.balance = max(0.0, float(db_inv.net_payable or 0.0) - float(db_inv.paid or 0.0))
-    db_inv.is_note = inv.is_note
-    db_inv.note_type = inv.note_type
-    db_inv.note_reason = inv.note_reason
+    fields_set = getattr(inv, "model_fields_set", set())
+    if "is_note" in fields_set:
+        db_inv.is_note = bool(inv.is_note)
+    if "note_type" in fields_set:
+        db_inv.note_type = inv.note_type
+    if "note_reason" in fields_set:
+        db_inv.note_reason = inv.note_reason
     
-    # CRITICAL FIX: Clear old items and write new ones safely using db_inv.id
-    db.query(InvoiceDispatchItem).filter(InvoiceDispatchItem.invoice_id == db_inv.id).delete()
-    for item in inv.dispatch_items:
-        new_dispatch = InvoiceDispatchItem(
-            invoice_id=db_inv.id,
-            description=item.description,
-            dispatched_qty=item.qty,
-            inspected_qty=item.inspected_qty,
-            uom=item.uom,
-            rate_per_uom=max(0.0, float(item.rate_per_uom or 0.0))
-        )
-        db.add(new_dispatch)
-    ensure_baseline_from_dispatch(po_id, inv.dispatch_items, db)
+    if inv.dispatch_items is not None:
+        # Omitted dispatch items mean "leave lines unchanged"; an explicit list replaces them.
+        db.query(InvoiceDispatchItem).filter(InvoiceDispatchItem.invoice_id == db_inv.id).delete()
+        for item in inv.dispatch_items:
+            new_dispatch = InvoiceDispatchItem(
+                invoice_id=db_inv.id,
+                description=item.description,
+                dispatched_qty=item.qty,
+                inspected_qty=item.inspected_qty,
+                uom=item.uom,
+                rate_per_uom=max(0.0, float(item.rate_per_uom or 0.0))
+            )
+            db.add(new_dispatch)
+        ensure_baseline_from_dispatch(po_id, inv.dispatch_items, db)
 
     after = {
         "basic": float(db_inv.basic or 0.0),
