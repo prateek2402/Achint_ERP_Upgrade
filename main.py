@@ -970,60 +970,6 @@ def create_user(user_data: UserCreate, current_user: User = Depends(get_current_
     new_user = User(username=username, hashed_password=hash_password(user_data.password), role=normalized_role)
     db.add(new_user)
     db.commit()
-    if inv.po_no and inv.po_no != "UNASSIGNED":
-        po_obj = db.query(PurchaseOrder).filter(
-            PurchaseOrder.client_id == inv.client_id,
-            PurchaseOrder.po_no == inv.po_no
-        ).first()
-        if po_obj and float(po_obj.adv_pct or 0.0) > 0:
-            added_by_payment: dict[str, float] = defaultdict(float)
-            consumed_by_payment: dict[str, float] = defaultdict(float)
-            po_allocs = db.query(PaymentAllocation).join(
-                PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id
-            ).filter(
-                PaymentHistory.client_id == inv.client_id,
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.alloc_type.in_(["po_advance", "po_advance_applied"]),
-            ).all()
-            for al in po_allocs:
-                pid = str(al.payment_id or "").strip()
-                if not pid:
-                    continue
-                if al.alloc_type == "po_advance":
-                    added_by_payment[pid] += float(al.amount or 0.0)
-                elif al.alloc_type == "po_advance_applied":
-                    consumed_by_payment[pid] += float(al.amount or 0.0)
-
-            base_amt = float(new_inv.basic or 0.0) if (po_obj.ret_base or "total") == "basic" else float(new_inv.total or 0.0)
-            max_allowed = max(0.0, base_amt * (float(po_obj.adv_pct or 0.0) / 100.0))
-            existing_applied = db.query(PaymentAllocation).filter(
-                PaymentAllocation.alloc_type == "po_advance_applied",
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.target_inv_id == new_inv.invoice_no
-            ).all()
-            already_applied = sum(float(a.amount or 0.0) for a in existing_applied)
-            shortfall = max(0.0, max_allowed - already_applied)
-
-            if shortfall > 0:
-                for pid, added_amt in added_by_payment.items():
-                    remaining_amt = float(added_amt) - float(consumed_by_payment.get(pid, 0.0))
-                    if remaining_amt <= 0:
-                        continue
-                    take = min(shortfall, remaining_amt)
-                    if take <= 0:
-                        continue
-                    db.add(PaymentAllocation(
-                        payment_id=pid,
-                        alloc_type="po_advance_applied",
-                        target_inv_id=new_inv.invoice_no,
-                        target_po_no=inv.po_no,
-                        note_id=None,
-                        amount=float(take),
-                    ))
-                    shortfall -= take
-                    if shortfall <= 0:
-                        break
-        db.commit()
     return {"success": True, "id": new_user.id}
 
 
@@ -1243,6 +1189,8 @@ def create_purchase_order(po: POCreate, request: Request, current_user: User = D
     existing_po = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po.po_no).first()
     
     if existing_po:
+        if existing_po.client_id != po.client_id:
+            raise HTTPException(status_code=400, detail="Purchase order number already belongs to another client.")
         # UPSERT: Update the existing lazily-created PO with strict financial terms
         existing_po.contact_person = po.contact_person
         existing_po.project_name = po.project_name
@@ -1322,8 +1270,6 @@ def update_purchase_order_status(po_no: str, status: POStatusSchema, current_use
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
     po = po_query.first()
     if not po:
         raise HTTPException(status_code=404, detail="PO not found")
@@ -1338,8 +1284,6 @@ def delete_purchase_order(po_no: str, current_user: User = Depends(get_current_u
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
     po = po_query.first()
     if po:
         client_id = po.client_id
@@ -2238,10 +2182,21 @@ def recalculate_client_ledger(client_id: int, db: Session, preserve_manual_paid:
     advance_applied_by_inv: dict[str, float] = defaultdict(float)
     alloc_paid_by_inv: dict[str, float] = defaultdict(float)
     payment_alloc_sum: dict[str, float] = defaultdict(float)
+    note_type_by_no: dict[str, Optional[str]] = {
+        inv.invoice_no: inv.note_type
+        for inv in invoices
+        if inv.is_note
+    }
     for pay in payments:
         allocations = db.query(PaymentAllocation).filter(PaymentAllocation.payment_id == pay.id).all()
         for al in allocations:
             if al.alloc_type == 'invoice' and al.target_inv_id in inv_map:
+                alloc_paid_by_inv[al.target_inv_id] += float(al.amount or 0.0)
+            if (
+                al.alloc_type == 'note_allocation'
+                and al.target_inv_id in inv_map
+                and note_type_by_no.get(al.note_id) == "CN"
+            ):
                 alloc_paid_by_inv[al.target_inv_id] += float(al.amount or 0.0)
             if al.alloc_type == 'po_advance_applied' and al.target_inv_id in inv_map:
                 advance_applied_by_inv[al.target_inv_id] += float(al.amount or 0.0)
@@ -2628,6 +2583,8 @@ def create_invoice(inv: InvoiceCreate, request: Request, current_user: User = De
     po_id = None
     if inv.po_no and inv.po_no.strip() and inv.po_no != 'UNASSIGNED':
         po = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == inv.po_no).first()
+        if po and po.client_id != inv.client_id:
+            raise HTTPException(status_code=400, detail="Purchase order number already belongs to another client.")
         if not po:
             po = PurchaseOrder(client_id=inv.client_id, po_no=inv.po_no)
             db.add(po)
@@ -2708,6 +2665,8 @@ def update_invoice(invoice_no: str, inv: InvoiceUpdate, request: Request, curren
     po_id = None
     if inv.po_no and inv.po_no.strip() and inv.po_no != 'UNASSIGNED':
         po = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == inv.po_no).first()
+        if po and po.client_id != inv.client_id:
+            raise HTTPException(status_code=400, detail="Purchase order number already belongs to another client.")
         if not po:
             po = PurchaseOrder(client_id=inv.client_id, po_no=inv.po_no)
             db.add(po)
@@ -3731,6 +3690,13 @@ def update_payment(payment_id: str, pay_update: PaymentUpdate, request: Request,
         raise HTTPException(status_code=404, detail="Payment not found")
     before_amount = float(db_pay.amount or 0.0)
     before_note = db_pay.note
+    allocated_amount = sum(
+        float(a.amount or 0.0)
+        for a in db.query(PaymentAllocation).filter(PaymentAllocation.payment_id == payment_id).all()
+        if a.alloc_type in ("invoice", "po_advance", "po_advance_applied", "note_allocation")
+    )
+    if float(pay_update.amount or 0.0) + 0.05 < allocated_amount:
+        raise HTTPException(status_code=400, detail="Payment amount cannot be less than existing allocations.")
     db_pay.amount = pay_update.amount
     db_pay.note = pay_update.note
     record_audit(
@@ -3941,6 +3907,14 @@ def transfer_invoice(invoice_no: str, req: TransferRequest, request: Request, cu
         db.commit()
         recalculate_client_ledger(req.new_client_id, db)
     elif req.action == "move":
+        linked_alloc_count = db.query(PaymentAllocation).filter(
+            or_(
+                PaymentAllocation.target_inv_id == db_inv.invoice_no,
+                PaymentAllocation.note_id == db_inv.invoice_no,
+            )
+        ).count()
+        if linked_alloc_count or float(db_inv.paid or 0.0) > 0.0:
+            raise HTTPException(status_code=400, detail="Cannot move an invoice with payment or note allocations. Redistribute or remove allocations first.")
         db_inv.client_id = req.new_client_id
         db_inv.po_id = None
         db_inv.advance_adj = 0
