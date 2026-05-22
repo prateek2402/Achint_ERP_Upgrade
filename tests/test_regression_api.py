@@ -853,8 +853,32 @@ def test_invoice_delete_returns_po_advance_to_pool_for_other_invoices(client: Te
 def test_note_issue_inherits_invoice_po_and_target_link(client: TestClient):
     token = login(client, "admin", "Admin@1234")
     client_id = create_client_po_invoice(client, token)
+    target_payload = {
+        "client_id": client_id,
+        "po_no": "PO-001",
+        "invoice_no": "INV-NOTE-TARGET",
+        "sub_entity": "",
+        "lr_no": "",
+        "inv_date": "2026-04-05",
+        "due_date": None,
+        "basic": 200.0,
+        "gst": 0.0,
+        "total": 200.0,
+        "advance_adj": 0.0,
+        "tds_ded": 0.0,
+        "retention_held": 0.0,
+        "net_payable": 0.0,
+        "paid": 0.0,
+        "balance": 0.0,
+        "is_note": False,
+        "note_type": None,
+        "note_reason": None,
+        "dispatch_items": [],
+    }
+    target_created = client.post("/api/invoices", json=target_payload, headers=auth_header(token))
+    assert target_created.status_code == 200, target_created.text
     before_invs = client.get("/api/invoices", headers=auth_header(token)).json()
-    before_target = next(i for i in before_invs if i["id"] == "INV-001")
+    before_target = next(i for i in before_invs if i["id"] == "INV-NOTE-TARGET")
 
     note_payload = {
         "client_id": client_id,
@@ -863,7 +887,7 @@ def test_note_issue_inherits_invoice_po_and_target_link(client: TestClient):
         "note_type": "CN",
         "amount": 50.0,
         "reason": "quality discount",
-        "target_invoice_id": "INV-001",
+        "target_invoice_id": "INV-NOTE-TARGET",
     }
     note = client.post("/api/notes/issue", json=note_payload, headers=auth_header(token))
     assert note.status_code == 200, note.text
@@ -873,8 +897,8 @@ def test_note_issue_inherits_invoice_po_and_target_link(client: TestClient):
     cn = next(i for i in invs.json() if i["id"] == "CN-001")
     assert cn["isNote"] is True
     assert cn["poNo"] == "PO-001"
-    assert cn["noteTargetInvoice"] == "INV-001"
-    target = next(i for i in invs.json() if i["id"] == "INV-001")
+    assert cn["noteTargetInvoice"] == "INV-NOTE-TARGET"
+    target = next(i for i in invs.json() if i["id"] == "INV-NOTE-TARGET")
     assert target["paid"] == pytest.approx(before_target["paid"] + 50.0)
     assert target["balance"] == pytest.approx(before_target["balance"] - 50.0)
 
