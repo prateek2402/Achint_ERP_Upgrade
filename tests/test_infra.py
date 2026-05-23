@@ -133,6 +133,39 @@ def test_lifespan_runs_schema_bootstrap_when_app_starts(client: TestClient):
     assert "uploaded_documents" in tables
 
 
+def test_schema_bootstrap_adds_inspected_qty_to_legacy_tables(tmp_path, monkeypatch):
+    import sqlite3
+
+    db_file = tmp_path / "legacy.sqlite"
+    conn = sqlite3.connect(str(db_file))
+    try:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE clients (id INTEGER PRIMARY KEY)")
+        cur.execute("CREATE TABLE purchase_orders (id INTEGER PRIMARY KEY)")
+        cur.execute("CREATE TABLE po_baseline_items (id INTEGER PRIMARY KEY)")
+        cur.execute("CREATE TABLE invoice_dispatch_items (id INTEGER PRIMARY KEY)")
+        cur.execute("CREATE TABLE system_settings (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(app_module, "DB_FILE_PATH", Path(db_file))
+    app_module.ensure_schema_columns()
+
+    conn = sqlite3.connect(str(db_file))
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(po_baseline_items)")
+        baseline_cols = {row[1] for row in cur.fetchall()}
+        cur.execute("PRAGMA table_info(invoice_dispatch_items)")
+        dispatch_cols = {row[1] for row in cur.fetchall()}
+    finally:
+        conn.close()
+
+    assert "inspected_qty" in baseline_cols
+    assert "inspected_qty" in dispatch_cols
+
+
 def test_login_exposes_expiry_fields(client: TestClient):
     """The SPA caches credentials in localStorage and expires them at exactly
     the same instant the backend stops accepting the JWT. /api/login must

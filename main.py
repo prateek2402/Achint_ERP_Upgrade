@@ -250,6 +250,8 @@ def ensure_schema_columns():
 
         cur.execute("PRAGMA table_info(po_baseline_items)")
         baseline_cols = {row[1] for row in cur.fetchall()}
+        if "inspected_qty" not in baseline_cols:
+            cur.execute("ALTER TABLE po_baseline_items ADD COLUMN inspected_qty REAL DEFAULT 0")
         if "material_type" not in baseline_cols:
             cur.execute("ALTER TABLE po_baseline_items ADD COLUMN material_type TEXT")
         if "dispatch_alias" not in baseline_cols:
@@ -259,6 +261,8 @@ def ensure_schema_columns():
 
         cur.execute("PRAGMA table_info(invoice_dispatch_items)")
         dispatch_cols = {row[1] for row in cur.fetchall()}
+        if "inspected_qty" not in dispatch_cols:
+            cur.execute("ALTER TABLE invoice_dispatch_items ADD COLUMN inspected_qty REAL DEFAULT 0")
         if "rate_per_uom" not in dispatch_cols:
             cur.execute("ALTER TABLE invoice_dispatch_items ADD COLUMN rate_per_uom REAL DEFAULT 0")
 
@@ -1322,8 +1326,6 @@ def update_purchase_order_status(po_no: str, status: POStatusSchema, current_use
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
     po = po_query.first()
     if not po:
         raise HTTPException(status_code=404, detail="PO not found")
@@ -1338,8 +1340,6 @@ def delete_purchase_order(po_no: str, current_user: User = Depends(get_current_u
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
     po = po_query.first()
     if po:
         client_id = po.client_id
@@ -2238,6 +2238,11 @@ def recalculate_client_ledger(client_id: int, db: Session, preserve_manual_paid:
     advance_applied_by_inv: dict[str, float] = defaultdict(float)
     alloc_paid_by_inv: dict[str, float] = defaultdict(float)
     payment_alloc_sum: dict[str, float] = defaultdict(float)
+    note_type_by_id = {
+        inv.invoice_no: (inv.note_type or "").upper()
+        for inv in invoices
+        if inv.is_note
+    }
     for pay in payments:
         allocations = db.query(PaymentAllocation).filter(PaymentAllocation.payment_id == pay.id).all()
         for al in allocations:
@@ -2245,6 +2250,13 @@ def recalculate_client_ledger(client_id: int, db: Session, preserve_manual_paid:
                 alloc_paid_by_inv[al.target_inv_id] += float(al.amount or 0.0)
             if al.alloc_type == 'po_advance_applied' and al.target_inv_id in inv_map:
                 advance_applied_by_inv[al.target_inv_id] += float(al.amount or 0.0)
+            if al.alloc_type == 'note_allocation' and al.target_inv_id in inv_map:
+                note_type = note_type_by_id.get(al.note_id or "")
+                note_amount = float(al.amount or 0.0)
+                if note_type == "CN":
+                    alloc_paid_by_inv[al.target_inv_id] += note_amount
+                elif note_type == "DN":
+                    alloc_paid_by_inv[al.target_inv_id] -= note_amount
             if al.alloc_type in ('invoice', 'po_advance', 'po_advance_applied', 'note_allocation'):
                 payment_alloc_sum[pay.id] += float(al.amount or 0.0)
 
@@ -2255,6 +2267,14 @@ def recalculate_client_ledger(client_id: int, db: Session, preserve_manual_paid:
     # post-create recalc when no payment record exists yet.
     for inv in invoices:
         manual_paid_pre = float(inv.paid or 0.0)
+        if inv.is_note:
+            inv.advance_adj = 0.0
+            inv.tds_ded = 0.0
+            inv.retention_held = 0.0
+            inv.net_payable = 0.0
+            inv.paid = 0.0
+            inv.balance = 0.0
+            continue
         po_obj = po_map.get(inv.po_id) if inv.po_id else None
         if po_obj is not None:
             ret_base_amount = invoice_amount_for_po_base(inv, po_obj.ret_base or "total")
@@ -2302,6 +2322,8 @@ def recalculate_client_ledger(client_id: int, db: Session, preserve_manual_paid:
     # silently hide that credit and break pool-total accounting.
     total_excess = 0.0
     for inv in invoices:
+        if inv.is_note:
+            continue
         alloc_paid = float(alloc_paid_by_inv.get(inv.invoice_no, 0.0))
         derived_paid = alloc_paid
         if preserve_manual_paid:
@@ -3941,6 +3963,17 @@ def transfer_invoice(invoice_no: str, req: TransferRequest, request: Request, cu
         db.commit()
         recalculate_client_ledger(req.new_client_id, db)
     elif req.action == "move":
+        existing_alloc = db.query(PaymentAllocation).filter(
+            or_(
+                PaymentAllocation.target_inv_id == invoice_no,
+                PaymentAllocation.note_id == invoice_no,
+            )
+        ).first()
+        if existing_alloc:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot move an invoice with payment or note allocations. Delete or redistribute allocations first.",
+            )
         db_inv.client_id = req.new_client_id
         db_inv.po_id = None
         db_inv.advance_adj = 0
