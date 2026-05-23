@@ -440,6 +440,37 @@ def test_po_terms_update_recalculates_client_ledger(client: TestClient):
     assert inv["balance"] == pytest.approx(inv["netPayable"] - inv["paid"])
 
 
+def test_po_status_and_delete_do_not_crash(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    create_client_po_invoice(client, token)
+
+    status = client.put(
+        "/api/purchase-orders/PO-001/status",
+        json={"is_completed": True, "is_hidden": True},
+        headers=auth_header(token),
+    )
+    assert status.status_code == 200, status.text
+
+    po_list = client.get(
+        "/api/purchase-orders",
+        params={"include_completed": True, "include_hidden": True},
+        headers=auth_header(token),
+    )
+    assert po_list.status_code == 200, po_list.text
+    po = next(p for p in po_list.json() if p["po_no"] == "PO-001")
+    assert po["is_completed"] is True
+    assert po["is_hidden"] is True
+
+    deleted = client.delete("/api/purchase-orders/PO-001", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+    after = client.get(
+        "/api/purchase-orders",
+        params={"include_completed": True, "include_hidden": True},
+        headers=auth_header(token),
+    )
+    assert all(p["po_no"] != "PO-001" for p in after.json())
+
+
 def test_po_tds_terms_update_changes_invoice_balance(client: TestClient):
     token = login(client, "admin", "Admin@1234")
     client_id = create_client_po_invoice(client, token)
@@ -713,6 +744,126 @@ def test_note_issue_inherits_invoice_po_and_target_link(client: TestClient):
     assert cn["isNote"] is True
     assert cn["poNo"] == "PO-001"
     assert cn["noteTargetInvoice"] == "INV-001"
+
+
+def test_note_allocations_change_target_invoice_balance(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "NOTE-LEDGER"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+
+    inv = client.post(
+        "/api/invoices",
+        json={
+            "client_id": client_id,
+            "po_no": "UNASSIGNED",
+            "invoice_no": "INV-NOTE-1",
+            "sub_entity": "",
+            "lr_no": "",
+            "inv_date": "2026-04-01",
+            "due_date": None,
+            "basic": 1000.0,
+            "gst": 0.0,
+            "total": 1000.0,
+            "advance_adj": 0.0,
+            "tds_ded": 0.0,
+            "retention_held": 0.0,
+            "net_payable": 0.0,
+            "paid": 0.0,
+            "balance": 0.0,
+            "is_note": False,
+            "note_type": None,
+            "note_reason": None,
+            "dispatch_items": [],
+        },
+        headers=auth_header(token),
+    )
+    assert inv.status_code == 200, inv.text
+
+    invs_before = client.get("/api/invoices", headers=auth_header(token)).json()
+    before = next(i for i in invs_before if i["id"] == "INV-NOTE-1")
+
+    cn = client.post(
+        "/api/notes/issue",
+        json={
+            "client_id": client_id,
+            "note_no": "CN-LEDGER-1",
+            "date": "2026-04-10",
+            "note_type": "CN",
+            "amount": 50.0,
+            "reason": "quality discount",
+            "target_invoice_id": "INV-NOTE-1",
+        },
+        headers=auth_header(token),
+    )
+    assert cn.status_code == 200, cn.text
+
+    invs_after_cn = client.get("/api/invoices", headers=auth_header(token)).json()
+    after_cn = next(i for i in invs_after_cn if i["id"] == "INV-NOTE-1")
+    cn_row = next(i for i in invs_after_cn if i["id"] == "CN-LEDGER-1")
+    assert after_cn["paid"] == pytest.approx(before["paid"] + 50.0)
+    assert after_cn["balance"] == pytest.approx(before["balance"] - 50.0)
+    assert cn_row["netPayable"] == pytest.approx(0.0)
+    assert cn_row["balance"] == pytest.approx(0.0)
+
+    dn = client.post(
+        "/api/notes/issue",
+        json={
+            "client_id": client_id,
+            "note_no": "DN-LEDGER-1",
+            "date": "2026-04-11",
+            "note_type": "DN",
+            "amount": 20.0,
+            "reason": "extra charge",
+            "target_invoice_id": "INV-NOTE-1",
+        },
+        headers=auth_header(token),
+    )
+    assert dn.status_code == 200, dn.text
+
+    invs_after_dn = client.get("/api/invoices", headers=auth_header(token)).json()
+    after_dn = next(i for i in invs_after_dn if i["id"] == "INV-NOTE-1")
+    dn_row = next(i for i in invs_after_dn if i["id"] == "DN-LEDGER-1")
+    assert after_dn["paid"] == pytest.approx(before["paid"] + 30.0)
+    assert after_dn["balance"] == pytest.approx(before["balance"] - 30.0)
+    assert dn_row["netPayable"] == pytest.approx(0.0)
+    assert dn_row["balance"] == pytest.approx(0.0)
+
+
+def test_move_invoice_with_allocations_is_blocked(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+    target = client.post("/api/clients", json={"name": "MOVE-TARGET"}, headers=auth_header(token))
+    assert target.status_code == 200, target.text
+
+    alloc = client.post(
+        "/api/payments/allocate",
+        json={
+            "client_id": client_id,
+            "id": "PAY-MOVE-BLOCK",
+            "date": datetime.date.today().isoformat(),
+            "amount": 100.0,
+            "note": "receipt",
+            "mode": "targeted",
+            "targets": [{"inv_id": "INV-001", "amount": 100.0}],
+            "fund_source": "receipt",
+        },
+        headers=auth_header(token),
+    )
+    assert alloc.status_code == 200, alloc.text
+
+    moved = client.post(
+        "/api/invoices/INV-001/transfer",
+        json={"new_client_id": target.json()["id"], "action": "move"},
+        headers=auth_header(token),
+    )
+    assert moved.status_code == 400
+    assert "allocations" in moved.json()["detail"].lower()
+
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    inv = next(i for i in invs if i["id"] == "INV-001")
+    assert inv["client_id"] == client_id
+    assert inv["paid"] > 0
 
 
 def test_dispatch_column_rename_merges_duplicates(client: TestClient):
