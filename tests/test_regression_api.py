@@ -182,6 +182,57 @@ def test_auth_and_permission_guards(client: TestClient):
     assert as_admin.status_code == 200
 
 
+def test_admin_create_user_does_not_crash_after_commit(client: TestClient):
+    admin_token = login(client, "admin", "Admin@1234")
+
+    created = client.post(
+        "/api/users",
+        json={"username": "ops-user", "password": "OpsUser@123", "role": "user"},
+        headers=auth_header(admin_token),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["success"] is True
+
+    new_login = client.post("/api/login", json={"username": "ops-user", "password": "OpsUser@123"})
+    assert new_login.status_code == 200, new_login.text
+
+
+def test_po_status_and_delete_do_not_reference_missing_payload(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "PO-CRASH-CLIENT"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+
+    po = client.post("/api/purchase-orders", json={
+        "client_id": client_id,
+        "po_no": "PO-CRASH-1",
+        "contact_person": "Ops",
+        "project_name": "Kiln",
+        "adv_pct": 0.0,
+        "ret_pct": 0.0,
+        "baseline_items": [],
+    }, headers=auth_header(token))
+    assert po.status_code == 200, po.text
+
+    status = client.put(
+        "/api/purchase-orders/PO-CRASH-1/status",
+        json={"is_completed": True, "is_hidden": True},
+        headers=auth_header(token),
+    )
+    assert status.status_code == 200, status.text
+
+    pos = client.get("/api/purchase-orders", params={"include_hidden": True}, headers=auth_header(token))
+    assert pos.status_code == 200, pos.text
+    updated = next(p for p in pos.json() if p["po_no"] == "PO-CRASH-1")
+    assert updated["is_completed"] is True
+    assert updated["is_hidden"] is True
+
+    deleted = client.delete("/api/purchase-orders/PO-CRASH-1", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+    pos_after = client.get("/api/purchase-orders", params={"include_hidden": True}, headers=auth_header(token))
+    assert all(p["po_no"] != "PO-CRASH-1" for p in pos_after.json())
+
+
 def test_payment_allocations_use_invid_field(client: TestClient):
     """Locks the /api/payments allocation contract so the SPA Payment Log cell keeps working.
 
@@ -399,6 +450,100 @@ def test_delete_payment_unallocates_invoices_and_restores_balance(client: TestCl
     inv_after_delete = next(i for i in invs_after_delete if i["id"] == "INV-PAY-DEL-1")
     assert inv_after_delete["paid"] == pytest.approx(0.0)
     assert inv_after_delete["balance"] == pytest.approx(inv_after_delete["netPayable"])
+
+
+def test_reversing_unallocated_register_removes_spendable_pool(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "UNALLOC-REV-CLIENT"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+
+    receipt = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-UNALLOC-REV-1",
+        "date": datetime.date.today().isoformat(),
+        "amount": 120.0,
+        "note": "parked receipt",
+        "mode": "targeted",
+        "targets": [],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "move_to_po": None,
+        "po_no": None,
+        "clear_po_pool": False,
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert receipt.status_code == 200, receipt.text
+
+    rows = client.get(
+        "/api/registers/unallocated-payments",
+        params={"client_id": client_id},
+        headers=auth_header(token),
+    )
+    assert rows.status_code == 200, rows.text
+    entry = rows.json()[0]
+    assert entry["balance"] == pytest.approx(120.0)
+
+    reversed_row = client.post(
+        f"/api/registers/unallocated-payments/{entry['id']}/reverse",
+        headers=auth_header(token),
+    )
+    assert reversed_row.status_code == 200, reversed_row.text
+
+    clients = client.get("/api/clients", headers=auth_header(token))
+    assert clients.status_code == 200, clients.text
+    acct = next(c for c in clients.json() if c["id"] == client_id)
+    assert acct["excess_funds"] == pytest.approx(0.0)
+
+    inv = client.post("/api/invoices", json={
+        "client_id": client_id,
+        "po_no": "UNASSIGNED",
+        "invoice_no": "INV-UNALLOC-REV-1",
+        "sub_entity": "",
+        "lr_no": "",
+        "inv_date": "2026-04-01",
+        "due_date": None,
+        "basic": 100.0,
+        "gst": 0.0,
+        "total": 100.0,
+        "advance_adj": 0.0,
+        "tds_ded": 0.0,
+        "retention_held": 0.0,
+        "net_payable": 0.0,
+        "paid": 0.0,
+        "balance": 0.0,
+        "is_note": False,
+        "note_type": None,
+        "note_reason": None,
+        "dispatch_items": [],
+    }, headers=auth_header(token))
+    assert inv.status_code == 200, inv.text
+
+    reuse_removed_funds = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-UNALLOC-REV-2",
+        "date": datetime.date.today().isoformat(),
+        "amount": 50.0,
+        "note": "should not spend reversed receipt",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-UNALLOC-REV-1", "amount": 50.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "unallocated",
+        "move_to_po": None,
+        "po_no": None,
+        "clear_po_pool": False,
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert reuse_removed_funds.status_code == 400
+    assert "no unallocated funds" in reuse_removed_funds.json()["detail"].lower()
 
 
 def test_po_terms_update_recalculates_client_ledger(client: TestClient):
