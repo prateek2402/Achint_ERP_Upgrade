@@ -46,6 +46,66 @@ def test_reconciliation_clean_ledger_has_no_errors(client: TestClient):
         assert _section(report, key)["errors"] == 0
 
 
+def test_reconciliation_accepts_tds_adjusted_invoice_math(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    update_po = client.post("/api/purchase-orders", json={
+        "client_id": client_id,
+        "po_no": "PO-001",
+        "contact_person": "Ops",
+        "project_name": "Kiln",
+        "adv_pct": 5.0,
+        "ret_pct": 2.0,
+        "ret_base": "total",
+        "tds_base": "total",
+        "tds_enabled": True,
+        "tds_rate": 0.1,
+        "tds_threshold": 500.0,
+        "baseline_items": [],
+    }, headers=auth_header(token))
+    assert update_po.status_code == 200, update_po.text
+
+    report = _get_report(client, token)
+    invoice_math = _section(report, "invoice_math")
+    mismatch_codes = {"net_payable_mismatch", "balance_mismatch"}
+    assert not (mismatch_codes & {iss["code"] for iss in invoice_math["issues"]})
+    assert invoice_math["errors"] == 0
+
+
+def test_reconciliation_accepts_explicit_invoice_credit_balance(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    overpay = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-OVERPAY-RECON",
+        "date": datetime.date.today().isoformat(),
+        "amount": 1200.0,
+        "note": "intentional invoice credit",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-001", "amount": 1200.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "move_to_po": "",
+        "po_no": "",
+        "clear_po_pool": False,
+        "excess_action": "park",
+        "allow_overpayment": True,
+    }, headers=auth_header(token))
+    assert overpay.status_code == 200, overpay.text
+
+    report = _get_report(client, token)
+    invoice_math = _section(report, "invoice_math")
+    mismatch_codes = {"net_payable_mismatch", "balance_mismatch"}
+    assert not (mismatch_codes & {iss["code"] for iss in invoice_math["issues"]})
+    assert invoice_math["errors"] == 0
+
+
 def _open_session():
     """Helper: open a session against the test DB to inject bad data directly."""
     return app_module.SessionLocal()

@@ -970,60 +970,6 @@ def create_user(user_data: UserCreate, current_user: User = Depends(get_current_
     new_user = User(username=username, hashed_password=hash_password(user_data.password), role=normalized_role)
     db.add(new_user)
     db.commit()
-    if inv.po_no and inv.po_no != "UNASSIGNED":
-        po_obj = db.query(PurchaseOrder).filter(
-            PurchaseOrder.client_id == inv.client_id,
-            PurchaseOrder.po_no == inv.po_no
-        ).first()
-        if po_obj and float(po_obj.adv_pct or 0.0) > 0:
-            added_by_payment: dict[str, float] = defaultdict(float)
-            consumed_by_payment: dict[str, float] = defaultdict(float)
-            po_allocs = db.query(PaymentAllocation).join(
-                PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id
-            ).filter(
-                PaymentHistory.client_id == inv.client_id,
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.alloc_type.in_(["po_advance", "po_advance_applied"]),
-            ).all()
-            for al in po_allocs:
-                pid = str(al.payment_id or "").strip()
-                if not pid:
-                    continue
-                if al.alloc_type == "po_advance":
-                    added_by_payment[pid] += float(al.amount or 0.0)
-                elif al.alloc_type == "po_advance_applied":
-                    consumed_by_payment[pid] += float(al.amount or 0.0)
-
-            base_amt = float(new_inv.basic or 0.0) if (po_obj.ret_base or "total") == "basic" else float(new_inv.total or 0.0)
-            max_allowed = max(0.0, base_amt * (float(po_obj.adv_pct or 0.0) / 100.0))
-            existing_applied = db.query(PaymentAllocation).filter(
-                PaymentAllocation.alloc_type == "po_advance_applied",
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.target_inv_id == new_inv.invoice_no
-            ).all()
-            already_applied = sum(float(a.amount or 0.0) for a in existing_applied)
-            shortfall = max(0.0, max_allowed - already_applied)
-
-            if shortfall > 0:
-                for pid, added_amt in added_by_payment.items():
-                    remaining_amt = float(added_amt) - float(consumed_by_payment.get(pid, 0.0))
-                    if remaining_amt <= 0:
-                        continue
-                    take = min(shortfall, remaining_amt)
-                    if take <= 0:
-                        continue
-                    db.add(PaymentAllocation(
-                        payment_id=pid,
-                        alloc_type="po_advance_applied",
-                        target_inv_id=new_inv.invoice_no,
-                        target_po_no=inv.po_no,
-                        note_id=None,
-                        amount=float(take),
-                    ))
-                    shortfall -= take
-                    if shortfall <= 0:
-                        break
-        db.commit()
     return {"success": True, "id": new_user.id}
 
 
@@ -1310,6 +1256,8 @@ def create_purchase_order(po: POCreate, request: Request, current_user: User = D
         },
         request=request,
     )
+    db.commit()
+    _strip_po_advance_applied_for_po(po.client_id, po.po_no, db)
     db.commit()
     _auto_apply_po_advance(po.client_id, db, po.po_no)
     # Terms changes (adv/ret/tds config) must immediately reflect in ledger math views.
