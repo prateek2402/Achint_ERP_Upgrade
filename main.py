@@ -1259,7 +1259,6 @@ def create_purchase_order(po: POCreate, request: Request, current_user: User = D
     db.commit()
     _strip_po_advance_applied_for_po(po.client_id, po.po_no, db)
     db.commit()
-    _auto_apply_po_advance(po.client_id, db, po.po_no)
     # Terms changes (adv/ret/tds config) must immediately reflect in ledger math views.
     recalculate_client_ledger(po.client_id, db)
     return {"success": True, "po_id": po_id}
