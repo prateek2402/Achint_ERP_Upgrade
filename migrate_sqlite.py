@@ -113,7 +113,64 @@ def truncate_target_tables(db):
     db.query(Client).delete()
     db.query(User).delete()
     db.query(SystemSettings).delete()
-    db.commit()
+
+
+def ensure_target_schema():
+    """Bring an existing target DB up to the columns the importer writes.
+
+    ``Base.metadata.create_all`` creates missing tables, but SQLite will not add
+    columns to tables that already exist. Run this before the destructive import
+    phase so a pre-upgrade DB cannot be truncated and then fail on first insert.
+    """
+    conn = sqlite3.connect("erp_database.sqlite")
+    cur = conn.cursor()
+    try:
+        cur.execute("PRAGMA table_info(clients)")
+        client_cols = {row[1] for row in cur.fetchall()}
+        if "display_currency" not in client_cols:
+            cur.execute("ALTER TABLE clients ADD COLUMN display_currency TEXT DEFAULT 'INR'")
+        if "exchange_rate" not in client_cols:
+            cur.execute("ALTER TABLE clients ADD COLUMN exchange_rate REAL DEFAULT 83.0")
+
+        cur.execute("PRAGMA table_info(purchase_orders)")
+        po_cols = {row[1] for row in cur.fetchall()}
+        if "contact_person" not in po_cols:
+            cur.execute("ALTER TABLE purchase_orders ADD COLUMN contact_person TEXT")
+        if "project_name" not in po_cols:
+            cur.execute("ALTER TABLE purchase_orders ADD COLUMN project_name TEXT")
+        if "is_completed" not in po_cols:
+            cur.execute("ALTER TABLE purchase_orders ADD COLUMN is_completed INTEGER DEFAULT 0")
+        if "is_hidden" not in po_cols:
+            cur.execute("ALTER TABLE purchase_orders ADD COLUMN is_hidden INTEGER DEFAULT 0")
+        if "completed_at" not in po_cols:
+            cur.execute("ALTER TABLE purchase_orders ADD COLUMN completed_at TEXT")
+        if "tds_base" not in po_cols:
+            cur.execute("ALTER TABLE purchase_orders ADD COLUMN tds_base TEXT DEFAULT 'basic'")
+
+        cur.execute("PRAGMA table_info(po_baseline_items)")
+        baseline_cols = {row[1] for row in cur.fetchall()}
+        if "material_type" not in baseline_cols:
+            cur.execute("ALTER TABLE po_baseline_items ADD COLUMN material_type TEXT")
+        if "dispatch_alias" not in baseline_cols:
+            cur.execute("ALTER TABLE po_baseline_items ADD COLUMN dispatch_alias TEXT")
+        if "dispatch_rate" not in baseline_cols:
+            cur.execute("ALTER TABLE po_baseline_items ADD COLUMN dispatch_rate REAL DEFAULT 0")
+
+        cur.execute("PRAGMA table_info(invoice_dispatch_items)")
+        dispatch_cols = {row[1] for row in cur.fetchall()}
+        if "rate_per_uom" not in dispatch_cols:
+            cur.execute("ALTER TABLE invoice_dispatch_items ADD COLUMN rate_per_uom REAL DEFAULT 0")
+
+        cur.execute("PRAGMA table_info(system_settings)")
+        settings_cols = {row[1] for row in cur.fetchall()}
+        if "fy_start_month" not in settings_cols:
+            cur.execute("ALTER TABLE system_settings ADD COLUMN fy_start_month INTEGER DEFAULT 4")
+        if "fy_start_day" not in settings_cols:
+            cur.execute("ALTER TABLE system_settings ADD COLUMN fy_start_day INTEGER DEFAULT 1")
+
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def read_legacy_snapshot():
@@ -147,18 +204,7 @@ def ensure_unique_payment_id(raw_id: str, used_ids: set[str]) -> str:
 
 
 def run_import(force: bool = False):
-    conn = sqlite3.connect("erp_database.sqlite")
-    cur = conn.cursor()
-    try:
-        cur.execute("PRAGMA table_info(purchase_orders)")
-        cols = {row[1] for row in cur.fetchall()}
-        if "contact_person" not in cols:
-            cur.execute("ALTER TABLE purchase_orders ADD COLUMN contact_person TEXT")
-        if "project_name" not in cols:
-            cur.execute("ALTER TABLE purchase_orders ADD COLUMN project_name TEXT")
-        conn.commit()
-    finally:
-        conn.close()
+    ensure_target_schema()
 
     if RUN_MARKER_PATH.exists() and not force:
         raise RuntimeError("One-time import already completed. Re-run with --force to import again.")

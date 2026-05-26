@@ -138,6 +138,12 @@ def check_sqlite_openable(db_path: Path) -> dict:
 def _import_app_against_sandbox(sandbox_db: Path):
     """Set env, then import main + override SessionLocal/engine to point at sandbox."""
     os.environ["APP_DATABASE_URL"] = f"sqlite:///{sandbox_db.as_posix()}"
+    # Router modules import auth/session helpers from main at module import time.
+    # Evict them with main so a second drill in the same Python process cannot
+    # keep dependencies bound to an older ephemeral JWT secret or database.
+    for module_name in ("routers.audit", "routers.reconciliation", "routers.health"):
+        if module_name in sys.modules:
+            del sys.modules[module_name]
     if "main" in sys.modules:
         del sys.modules["main"]
 

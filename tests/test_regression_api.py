@@ -56,6 +56,20 @@ def auth_header(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def test_admin_can_create_user_without_partial_failure(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+
+    resp = client.post(
+        "/api/users",
+        json={"username": "ops.lead", "password": "OpsLead@12345", "role": "user"},
+        headers=auth_header(token),
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["success"] is True
+    assert login(client, "ops.lead", "OpsLead@12345")
+
+
 def create_client_po_invoice(client: TestClient, token: str):
     c = client.post("/api/clients", json={"name": "ACME"}, headers=auth_header(token))
     assert c.status_code == 200, c.text
@@ -617,6 +631,60 @@ def test_po_advance_pools_api_and_manual_recalculate(client: TestClient):
     )
     assert apply.status_code == 200, apply.text
     assert "pool_remaining" in apply.json()
+
+
+def test_po_terms_update_rebuilds_advance_pool_consumption(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    adv_pay = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-PO-ADV-RETERMS",
+        "date": datetime.date.today().isoformat(),
+        "amount": 400.0,
+        "note": "po advance add",
+        "mode": "targeted",
+        "targets": [],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "move_to_po": "PO-001",
+        "po_no": "PO-001",
+        "clear_po_pool": False,
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert adv_pay.status_code == 200, adv_pay.text
+
+    invs_before = client.get("/api/invoices", headers=auth_header(token)).json()
+    inv_before = next(i for i in invs_before if i["id"] == "INV-001")
+    assert inv_before["advance"] == pytest.approx(50.0, abs=0.01)
+
+    update_po = client.post("/api/purchase-orders", json={
+        "client_id": client_id,
+        "po_no": "PO-001",
+        "contact_person": "Ops",
+        "project_name": "Kiln",
+        "adv_pct": 2.0,
+        "ret_pct": 2.0,
+        "ret_base": "basic",
+        "tds_enabled": True,
+        "tds_rate": 0.1,
+        "tds_threshold": 5000.0,
+        "baseline_items": [],
+    }, headers=auth_header(token))
+    assert update_po.status_code == 200, update_po.text
+
+    invs_after = client.get("/api/invoices", headers=auth_header(token)).json()
+    inv_after = next(i for i in invs_after if i["id"] == "INV-001")
+    assert inv_after["advance"] == pytest.approx(20.0, abs=0.01)
+
+    pools = client.get(f"/api/clients/{client_id}/po-advance-pools", headers=auth_header(token))
+    assert pools.status_code == 200, pools.text
+    po_entry = next(p for p in pools.json()["pools"] if p["po_no"] == "PO-001")
+    assert po_entry["pool_remaining"] == pytest.approx(380.0, abs=0.01)
 
 
 def test_delete_po_advance_payment_deallocates_from_invoices(client: TestClient):
