@@ -182,6 +182,22 @@ def test_auth_and_permission_guards(client: TestClient):
     assert as_admin.status_code == 200
 
 
+def test_admin_create_user_persists_without_server_error(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+
+    created = client.post(
+        "/api/users",
+        json={"username": "ops_user", "password": "OpsUser@12345", "role": "user"},
+        headers=auth_header(token),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["success"] is True
+
+    users = client.get("/api/users", headers=auth_header(token))
+    assert users.status_code == 200, users.text
+    assert any(u["username"] == "ops_user" and u["role"] == "user" for u in users.json())
+
+
 def test_payment_allocations_use_invid_field(client: TestClient):
     """Locks the /api/payments allocation contract so the SPA Payment Log cell keeps working.
 
@@ -438,6 +454,86 @@ def test_po_terms_update_recalculates_client_ledger(client: TestClient):
     inv = next(i for i in invs if i["id"] == "INV-001")
     assert inv["netPayable"] == pytest.approx(inv["total"])
     assert inv["balance"] == pytest.approx(inv["netPayable"] - inv["paid"])
+
+
+def test_po_status_and_delete_do_not_crash(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    create_client_po_invoice(client, token)
+
+    marked = client.put(
+        "/api/purchase-orders/PO-001/status",
+        json={"is_completed": True, "is_hidden": True},
+        headers=auth_header(token),
+    )
+    assert marked.status_code == 200, marked.text
+
+    pos = client.get("/api/purchase-orders", params={"include_hidden": True}, headers=auth_header(token))
+    assert pos.status_code == 200, pos.text
+    po = next(p for p in pos.json() if p["po_no"] == "PO-001")
+    assert po["is_completed"] is True
+    assert po["is_hidden"] is True
+
+    deleted = client.delete("/api/purchase-orders/PO-001", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+
+    pos_after = client.get("/api/purchase-orders", params={"include_hidden": True}, headers=auth_header(token))
+    assert pos_after.status_code == 200, pos_after.text
+    assert all(p["po_no"] != "PO-001" for p in pos_after.json())
+
+
+def test_po_number_collision_cannot_update_or_attach_other_client_po(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    first_client_id = create_client_po_invoice(client, token)
+    second = client.post("/api/clients", json={"name": "SECOND"}, headers=auth_header(token))
+    assert second.status_code == 200, second.text
+    second_client_id = second.json()["id"]
+
+    conflicting_po = client.post("/api/purchase-orders", json={
+        "client_id": second_client_id,
+        "po_no": "PO-001",
+        "contact_person": "Other",
+        "project_name": "Other Project",
+        "adv_pct": 99.0,
+        "ret_pct": 99.0,
+        "ret_base": "total",
+        "tds_enabled": True,
+        "tds_rate": 5.0,
+        "tds_threshold": 0.0,
+        "baseline_items": [],
+    }, headers=auth_header(token))
+    assert conflicting_po.status_code == 409, conflicting_po.text
+
+    conflicting_invoice = client.post("/api/invoices", json={
+        "client_id": second_client_id,
+        "po_no": "PO-001",
+        "invoice_no": "INV-SECOND-1",
+        "sub_entity": "",
+        "lr_no": "",
+        "inv_date": "2026-04-02",
+        "due_date": None,
+        "basic": 100.0,
+        "gst": 0.0,
+        "total": 100.0,
+        "advance_adj": 0.0,
+        "tds_ded": 0.0,
+        "retention_held": 0.0,
+        "net_payable": 0.0,
+        "paid": 0.0,
+        "balance": 0.0,
+        "is_note": False,
+        "note_type": None,
+        "note_reason": None,
+        "dispatch_items": [],
+    }, headers=auth_header(token))
+    assert conflicting_invoice.status_code == 409, conflicting_invoice.text
+
+    db = app_module.SessionLocal()
+    try:
+        po = db.query(app_module.PurchaseOrder).filter(app_module.PurchaseOrder.po_no == "PO-001").one()
+        assert po.client_id == first_client_id
+        assert po.adv_pct == pytest.approx(5.0)
+    finally:
+        db.close()
 
 
 def test_po_tds_terms_update_changes_invoice_balance(client: TestClient):
