@@ -47,6 +47,47 @@ def test_invoice_create_writes_audit_entry(client: TestClient):
     assert any(e["entity_id"] == "PO-001" for e in po_entries["items"])
 
 
+def test_audit_failure_does_not_rollback_business_transaction(client: TestClient, monkeypatch):
+    import main as app_module
+
+    token = login(client, "admin", "Admin@1234")
+
+    created = client.post("/api/clients", json={"name": "AUDIT-SAFE"}, headers=auth_header(token))
+    assert created.status_code == 200, created.text
+    client_id = created.json()["id"]
+
+    def fail_audit_write(entries):
+        raise RuntimeError("simulated audit sink failure")
+
+    monkeypatch.setattr(app_module, "_write_audit_entries", fail_audit_write)
+
+    po_resp = client.post("/api/purchase-orders", json={
+        "client_id": client_id,
+        "po_no": "PO-AUDIT-SAFE",
+        "contact_person": "Ops",
+        "project_name": "Kiln",
+        "adv_pct": 5.0,
+        "ret_pct": 2.0,
+        "ret_base": "basic",
+        "tds_enabled": True,
+        "tds_rate": 0.1,
+        "tds_threshold": 5000.0,
+        "baseline_items": [
+            {"description": "Brick A", "ordered_qty": 10, "inspected_qty": 0, "uom": "Nos", "material_type": "brick"},
+        ],
+    }, headers=auth_header(token))
+    assert po_resp.status_code == 200, po_resp.text
+
+    db = app_module.SessionLocal()
+    try:
+        po = db.query(app_module.PurchaseOrder).filter(app_module.PurchaseOrder.po_no == "PO-AUDIT-SAFE").first()
+        assert po is not None
+        assert po.client_id == client_id
+        assert len(po.baseline_items) == 1
+    finally:
+        db.close()
+
+
 def test_invoice_update_records_before_after(client: TestClient):
     token = login(client, "admin", "Admin@1234")
     client_id = create_client_po_invoice(client, token)
