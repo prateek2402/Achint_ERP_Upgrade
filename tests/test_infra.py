@@ -8,6 +8,7 @@ test_regression_api so they exercise the actual app, not a stub.
 from __future__ import annotations
 
 import datetime
+import sqlite3
 import time
 from pathlib import Path
 
@@ -112,6 +113,63 @@ def test_prune_disabled_when_keep_days_zero(tmp_path, monkeypatch):
     _os.utime(f, (0, 0))
     assert app_module.prune_old_backups(0) == 0
     assert f.exists()
+
+
+def test_database_backup_uses_fresh_backup_mtime(tmp_path, monkeypatch):
+    db_file = tmp_path / "erp_database.sqlite"
+    conn = sqlite3.connect(str(db_file))
+    try:
+        conn.execute("CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO marker (value) VALUES ('ok')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    old = time.time() - (31 * 86400)
+    import os as _os
+    _os.utime(db_file, (old, old))
+
+    backup_dir = tmp_path / "backups"
+    monkeypatch.setattr(app_module, "DB_FILE_PATH", db_file)
+    monkeypatch.setattr(app_module, "BACKUP_DIR", backup_dir)
+    monkeypatch.setattr(app_module, "KEEP_BACKUPS_DAYS", 30)
+
+    app_module.perform_database_backup()
+
+    backups = list(backup_dir.glob("erp_database_*.sqlite"))
+    assert len(backups) == 1
+    assert backups[0].stat().st_mtime > time.time() - 60
+    copied = sqlite3.connect(str(backups[0]))
+    try:
+        assert copied.execute("SELECT value FROM marker").fetchone()[0] == "ok"
+    finally:
+        copied.close()
+
+
+def test_schema_bootstrap_adds_dispatch_inspected_columns(tmp_path, monkeypatch):
+    db_file = tmp_path / "legacy.sqlite"
+    conn = sqlite3.connect(str(db_file))
+    try:
+        conn.execute("CREATE TABLE clients (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("CREATE TABLE purchase_orders (id INTEGER PRIMARY KEY, po_no TEXT)")
+        conn.execute("CREATE TABLE po_baseline_items (id INTEGER PRIMARY KEY, dispatch_rate REAL)")
+        conn.execute("CREATE TABLE invoice_dispatch_items (id INTEGER PRIMARY KEY, rate_per_uom REAL)")
+        conn.execute("CREATE TABLE system_settings (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(app_module, "DB_FILE_PATH", db_file)
+    app_module.ensure_schema_columns()
+
+    conn = sqlite3.connect(str(db_file))
+    try:
+        baseline_cols = {row[1] for row in conn.execute("PRAGMA table_info(po_baseline_items)").fetchall()}
+        dispatch_cols = {row[1] for row in conn.execute("PRAGMA table_info(invoice_dispatch_items)").fetchall()}
+    finally:
+        conn.close()
+    assert "inspected_qty" in baseline_cols
+    assert "inspected_qty" in dispatch_cols
 
 
 # ---------------------------------------------------------------------------

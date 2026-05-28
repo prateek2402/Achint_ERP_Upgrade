@@ -14,6 +14,7 @@ from tests.test_regression_api import (  # noqa: F401  (fixture is consumed by n
     auth_header,
     create_client_po_invoice,
 )
+import main as app_module
 
 
 def _audit_query(c: TestClient, token: str, **params) -> dict:
@@ -45,6 +46,69 @@ def test_invoice_create_writes_audit_entry(client: TestClient):
     # PO create should also be audited.
     po_entries = _audit_query(client, token, entity_type="purchase_order")
     assert any(e["entity_id"] == "PO-001" for e in po_entries["items"])
+
+
+def test_audit_failure_does_not_rollback_invoice_create(client: TestClient, monkeypatch):
+    token = login(client, "admin", "Admin@1234")
+    client_resp = client.post("/api/clients", json={"name": "AUDIT-SAFE"}, headers=auth_header(token))
+    assert client_resp.status_code == 200, client_resp.text
+    client_id = client_resp.json()["id"]
+
+    po_resp = client.post(
+        "/api/purchase-orders",
+        json={
+            "client_id": client_id,
+            "po_no": "PO-AUDIT",
+            "contact_person": "Ops",
+            "project_name": "Kiln",
+            "adv_pct": 0.0,
+            "ret_pct": 0.0,
+            "ret_base": "basic",
+            "tds_base": "basic",
+            "tds_enabled": False,
+            "tds_rate": 0.0,
+            "tds_threshold": 0.0,
+            "baseline_items": [],
+        },
+        headers=auth_header(token),
+    )
+    assert po_resp.status_code == 200, po_resp.text
+
+    def broken_audit_log(*_args, **_kwargs):
+        raise RuntimeError("audit insert failed")
+
+    monkeypatch.setattr(app_module, "AuditLog", broken_audit_log)
+    inv_resp = client.post(
+        "/api/invoices",
+        json={
+            "client_id": client_id,
+            "po_no": "PO-AUDIT",
+            "invoice_no": "INV-AUDIT-SAFE",
+            "sub_entity": "",
+            "lr_no": "",
+            "inv_date": "2026-04-01",
+            "due_date": None,
+            "basic": 100.0,
+            "gst": 18.0,
+            "total": 118.0,
+            "advance_adj": 0.0,
+            "tds_ded": 0.0,
+            "retention_held": 0.0,
+            "net_payable": 0.0,
+            "paid": 0.0,
+            "balance": 0.0,
+            "is_note": False,
+            "note_type": None,
+            "note_reason": None,
+            "dispatch_items": [],
+        },
+        headers=auth_header(token),
+    )
+    assert inv_resp.status_code == 200, inv_resp.text
+
+    invs = client.get("/api/invoices", headers=auth_header(token))
+    assert invs.status_code == 200, invs.text
+    assert any(i["id"] == "INV-AUDIT-SAFE" for i in invs.json())
 
 
 def test_invoice_update_records_before_after(client: TestClient):
