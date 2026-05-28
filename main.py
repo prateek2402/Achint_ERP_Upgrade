@@ -9,7 +9,6 @@ import hmac
 import base64
 import secrets
 import sqlite3
-import shutil
 import threading
 import warnings
 import io
@@ -256,11 +255,15 @@ def ensure_schema_columns():
             cur.execute("ALTER TABLE po_baseline_items ADD COLUMN dispatch_alias TEXT")
         if "dispatch_rate" not in baseline_cols:
             cur.execute("ALTER TABLE po_baseline_items ADD COLUMN dispatch_rate REAL DEFAULT 0")
+        if "inspected_qty" not in baseline_cols:
+            cur.execute("ALTER TABLE po_baseline_items ADD COLUMN inspected_qty REAL DEFAULT 0")
 
         cur.execute("PRAGMA table_info(invoice_dispatch_items)")
         dispatch_cols = {row[1] for row in cur.fetchall()}
         if "rate_per_uom" not in dispatch_cols:
             cur.execute("ALTER TABLE invoice_dispatch_items ADD COLUMN rate_per_uom REAL DEFAULT 0")
+        if "inspected_qty" not in dispatch_cols:
+            cur.execute("ALTER TABLE invoice_dispatch_items ADD COLUMN inspected_qty REAL DEFAULT 0")
 
         cur.execute("PRAGMA table_info(system_settings)")
         settings_cols = {row[1] for row in cur.fetchall()}
@@ -347,7 +350,16 @@ def perform_database_backup():
         ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
         backup_path = BACKUP_DIR / f"erp_database_{ts}.sqlite"
         if DB_FILE_PATH.exists():
-            shutil.copy2(DB_FILE_PATH, backup_path)
+            source = sqlite3.connect(str(DB_FILE_PATH))
+            try:
+                target = sqlite3.connect(str(backup_path))
+                try:
+                    source.backup(target)
+                finally:
+                    target.close()
+            finally:
+                source.close()
+            os.utime(backup_path, None)
             log.info("daily backup created: %s", backup_path)
         prune_old_backups(KEEP_BACKUPS_DAYS)
     except Exception as exc:
@@ -697,16 +709,17 @@ def record_audit(
             details=details_text,
             ip_address=ip,
         )
-        db.add(entry)
         if commit:
+            db.add(entry)
             db.commit()
         else:
-            db.flush()
+            # Keep audit failures isolated from the caller's business write.
+            # A nested transaction rolls back only the audit row on constraint
+            # or serialization errors instead of undoing invoice/payment work.
+            with db.begin_nested():
+                db.add(entry)
+                db.flush()
     except Exception as exc:
-        try:
-            db.rollback()
-        except Exception:
-            pass
         log.warning("audit log write failed: %s", exc)
 
 # --- Security Middleware ---
@@ -884,6 +897,7 @@ class PaymentAllocateRequest(BaseModel):
     clear_po_pool: bool = False
     excess_action: str = "park"  # park | allocate_pending
     allow_overpayment: bool = False  # if True, allow allocating > invoice balance → negative balance
+    register_entry_id: Optional[int] = None
 
 class TransferRequest(BaseModel):
     new_client_id: int
@@ -970,60 +984,6 @@ def create_user(user_data: UserCreate, current_user: User = Depends(get_current_
     new_user = User(username=username, hashed_password=hash_password(user_data.password), role=normalized_role)
     db.add(new_user)
     db.commit()
-    if inv.po_no and inv.po_no != "UNASSIGNED":
-        po_obj = db.query(PurchaseOrder).filter(
-            PurchaseOrder.client_id == inv.client_id,
-            PurchaseOrder.po_no == inv.po_no
-        ).first()
-        if po_obj and float(po_obj.adv_pct or 0.0) > 0:
-            added_by_payment: dict[str, float] = defaultdict(float)
-            consumed_by_payment: dict[str, float] = defaultdict(float)
-            po_allocs = db.query(PaymentAllocation).join(
-                PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id
-            ).filter(
-                PaymentHistory.client_id == inv.client_id,
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.alloc_type.in_(["po_advance", "po_advance_applied"]),
-            ).all()
-            for al in po_allocs:
-                pid = str(al.payment_id or "").strip()
-                if not pid:
-                    continue
-                if al.alloc_type == "po_advance":
-                    added_by_payment[pid] += float(al.amount or 0.0)
-                elif al.alloc_type == "po_advance_applied":
-                    consumed_by_payment[pid] += float(al.amount or 0.0)
-
-            base_amt = float(new_inv.basic or 0.0) if (po_obj.ret_base or "total") == "basic" else float(new_inv.total or 0.0)
-            max_allowed = max(0.0, base_amt * (float(po_obj.adv_pct or 0.0) / 100.0))
-            existing_applied = db.query(PaymentAllocation).filter(
-                PaymentAllocation.alloc_type == "po_advance_applied",
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.target_inv_id == new_inv.invoice_no
-            ).all()
-            already_applied = sum(float(a.amount or 0.0) for a in existing_applied)
-            shortfall = max(0.0, max_allowed - already_applied)
-
-            if shortfall > 0:
-                for pid, added_amt in added_by_payment.items():
-                    remaining_amt = float(added_amt) - float(consumed_by_payment.get(pid, 0.0))
-                    if remaining_amt <= 0:
-                        continue
-                    take = min(shortfall, remaining_amt)
-                    if take <= 0:
-                        continue
-                    db.add(PaymentAllocation(
-                        payment_id=pid,
-                        alloc_type="po_advance_applied",
-                        target_inv_id=new_inv.invoice_no,
-                        target_po_no=inv.po_no,
-                        note_id=None,
-                        amount=float(take),
-                    ))
-                    shortfall -= take
-                    if shortfall <= 0:
-                        break
-        db.commit()
     return {"success": True, "id": new_user.id}
 
 
@@ -2378,6 +2338,9 @@ def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = N
         if adv_pct <= 0:
             _strip_po_advance_applied_for_po(client_id, po.po_no, db)
             continue
+        if invoice_no is None:
+            _strip_po_advance_applied_for_po(client_id, po.po_no, db)
+            db.flush()
 
         # Build per-payment advance lots for this PO.
         added_by_payment: dict[str, float] = defaultdict(float)
@@ -3213,8 +3176,22 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
 
+    selected_unallocated_register = None
     available_unallocated = float(client.excess_funds or 0.0)
     if payment.fund_source == "unallocated":
+        if payment.register_entry_id:
+            selected_unallocated_register = db.query(UnallocatedPaymentRegister).filter(
+                UnallocatedPaymentRegister.id == int(payment.register_entry_id),
+                UnallocatedPaymentRegister.client_id == payment.client_id,
+                UnallocatedPaymentRegister.status == "open",
+                UnallocatedPaymentRegister.balance > 0,
+            ).first()
+            if not selected_unallocated_register:
+                raise HTTPException(status_code=400, detail="Selected unallocated entry is no longer available.")
+            selected_balance = float(selected_unallocated_register.balance or 0.0)
+            if payment.amount > selected_balance + 0.01:
+                raise HTTPException(status_code=400, detail="Amount exceeds selected unallocated entry balance.")
+            available_unallocated = min(available_unallocated, selected_balance)
         if available_unallocated <= 0:
             raise HTTPException(status_code=400, detail="No unallocated funds available.")
         if payment.amount > 0:
@@ -3443,16 +3420,19 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
     # showing the old balance even after the pool has been consumed.
     if payment.fund_source == "unallocated" and payment_amount > 0:
         to_deduct = float(payment_amount)
-        open_regs = (
-            db.query(UnallocatedPaymentRegister)
-            .filter(
-                UnallocatedPaymentRegister.client_id == payment.client_id,
-                UnallocatedPaymentRegister.status == "open",
-                UnallocatedPaymentRegister.balance > 0,
+        if selected_unallocated_register is not None:
+            open_regs = [selected_unallocated_register]
+        else:
+            open_regs = (
+                db.query(UnallocatedPaymentRegister)
+                .filter(
+                    UnallocatedPaymentRegister.client_id == payment.client_id,
+                    UnallocatedPaymentRegister.status == "open",
+                    UnallocatedPaymentRegister.balance > 0,
+                )
+                .order_by(UnallocatedPaymentRegister.id.asc())
+                .all()
             )
-            .order_by(UnallocatedPaymentRegister.id.asc())
-            .all()
-        )
         for reg in open_regs:
             if to_deduct <= 0:
                 break

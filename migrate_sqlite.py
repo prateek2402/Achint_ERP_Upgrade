@@ -20,6 +20,9 @@ from models import (
     PoBaselineItem,
     PurchaseOrder,
     SystemSettings,
+    UnallocatedAdvanceRegister,
+    UnallocatedPaymentRegister,
+    UploadedDocument,
     User,
 )
 
@@ -100,10 +103,13 @@ def recalculate_client_ledger(client_id: int, db):
             total_excess -= alloc_sum
 
     client.excess_funds = max(0.0, total_excess)
-    db.commit()
+    db.flush()
 
 
 def truncate_target_tables(db):
+    db.query(UploadedDocument).delete()
+    db.query(UnallocatedAdvanceRegister).delete()
+    db.query(UnallocatedPaymentRegister).delete()
     db.query(PaymentAllocation).delete()
     db.query(PaymentHistory).delete()
     db.query(InvoiceDispatchItem).delete()
@@ -113,7 +119,7 @@ def truncate_target_tables(db):
     db.query(Client).delete()
     db.query(User).delete()
     db.query(SystemSettings).delete()
-    db.commit()
+    db.flush()
 
 
 def read_legacy_snapshot():
@@ -411,8 +417,6 @@ def run_import(force: bool = False):
                     )
                     report["counts"]["allocations"]["inserted"] += 1
 
-        db.commit()
-
         for client in db.query(Client).all():
             recalculate_client_ledger(client.id, db)
 
@@ -464,6 +468,7 @@ def run_import(force: bool = False):
 
         report["success"] = True
         report["completed_at"] = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+        db.commit()
         STATUS_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
         RUN_MARKER_PATH.write_text(report["completed_at"], encoding="utf-8")
 

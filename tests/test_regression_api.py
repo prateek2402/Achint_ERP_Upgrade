@@ -182,6 +182,22 @@ def test_auth_and_permission_guards(client: TestClient):
     assert as_admin.status_code == 200
 
 
+def test_admin_create_user_returns_success(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+
+    resp = client.post(
+        "/api/users",
+        json={"username": "new.user", "password": "Strong@12345", "role": "user"},
+        headers=auth_header(token),
+    )
+
+    assert resp.status_code == 200, resp.text
+    created_id = resp.json()["id"]
+    users = client.get("/api/users", headers=auth_header(token))
+    assert users.status_code == 200, users.text
+    assert any(u["id"] == created_id and u["username"] == "new.user" for u in users.json())
+
+
 def test_payment_allocations_use_invid_field(client: TestClient):
     """Locks the /api/payments allocation contract so the SPA Payment Log cell keeps working.
 
@@ -335,6 +351,87 @@ def test_delete_then_readd_invoice_drops_old_allocations(client: TestClient):
     invs = client.get("/api/invoices", headers=auth_header(token)).json()
     inv = next(i for i in invs if i["id"] == "INV-001")
     assert inv["paid"] == pytest.approx(0.0)
+
+
+def test_selected_unallocated_register_entry_is_debited(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "REG-ALLOC"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+
+    for pay_id, amount in (("UNALLOC-1", 100.0), ("UNALLOC-2", 50.0)):
+        receipt = client.post("/api/payments/allocate", json={
+            "client_id": client_id,
+            "id": pay_id,
+            "date": datetime.date.today().isoformat(),
+            "amount": amount,
+            "note": pay_id,
+            "mode": "targeted",
+            "targets": [],
+            "fund_source": "receipt",
+            "excess_action": "park",
+        }, headers=auth_header(token))
+        assert receipt.status_code == 200, receipt.text
+
+    inv_payload = {
+        "client_id": client_id,
+        "po_no": "UNASSIGNED",
+        "invoice_no": "INV-REG-ALLOC",
+        "sub_entity": "",
+        "lr_no": "",
+        "inv_date": "2026-04-01",
+        "due_date": None,
+        "basic": 50.0,
+        "gst": 0.0,
+        "total": 50.0,
+        "advance_adj": 0.0,
+        "tds_ded": 0.0,
+        "retention_held": 0.0,
+        "net_payable": 0.0,
+        "paid": 0.0,
+        "balance": 0.0,
+        "is_note": False,
+        "note_type": None,
+        "note_reason": None,
+        "dispatch_items": [],
+    }
+    inv = client.post("/api/invoices", json=inv_payload, headers=auth_header(token))
+    assert inv.status_code == 200, inv.text
+
+    rows_resp = client.get(
+        "/api/registers/unallocated-payments",
+        params={"client_id": client_id},
+        headers=auth_header(token),
+    )
+    assert rows_resp.status_code == 200, rows_resp.text
+    rows = sorted(rows_resp.json(), key=lambda r: r["id"])
+    assert [r["balance"] for r in rows] == [100.0, 50.0]
+    selected_id = rows[1]["id"]
+
+    allocation = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "ALLOC-FROM-SECOND",
+        "date": datetime.date.today().isoformat(),
+        "amount": 50.0,
+        "note": "allocate selected row",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-REG-ALLOC", "amount": 50.0}],
+        "fund_source": "unallocated",
+        "register_entry_id": selected_id,
+    }, headers=auth_header(token))
+    assert allocation.status_code == 200, allocation.text
+
+    after_resp = client.get(
+        "/api/registers/unallocated-payments",
+        params={"client_id": client_id},
+        headers=auth_header(token),
+    )
+    assert after_resp.status_code == 200, after_resp.text
+    after = {r["id"]: r for r in after_resp.json()}
+    assert after[rows[0]["id"]]["balance"] == pytest.approx(100.0)
+    assert after[rows[0]["id"]]["status"] == "open"
+    assert after[selected_id]["balance"] == pytest.approx(0.0)
+    assert after[selected_id]["status"] == "used"
 
 
 def test_delete_payment_unallocates_invoices_and_restores_balance(client: TestClient):
@@ -594,6 +691,68 @@ def test_po_advance_auto_apply_existing_and_new_invoices(client: TestClient):
     invs2 = client.get("/api/invoices", headers=auth_header(token)).json()
     inv3 = next(i for i in invs2 if i["id"] == "INV-ADV-3")
     assert inv3["advance"] == pytest.approx(40.0, abs=0.05)
+
+
+def test_po_advance_rebuilds_when_invoice_amount_shrinks(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    adv_pay = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-PO-ADV-SHRINK-1",
+        "date": datetime.date.today().isoformat(),
+        "amount": 100.0,
+        "note": "po advance add",
+        "mode": "targeted",
+        "targets": [],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "move_to_po": "PO-001",
+        "po_no": "PO-001",
+        "clear_po_pool": False,
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert adv_pay.status_code == 200, adv_pay.text
+
+    update_payload = {
+        "client_id": client_id,
+        "po_no": "PO-001",
+        "invoice_no": "INV-001",
+        "sub_entity": "Unit-1",
+        "lr_no": "LR-11",
+        "inv_date": "2026-04-01",
+        "due_date": "2026-04-15",
+        "basic": 100.0,
+        "gst": 18.0,
+        "total": 118.0,
+        "advance_adj": 0.0,
+        "tds_ded": 0.0,
+        "retention_held": 0.0,
+        "net_payable": 0.0,
+        "paid": 0.0,
+        "balance": 0.0,
+        "is_note": False,
+        "note_type": None,
+        "note_reason": None,
+        "dispatch_items": [],
+    }
+    updated = client.put("/api/invoices/INV-001", json=update_payload, headers=auth_header(token))
+    assert updated.status_code == 200, updated.text
+
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    inv = next(i for i in invs if i["id"] == "INV-001")
+    assert inv["advance"] == pytest.approx(5.0, abs=0.01)
+
+    pools = client.get(f"/api/clients/{client_id}/po-advance-pools", headers=auth_header(token))
+    assert pools.status_code == 200, pools.text
+    po_pool = next(p for p in pools.json()["pools"] if p["po_no"] == "PO-001")
+    assert po_pool["pool_remaining"] == pytest.approx(95.0, abs=0.01)
+    invoice_row = next(i for i in po_pool["invoices"] if i["invoice_no"] == "INV-001")
+    assert invoice_row["allocated_from_pool"] == pytest.approx(5.0, abs=0.01)
 
 
 def test_po_advance_pools_api_and_manual_recalculate(client: TestClient):
