@@ -20,7 +20,13 @@ def test_truncate_target_tables_is_rollback_safe_and_clears_registers(tmp_path):
         db.flush()
         db.add(User(username="legacy", hashed_password="x", role="user"))
         db.add(SystemSettings(exchange_rate=83.0, custom_columns="[]"))
-        db.add(UnallocatedPaymentRegister(client_id=client.id, amount=100.0, balance=100.0, status="open"))
+        db.add(UnallocatedPaymentRegister(
+            client_id=client.id,
+            created_on=datetime.date(2026, 4, 1),
+            amount=100.0,
+            balance=100.0,
+            status="open",
+        ))
         db.add(UploadedDocument(
             sha256="abc",
             kind="invoice",
