@@ -897,6 +897,7 @@ class PaymentAllocateRequest(BaseModel):
     clear_po_pool: bool = False
     excess_action: str = "park"  # park | allocate_pending
     allow_overpayment: bool = False  # if True, allow allocating > invoice balance → negative balance
+    register_entry_id: Optional[int] = None
 
 class TransferRequest(BaseModel):
     new_client_id: int
@@ -3175,8 +3176,22 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
 
+    selected_unallocated_register = None
     available_unallocated = float(client.excess_funds or 0.0)
     if payment.fund_source == "unallocated":
+        if payment.register_entry_id:
+            selected_unallocated_register = db.query(UnallocatedPaymentRegister).filter(
+                UnallocatedPaymentRegister.id == int(payment.register_entry_id),
+                UnallocatedPaymentRegister.client_id == payment.client_id,
+                UnallocatedPaymentRegister.status == "open",
+                UnallocatedPaymentRegister.balance > 0,
+            ).first()
+            if not selected_unallocated_register:
+                raise HTTPException(status_code=400, detail="Selected unallocated entry is no longer available.")
+            selected_balance = float(selected_unallocated_register.balance or 0.0)
+            if payment.amount > selected_balance + 0.01:
+                raise HTTPException(status_code=400, detail="Amount exceeds selected unallocated entry balance.")
+            available_unallocated = min(available_unallocated, selected_balance)
         if available_unallocated <= 0:
             raise HTTPException(status_code=400, detail="No unallocated funds available.")
         if payment.amount > 0:
@@ -3405,16 +3420,19 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
     # showing the old balance even after the pool has been consumed.
     if payment.fund_source == "unallocated" and payment_amount > 0:
         to_deduct = float(payment_amount)
-        open_regs = (
-            db.query(UnallocatedPaymentRegister)
-            .filter(
-                UnallocatedPaymentRegister.client_id == payment.client_id,
-                UnallocatedPaymentRegister.status == "open",
-                UnallocatedPaymentRegister.balance > 0,
+        if selected_unallocated_register is not None:
+            open_regs = [selected_unallocated_register]
+        else:
+            open_regs = (
+                db.query(UnallocatedPaymentRegister)
+                .filter(
+                    UnallocatedPaymentRegister.client_id == payment.client_id,
+                    UnallocatedPaymentRegister.status == "open",
+                    UnallocatedPaymentRegister.balance > 0,
+                )
+                .order_by(UnallocatedPaymentRegister.id.asc())
+                .all()
             )
-            .order_by(UnallocatedPaymentRegister.id.asc())
-            .all()
-        )
         for reg in open_regs:
             if to_deduct <= 0:
                 break

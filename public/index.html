@@ -5260,7 +5260,8 @@
                 apply_adv: false,
                 advance_only: false,
                 fund_source: 'unallocated',
-                allow_overpayment: allowOverpay
+                allow_overpayment: allowOverpay,
+                register_entry_id: Number(entryId)
             };
             try {
                 const resp = await fetch('/api/payments/allocate', {

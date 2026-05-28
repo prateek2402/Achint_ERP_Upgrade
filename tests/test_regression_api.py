@@ -353,6 +353,87 @@ def test_delete_then_readd_invoice_drops_old_allocations(client: TestClient):
     assert inv["paid"] == pytest.approx(0.0)
 
 
+def test_selected_unallocated_register_entry_is_debited(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "REG-ALLOC"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+
+    for pay_id, amount in (("UNALLOC-1", 100.0), ("UNALLOC-2", 50.0)):
+        receipt = client.post("/api/payments/allocate", json={
+            "client_id": client_id,
+            "id": pay_id,
+            "date": datetime.date.today().isoformat(),
+            "amount": amount,
+            "note": pay_id,
+            "mode": "targeted",
+            "targets": [],
+            "fund_source": "receipt",
+            "excess_action": "park",
+        }, headers=auth_header(token))
+        assert receipt.status_code == 200, receipt.text
+
+    inv_payload = {
+        "client_id": client_id,
+        "po_no": "UNASSIGNED",
+        "invoice_no": "INV-REG-ALLOC",
+        "sub_entity": "",
+        "lr_no": "",
+        "inv_date": "2026-04-01",
+        "due_date": None,
+        "basic": 50.0,
+        "gst": 0.0,
+        "total": 50.0,
+        "advance_adj": 0.0,
+        "tds_ded": 0.0,
+        "retention_held": 0.0,
+        "net_payable": 0.0,
+        "paid": 0.0,
+        "balance": 0.0,
+        "is_note": False,
+        "note_type": None,
+        "note_reason": None,
+        "dispatch_items": [],
+    }
+    inv = client.post("/api/invoices", json=inv_payload, headers=auth_header(token))
+    assert inv.status_code == 200, inv.text
+
+    rows_resp = client.get(
+        "/api/registers/unallocated-payments",
+        params={"client_id": client_id},
+        headers=auth_header(token),
+    )
+    assert rows_resp.status_code == 200, rows_resp.text
+    rows = sorted(rows_resp.json(), key=lambda r: r["id"])
+    assert [r["balance"] for r in rows] == [100.0, 50.0]
+    selected_id = rows[1]["id"]
+
+    allocation = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "ALLOC-FROM-SECOND",
+        "date": datetime.date.today().isoformat(),
+        "amount": 50.0,
+        "note": "allocate selected row",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-REG-ALLOC", "amount": 50.0}],
+        "fund_source": "unallocated",
+        "register_entry_id": selected_id,
+    }, headers=auth_header(token))
+    assert allocation.status_code == 200, allocation.text
+
+    after_resp = client.get(
+        "/api/registers/unallocated-payments",
+        params={"client_id": client_id},
+        headers=auth_header(token),
+    )
+    assert after_resp.status_code == 200, after_resp.text
+    after = {r["id"]: r for r in after_resp.json()}
+    assert after[rows[0]["id"]]["balance"] == pytest.approx(100.0)
+    assert after[rows[0]["id"]]["status"] == "open"
+    assert after[selected_id]["balance"] == pytest.approx(0.0)
+    assert after[selected_id]["status"] == "used"
+
+
 def test_delete_payment_unallocates_invoices_and_restores_balance(client: TestClient):
     token = login(client, "admin", "Admin@1234")
     cr = client.post("/api/clients", json={"name": "PAY-DEL-CLIENT"}, headers=auth_header(token))
