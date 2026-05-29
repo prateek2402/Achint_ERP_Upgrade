@@ -37,6 +37,12 @@
     }
     function setOne(key, v) { lsSet(key, v); ssSet(key, v); }
     function remOne(key) { lsRem(key); ssRem(key); }
+    function hydrateSessionFromLocal() {
+        [TOKEN_KEY, ROLE_KEY, USER_KEY, EXPIRY_KEY].forEach(function (key) {
+            var v = lsGet(key);
+            if (v != null) ssSet(key, v);
+        });
+    }
 
     function isExpired() {
         var raw = lsGet(EXPIRY_KEY) || ssGet(EXPIRY_KEY);
@@ -84,6 +90,11 @@
             return token ? { Authorization: "Bearer " + token } : {};
         }
     };
+    if (isExpired()) {
+        remOne(TOKEN_KEY); remOne(ROLE_KEY); remOne(USER_KEY); remOne(EXPIRY_KEY);
+    } else {
+        hydrateSessionFromLocal();
+    }
 
     /* ----------------------------------------------------------------------
      * Global loading overlay.

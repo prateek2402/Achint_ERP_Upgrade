@@ -697,16 +697,12 @@ def record_audit(
             details=details_text,
             ip_address=ip,
         )
-        db.add(entry)
+        with db.begin_nested():
+            db.add(entry)
+            db.flush()
         if commit:
             db.commit()
-        else:
-            db.flush()
     except Exception as exc:
-        try:
-            db.rollback()
-        except Exception:
-            pass
         log.warning("audit log write failed: %s", exc)
 
 # --- Security Middleware ---
@@ -970,60 +966,6 @@ def create_user(user_data: UserCreate, current_user: User = Depends(get_current_
     new_user = User(username=username, hashed_password=hash_password(user_data.password), role=normalized_role)
     db.add(new_user)
     db.commit()
-    if inv.po_no and inv.po_no != "UNASSIGNED":
-        po_obj = db.query(PurchaseOrder).filter(
-            PurchaseOrder.client_id == inv.client_id,
-            PurchaseOrder.po_no == inv.po_no
-        ).first()
-        if po_obj and float(po_obj.adv_pct or 0.0) > 0:
-            added_by_payment: dict[str, float] = defaultdict(float)
-            consumed_by_payment: dict[str, float] = defaultdict(float)
-            po_allocs = db.query(PaymentAllocation).join(
-                PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id
-            ).filter(
-                PaymentHistory.client_id == inv.client_id,
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.alloc_type.in_(["po_advance", "po_advance_applied"]),
-            ).all()
-            for al in po_allocs:
-                pid = str(al.payment_id or "").strip()
-                if not pid:
-                    continue
-                if al.alloc_type == "po_advance":
-                    added_by_payment[pid] += float(al.amount or 0.0)
-                elif al.alloc_type == "po_advance_applied":
-                    consumed_by_payment[pid] += float(al.amount or 0.0)
-
-            base_amt = float(new_inv.basic or 0.0) if (po_obj.ret_base or "total") == "basic" else float(new_inv.total or 0.0)
-            max_allowed = max(0.0, base_amt * (float(po_obj.adv_pct or 0.0) / 100.0))
-            existing_applied = db.query(PaymentAllocation).filter(
-                PaymentAllocation.alloc_type == "po_advance_applied",
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.target_inv_id == new_inv.invoice_no
-            ).all()
-            already_applied = sum(float(a.amount or 0.0) for a in existing_applied)
-            shortfall = max(0.0, max_allowed - already_applied)
-
-            if shortfall > 0:
-                for pid, added_amt in added_by_payment.items():
-                    remaining_amt = float(added_amt) - float(consumed_by_payment.get(pid, 0.0))
-                    if remaining_amt <= 0:
-                        continue
-                    take = min(shortfall, remaining_amt)
-                    if take <= 0:
-                        continue
-                    db.add(PaymentAllocation(
-                        payment_id=pid,
-                        alloc_type="po_advance_applied",
-                        target_inv_id=new_inv.invoice_no,
-                        target_po_no=inv.po_no,
-                        note_id=None,
-                        amount=float(take),
-                    ))
-                    shortfall -= take
-                    if shortfall <= 0:
-                        break
-        db.commit()
     return {"success": True, "id": new_user.id}
 
 
@@ -2243,9 +2185,14 @@ def recalculate_client_ledger(client_id: int, db: Session, preserve_manual_paid:
         for al in allocations:
             if al.alloc_type == 'invoice' and al.target_inv_id in inv_map:
                 alloc_paid_by_inv[al.target_inv_id] += float(al.amount or 0.0)
+            if al.alloc_type == 'note_allocation' and al.target_inv_id in inv_map:
+                note = inv_map.get(str(al.note_id)) if al.note_id else None
+                note_type = (note.note_type if note else None) or ""
+                note_amount = float(al.amount or 0.0)
+                alloc_paid_by_inv[al.target_inv_id] += note_amount if note_type != "DN" else -note_amount
             if al.alloc_type == 'po_advance_applied' and al.target_inv_id in inv_map:
                 advance_applied_by_inv[al.target_inv_id] += float(al.amount or 0.0)
-            if al.alloc_type in ('invoice', 'po_advance', 'po_advance_applied', 'note_allocation'):
+            if al.alloc_type in ('invoice', 'po_advance', 'po_advance_applied', 'note_allocation', 'unallocated_reversal'):
                 payment_alloc_sum[pay.id] += float(al.amount or 0.0)
 
     # 1. Reset all invoice balances to baseline.
@@ -2373,6 +2320,7 @@ def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = N
     if not po_rows:
         return
 
+    added_allocations = False
     for po in po_rows:
         adv_pct = float(po.adv_pct or 0.0)
         if adv_pct <= 0:
@@ -2453,9 +2401,13 @@ def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = N
                     note_id=None,
                     amount=float(take),
                 ))
+                added_allocations = True
                 lots[lot_idx][1] = remaining_lot - take
                 applied_by_invoice[inv.invoice_no] = applied_by_invoice.get(inv.invoice_no, 0.0) + take
                 shortfall -= take
+
+    if added_allocations:
+        db.flush()
 
 
 def round_inr_nearest(value: Optional[float]) -> float:
@@ -3198,11 +3150,17 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
     if payment.mode == "targeted" and payment.targets:
         for t in payment.targets:
             inv = inv_map.get(t.inv_id)
-            if inv and (inv.balance or 0) > 0:
+            requested_amount = max(0.0, float(t.amount or 0.0))
+            include_overpaid_target = (
+                payment.allow_overpayment
+                and not payment.advance_only
+                and requested_amount > 0
+            )
+            if inv and ((inv.balance or 0) > 0 or include_overpaid_target):
                 if payment.advance_only:
                     selected.append((inv, -1.0))
                 else:
-                    selected.append((inv, max(0.0, float(t.amount or 0.0))))
+                    selected.append((inv, requested_amount))
     else:
         selected = [(inv, -1.0) for inv in sorted(
             [i for i in invoices if (i.balance or 0) > 0],
@@ -3287,6 +3245,11 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
                     to_apply_adv = min(shortfall, available_pool, inv_balance_for_adv)
                     if to_apply_adv > 0:
                         inv.advance_adj = current_advance + to_apply_adv
+                        inv.net_payable = max(
+                            0.0,
+                            float(inv.total or 0.0) - float(inv.advance_adj or 0.0) - float(inv.tds_ded or 0.0)
+                        )
+                        inv.balance = float(inv.net_payable or 0.0) - float(inv.paid or 0.0)
                         po_pool[po_no] = available_pool - to_apply_adv
                         po_advance_allocs.append((inv.invoice_no, to_apply_adv, po_no))
                         advance_applied_total += to_apply_adv
@@ -3592,6 +3555,27 @@ def reverse_unallocated_payment_entry(entry_id: int, current_user: User = Depend
     row = db.query(UnallocatedPaymentRegister).filter(UnallocatedPaymentRegister.id == entry_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="Register entry not found.")
+    reversed_amount = max(0.0, float(row.balance or 0.0))
+    if reversed_amount > 0:
+        reversal_id = f"UNALLOC-REV-{row.id}"
+        if not db.query(PaymentHistory).filter(PaymentHistory.id == reversal_id).first():
+            db.add(PaymentHistory(
+                id=reversal_id,
+                client_id=row.client_id,
+                date=row.created_on or datetime.date.today(),
+                type="UNALLOCATED_APPLIED",
+                amount=reversed_amount,
+                details=f"Reversed unallocated register entry {row.id}",
+                note=row.note,
+            ))
+            db.add(PaymentAllocation(
+                payment_id=reversal_id,
+                alloc_type="unallocated_reversal",
+                target_inv_id=None,
+                target_po_no=None,
+                note_id=None,
+                amount=reversed_amount,
+            ))
     row.status = "reversed"
     row.balance = 0.0
     db.commit()

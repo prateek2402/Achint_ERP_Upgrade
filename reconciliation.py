@@ -50,7 +50,7 @@ def check_invoice_math(db: Session) -> list[dict]:
     """Persisted invoice fields should follow the documented formulas.
 
     For each invoice that is NOT a credit/debit note:
-      * expected_net_payable = max(0, total - advance_adj)
+      * expected_net_payable = max(0, total - advance_adj - tds_ded)
         (retention_held is informational; it does not reduce net payable or balance.)
       * expected_balance     = max(0, expected_net_payable - paid)
 
@@ -70,7 +70,7 @@ def check_invoice_math(db: Session) -> list[dict]:
         np_persisted = float(inv.net_payable or 0.0)
         bal_persisted = float(inv.balance or 0.0)
 
-        np_expected = max(0.0, total - adv)
+        np_expected = max(0.0, total - adv - tds)
         bal_expected = max(0.0, np_expected - paid)
         bal_acceptable = _money_close(bal_persisted, bal_expected)
 
@@ -123,7 +123,7 @@ def check_invoice_math(db: Session) -> list[dict]:
 
 # Allocation types whose amounts should be considered "consumed" against the payment.
 _CONSUMING_ALLOC_TYPES = (
-    "invoice", "po_advance", "po_advance_applied", "note_allocation",
+    "invoice", "po_advance", "po_advance_applied", "note_allocation", "unallocated_reversal",
 )
 
 
