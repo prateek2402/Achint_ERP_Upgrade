@@ -46,6 +46,37 @@ def test_reconciliation_clean_ledger_has_no_errors(client: TestClient):
         assert _section(report, key)["errors"] == 0
 
 
+def test_reconciliation_accepts_tds_adjusted_invoice_math(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    upd = client.patch(
+        "/api/invoices/INV-001/inline",
+        json={"total": 10000.0},
+        headers=auth_header(token),
+    )
+    assert upd.status_code == 200, upd.text
+    update_po = client.post("/api/purchase-orders", json={
+        "client_id": client_id,
+        "po_no": "PO-001",
+        "contact_person": "Ops",
+        "project_name": "Kiln",
+        "adv_pct": 5.0,
+        "ret_pct": 2.0,
+        "ret_base": "total",
+        "tds_base": "total",
+        "tds_enabled": True,
+        "tds_rate": 0.1,
+        "tds_threshold": 5000.0,
+        "baseline_items": [],
+    }, headers=auth_header(token))
+    assert update_po.status_code == 200, update_po.text
+
+    report = _get_report(client, token)
+    invoice_section = _section(report, "invoice_math")
+    assert invoice_section["errors"] == 0
+
+
 def _open_session():
     """Helper: open a session against the test DB to inject bad data directly."""
     return app_module.SessionLocal()

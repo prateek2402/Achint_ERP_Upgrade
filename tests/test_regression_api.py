@@ -7,7 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import main as app_module
-from models import Base, User
+from models import AuditLog, Base, Client, User
 
 
 @pytest.fixture()
@@ -182,6 +182,45 @@ def test_auth_and_permission_guards(client: TestClient):
     assert as_admin.status_code == 200
 
 
+def test_create_user_returns_success_after_insert(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+
+    resp = client.post(
+        "/api/users",
+        json={"username": "new.user", "password": "Newuser@1234", "role": "user"},
+        headers=auth_header(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+    users = client.get("/api/users", headers=auth_header(token)).json()
+    assert any(u["username"] == "new.user" and u["role"] == "user" for u in users)
+
+
+def test_audit_failure_does_not_rollback_business_transaction(client: TestClient, monkeypatch):
+    db = app_module.SessionLocal()
+    try:
+        db.add(Client(name="AUDIT-SAFE"))
+        original_add = db.add
+
+        def fail_audit_add(obj, *args, **kwargs):
+            if isinstance(obj, AuditLog):
+                raise RuntimeError("audit sink unavailable")
+            return original_add(obj, *args, **kwargs)
+
+        monkeypatch.setattr(db, "add", fail_audit_add)
+        app_module.record_audit(db, None, "client", "create", entity_id="AUDIT-SAFE")
+        monkeypatch.setattr(db, "add", original_add)
+        db.commit()
+    finally:
+        db.close()
+
+    db = app_module.SessionLocal()
+    try:
+        assert db.query(Client).filter(Client.name == "AUDIT-SAFE").first() is not None
+    finally:
+        db.close()
+
+
 def test_payment_allocations_use_invid_field(client: TestClient):
     """Locks the /api/payments allocation contract so the SPA Payment Log cell keeps working.
 
@@ -212,6 +251,110 @@ def test_payment_allocations_use_invid_field(client: TestClient):
         assert "invId" in a, f"allocation missing 'invId' key: {a}"
         assert a["invId"] == "INV-001"
         assert "noteType" in a  # may be None for non-note allocations
+
+
+def test_credit_note_reduces_target_invoice_balance(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "NOTECLIENT"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+    inv = client.post("/api/invoices", json={
+        "client_id": client_id,
+        "po_no": "UNASSIGNED",
+        "invoice_no": "INV-CN-1",
+        "sub_entity": "",
+        "lr_no": "",
+        "inv_date": "2026-04-01",
+        "due_date": None,
+        "basic": 100.0,
+        "gst": 0.0,
+        "total": 100.0,
+        "advance_adj": 0.0,
+        "tds_ded": 0.0,
+        "retention_held": 0.0,
+        "net_payable": 0.0,
+        "paid": 0.0,
+        "balance": 0.0,
+        "is_note": False,
+        "note_type": None,
+        "note_reason": None,
+        "dispatch_items": [],
+    }, headers=auth_header(token))
+    assert inv.status_code == 200, inv.text
+
+    note = client.post("/api/notes/issue", json={
+        "client_id": client_id,
+        "note_no": "CN-1",
+        "date": "2026-04-02",
+        "note_type": "CN",
+        "amount": 25.0,
+        "reason": "rate difference",
+        "target_invoice_id": "INV-CN-1",
+    }, headers=auth_header(token))
+    assert note.status_code == 200, note.text
+
+    invoices = client.get("/api/invoices", headers=auth_header(token)).json()
+    target = next(i for i in invoices if i["id"] == "INV-CN-1")
+    assert target["paid"] == pytest.approx(25.0)
+    assert target["balance"] == pytest.approx(75.0)
+
+
+def test_allow_overpayment_can_target_zero_balance_invoice(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "OVERPAYCLIENT"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+    inv_payload = {
+        "client_id": client_id,
+        "po_no": "UNASSIGNED",
+        "invoice_no": "INV-OVER-1",
+        "sub_entity": "",
+        "lr_no": "",
+        "inv_date": "2026-04-01",
+        "due_date": None,
+        "basic": 100.0,
+        "gst": 0.0,
+        "total": 100.0,
+        "advance_adj": 0.0,
+        "tds_ded": 0.0,
+        "retention_held": 0.0,
+        "net_payable": 0.0,
+        "paid": 0.0,
+        "balance": 0.0,
+        "is_note": False,
+        "note_type": None,
+        "note_reason": None,
+        "dispatch_items": [],
+    }
+    inv = client.post("/api/invoices", json=inv_payload, headers=auth_header(token))
+    assert inv.status_code == 200, inv.text
+    first = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-OVER-1",
+        "date": "2026-04-03",
+        "amount": 100.0,
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-OVER-1", "amount": 100.0}],
+        "fund_source": "receipt",
+    }, headers=auth_header(token))
+    assert first.status_code == 200, first.text
+
+    extra = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-OVER-2",
+        "date": "2026-04-04",
+        "amount": 40.0,
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-OVER-1", "amount": 40.0}],
+        "fund_source": "receipt",
+        "allow_overpayment": True,
+    }, headers=auth_header(token))
+    assert extra.status_code == 200, extra.text
+
+    invoices = client.get("/api/invoices", headers=auth_header(token)).json()
+    target = next(i for i in invoices if i["id"] == "INV-OVER-1")
+    assert target["paid"] == pytest.approx(140.0)
+    assert target["balance"] == pytest.approx(-40.0)
 
 
 def test_invoice_rounding_and_tiny_balance_preserved(client: TestClient):
@@ -617,6 +760,81 @@ def test_po_advance_pools_api_and_manual_recalculate(client: TestClient):
     )
     assert apply.status_code == 200, apply.text
     assert "pool_remaining" in apply.json()
+
+
+def test_po_terms_update_does_not_duplicate_uncommitted_advance_apply(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    adv_pay = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-PO-ADV-IDEMPOTENT",
+        "date": datetime.date.today().isoformat(),
+        "amount": 100.0,
+        "note": "po advance idempotence",
+        "mode": "targeted",
+        "targets": [],
+        "fund_source": "receipt",
+        "move_to_po": "PO-001",
+        "po_no": "PO-001",
+    }, headers=auth_header(token))
+    assert adv_pay.status_code == 200, adv_pay.text
+
+    update_po = client.post("/api/purchase-orders", json={
+        "client_id": client_id,
+        "po_no": "PO-001",
+        "contact_person": "Ops",
+        "project_name": "Kiln",
+        "adv_pct": 8.0,
+        "ret_pct": 2.0,
+        "ret_base": "basic",
+        "tds_enabled": True,
+        "tds_rate": 0.1,
+        "tds_threshold": 5000.0,
+        "baseline_items": [],
+    }, headers=auth_header(token))
+    assert update_po.status_code == 200, update_po.text
+
+    pools = client.get(f"/api/clients/{client_id}/po-advance-pools", headers=auth_header(token))
+    assert pools.status_code == 200, pools.text
+    po_entry = next(p for p in pools.json()["pools"] if p["po_no"] == "PO-001")
+    assert po_entry["pool_remaining"] == pytest.approx(20.0, abs=0.01)
+    inv_entry = next(i for i in po_entry["invoices"] if i["invoice_no"] == "INV-001")
+    assert inv_entry["allocated_from_pool"] == pytest.approx(80.0, abs=0.01)
+
+
+def test_reversing_unallocated_register_reduces_spendable_excess(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "UNALLOC-REV-CLIENT"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+
+    pay = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-UNALLOC-REV-1",
+        "date": "2026-04-05",
+        "amount": 125.0,
+        "note": "unallocated receipt",
+        "mode": "targeted",
+        "targets": [],
+        "fund_source": "receipt",
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert pay.status_code == 200, pay.text
+
+    clients = client.get("/api/clients", headers=auth_header(token)).json()
+    row = next(c for c in clients if c["id"] == client_id)
+    assert row["excess_funds"] == pytest.approx(125.0)
+
+    regs = client.get(f"/api/registers/unallocated-payments?client_id={client_id}", headers=auth_header(token))
+    assert regs.status_code == 200, regs.text
+    reg_id = regs.json()[0]["id"]
+    rev = client.post(f"/api/registers/unallocated-payments/{reg_id}/reverse", headers=auth_header(token))
+    assert rev.status_code == 200, rev.text
+
+    clients_after = client.get("/api/clients", headers=auth_header(token)).json()
+    row_after = next(c for c in clients_after if c["id"] == client_id)
+    assert row_after["excess_funds"] == pytest.approx(0.0)
 
 
 def test_delete_po_advance_payment_deallocates_from_invoices(client: TestClient):
