@@ -135,9 +135,12 @@
             }
             var ov = ensure();
             if (!ov) return;
+            ov.classList.remove("erp-loader-hiding");
+            ov.style.pointerEvents = "auto";
             var m = msgEl();
             if (m) m.textContent = lastMessage || "Loading...";
             ov.style.display = "flex";
+            ov.style.visibility = "visible";
             // double rAF so the transition fires after display:flex applies
             requestAnimationFrame(function () {
                 requestAnimationFrame(function () { ov.style.opacity = "1"; });
@@ -150,15 +153,35 @@
             lastMessage = "";
             var ov = el();
             if (!ov) return;
+            ov.style.pointerEvents = "none";
             ov.style.opacity = "0";
-            setTimeout(function () { if (pending === 0 && ov) ov.style.display = "none"; }, 160);
+            setTimeout(function () {
+                if (pending === 0 && ov) {
+                    ov.style.display = "none";
+                    ov.style.visibility = "hidden";
+                }
+            }, 160);
         }
 
         function reset() {
             pending = 0;
             lastMessage = "";
             var ov = el();
-            if (ov) { ov.style.opacity = "0"; ov.style.display = "none"; }
+            if (ov) {
+                ov.classList.remove("erp-loader-hiding");
+                ov.style.pointerEvents = "none";
+                ov.style.opacity = "0";
+                ov.style.display = "none";
+                ov.style.visibility = "hidden";
+            }
+        }
+
+        function setMessage(message) {
+            if (typeof message === "string" && message.length) {
+                lastMessage = message;
+            }
+            var m = msgEl();
+            if (m) m.textContent = lastMessage || "Loading...";
         }
 
         function withLoader(promise, message) {
@@ -172,7 +195,7 @@
             );
         }
 
-        return { show: show, hide: hide, reset: reset, withLoader: withLoader };
+        return { show: show, hide: hide, reset: reset, setMessage: setMessage, withLoader: withLoader };
     })();
 
     /**

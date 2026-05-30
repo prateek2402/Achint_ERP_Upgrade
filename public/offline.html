@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#1e3a8a">
+    <title>Achint ERP — Offline</title>
+    <style>
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: Inter, "Segoe UI", sans-serif;
+            background: linear-gradient(160deg, #0b2c5f 0%, #1e3a8a 55%, #d97706 140%);
+            color: #fff;
+            padding: 24px;
+            text-align: center;
+        }
+        .card {
+            max-width: 420px;
+            background: rgba(255, 255, 255, 0.96);
+            color: #0f172a;
+            border-radius: 16px;
+            padding: 28px 24px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
+        }
+        h1 { margin: 0 0 8px; font-size: 1.25rem; }
+        p { margin: 0 0 18px; font-size: 0.92rem; color: #475569; line-height: 1.5; }
+        button {
+            border: none;
+            background: #0b2c5f;
+            color: #fff;
+            font-weight: 700;
+            padding: 12px 20px;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>You are offline</h1>
+        <p>Achint ERP needs a connection to the server for live data. Check your network, then try again.</p>
+        <button type="button" onclick="location.reload()">Retry</button>
+    </div>
+</body>
+</html>

@@ -2,10 +2,17 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Achint Chemicals | Accounts ERP</title>
+    <meta name="description" content="Achint Chemicals accounts ERP — invoices, dispatch, payments, and ledger.">
     <meta name="theme-color" content="#1e3a8a">
-    <link rel="apple-touch-icon" href="icon-192.png">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Achint ERP">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+    <link rel="apple-touch-icon" href="/icon-192.png">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -14,6 +21,8 @@
     <script src="https://cdn.jsdelivr.net/npm/ag-grid-community/dist/ag-grid-community.min.js"></script>
     <link rel="stylesheet" href="/static/css/styles.css">
     <script src="/static/js/api.js"></script>
+    <script src="/static/js/hscroll-top.js"></script>
+    <script src="/static/js/ui-polish.js"></script>
     <script src="/static/js/audit.js"></script>
     <script src="/static/js/recon.js"></script>
 </head>
@@ -539,6 +548,7 @@
             </div>
 
             <div class="user-menu-container" id="userMenuTop" style="display: none;">
+                <button type="button" class="btn-outline btn-sm" id="pwaInstallBtn" style="display: none;" onclick="AchintPwa && AchintPwa.promptInstall()" title="Install Achint ERP as an app">Install app</button>
                 <button class="btn-outline btn-sm" id="btnFxRate" onclick="setExchangeRate()" title="Set Exchange Rate" style="border-color: var(--border-dark); color: var(--text-dark); font-weight: 600;">FX 1 USD = ₹<span id="exRateDisplay">83.00</span></button>
                 <button class="btn-primary btn-sm" onclick="toggleDisplayCurrency()" id="btnDisplayCur" style="width:100px;">View in USD</button>
                 <div class="user-menu-dropdown" id="topUserMenuWrap">
@@ -943,6 +953,10 @@
                         <div class="form-group" style="margin-bottom: 16px;">
                             <label>Transaction Remarks / Notes</label>
                             <input type="text" id="paymentNote" placeholder="Optional notes for this receipt..." style="background: #f8fafc;">
+                        </div>
+                        <div class="form-group" style="margin-bottom: 16px;">
+                            <label>Payment Date</label>
+                            <input type="date" id="paymentDate" style="background: #f8fafc;">
                         </div>
 
                         <div style="display:flex; flex-wrap:wrap; gap: 16px; margin-bottom: 12px; background: #f8fafc; padding: 10px 14px; border: 1px solid var(--border); border-radius: var(--radius-md);">
@@ -1362,7 +1376,10 @@
                     <span class="dispatch-formula-label">fx</span>
                     <input id="dispatchFormulaInput" type="text" placeholder="Select a cell to view/edit value">
                 </div>
-                <div id="dispatchAgGrid" class="ag-theme-alpine"></div>
+                <div class="hscroll-sync hscroll-sync--grid">
+                    <div class="hscroll-top" aria-hidden="true"><div class="hscroll-top-inner"></div></div>
+                    <div id="dispatchAgGrid" class="ag-theme-alpine hscroll-grid-host"></div>
+                </div>
                 <div style="margin-bottom: 20px;">
                     <table id="dispatchUnifiedTable" class="dispatch-table" style="font-size: 0.8rem;">
                         <thead id="dispatchUnifiedHead" style="background: #f8fafc; position: static; top: auto; z-index: auto; box-shadow: none;">
@@ -1975,6 +1992,10 @@
         ];
 
         window.onload = function () {
+            const payDateEl = document.getElementById('paymentDate');
+            if (payDateEl && !payDateEl.value) {
+                payDateEl.value = new Date().toISOString().split('T')[0];
+            }
             const token = ErpAuth.getToken();
             if (!token) {
                 document.getElementById('loginOverlay').style.display = 'flex';
@@ -2072,6 +2093,23 @@
             return '₹' + v.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
         }
 
+        function getSelectedPaymentDate() {
+            const today = new Date().toISOString().split('T')[0];
+            const el = document.getElementById('paymentDate');
+            if (!el) return today;
+            const v = String(el.value || '').trim();
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) {
+                el.value = today;
+                return today;
+            }
+            return v;
+        }
+
+        // Ledger display helper for columns that must remain rounded to nearest INR.
+        function formatCurRounded(val) {
+            return formatCur(roundMoneyTotal(val));
+        }
+
         function formatNum(val, digits = 2) {
             const n = Number(val) || 0;
             return n.toLocaleString('en-IN', { minimumFractionDigits: digits, maximumFractionDigits: digits });
@@ -2093,9 +2131,70 @@
         // balance is below this threshold. The actual `inv.balance` is preserved,
         // so the cell shows the real (small) due in green for traceability.
         const TINY_BAL_THRESHOLD = 5;
+        // Tiny credit balances (absolute value below this) are ignored as credit
+        // and treated as cleared to avoid noise from rounding-level adjustments.
+        const CREDIT_IGNORE_THRESHOLD = 10;
+        function ledgerBalance(inv) {
+            if (!inv) return 0;
+            if (inv.isNote) {
+                const ntype = String(inv.noteType || '').toUpperCase();
+                const stored = Number(inv.balance);
+                const totalNum = Number(inv.total || 0);
+                const noteAbs = Math.abs(totalNum);
+                // CN/DN rows: show signed credit/debit in Total Due. Legacy rows may have
+                // correct `total` but `balance` still 0 until ledger recalculate runs.
+                if (ntype === 'CN') {
+                    if (Number.isFinite(stored) && stored < -0.009) return stored;
+                    if (noteAbs > 0.009) return totalNum <= 0 ? totalNum : -noteAbs;
+                    return Number.isFinite(stored) ? stored : 0;
+                }
+                if (ntype === 'DN') {
+                    const net = Number(inv.netPayable || 0);
+                    const paid = Number(inv.paid || 0);
+                    if (net > 0.009) return Math.max(0, net - paid);
+                    if (Number.isFinite(stored) && stored > 0.009) return stored;
+                    if (noteAbs > 0.009) return noteAbs;
+                    return Number.isFinite(stored) ? stored : 0;
+                }
+                return Number.isFinite(stored) ? stored : totalNum;
+            }
+            const stored = Number(inv.balance);
+            if (Number.isFinite(stored)) return stored;
+            return Number(inv.netPayable || 0) - Number(inv.paid || 0);
+        }
+        function invoiceBalance(inv) {
+            return ledgerBalance(inv);
+        }
+        function isInvoiceCreditBalance(inv) {
+            if (!inv) return false;
+            if (inv.isNote && String(inv.noteType || '').toUpperCase() === 'CN') return true;
+            return ledgerBalance(inv) <= -CREDIT_IGNORE_THRESHOLD;
+        }
         function isInvoiceCleared(inv) {
             if (!inv) return false;
-            return (Number(inv.balance) || 0) < TINY_BAL_THRESHOLD;
+            if (inv.isNote) return false;
+            if (isInvoiceCreditBalance(inv)) return false;
+            const bal = ledgerBalance(inv);
+            if (bal < 0) return bal > -CREDIT_IGNORE_THRESHOLD;
+            return bal < TINY_BAL_THRESHOLD;
+        }
+        /** Invoices and debit notes with outstanding due appear in payment allocation lists. */
+        function isPendingPaymentAllocatable(inv) {
+            if (!inv) return false;
+            if (!inv.isNote) return !isInvoiceCleared(inv);
+            if (String(inv.noteType || '').toUpperCase() === 'DN') {
+                return ledgerBalance(inv) >= TINY_BAL_THRESHOLD;
+            }
+            return false;
+        }
+        function formatBalanceCur(inv) {
+            return formatCur(ledgerBalance(inv));
+        }
+        function balanceTotalColor(total) {
+            const t = roundMoneyTotal(total);
+            if (t < 0) return '#2563eb';
+            if (t > 0) return 'var(--danger)';
+            return 'var(--text-muted)';
         }
 
         function normalizeDispatchDesc(text) {
@@ -2472,7 +2571,7 @@
                     });
                     document.getElementById('loginOverlay').style.display = 'none';
                     // Keep the loader visible while the dashboard hydrates.
-                    document.getElementById('erpGlobalLoaderMsg').textContent = 'Loading your workspace...';
+                    setLoaderMessage('Loading your workspace...');
                     try {
                         await loadSecuredData(data.token);
                     } finally {
@@ -2486,6 +2585,7 @@
                 ErpLoader.hide();
                 errDiv.innerText = "Cannot connect to central server.";
             } finally {
+                ErpLoader.hide();
                 if (btn) { btn.disabled = false; btn.innerText = originalLabel || 'Secure Sign In'; }
             }
         }
@@ -2545,6 +2645,15 @@
             }
         }
 
+        function setLoaderMessage(message) {
+            if (window.ErpLoader && typeof ErpLoader.setMessage === 'function') {
+                ErpLoader.setMessage(message);
+            } else {
+                const msg = document.getElementById('erpGlobalLoaderMsg');
+                if (msg) msg.textContent = message;
+            }
+        }
+
         async function loadSecuredData() {
             const token = ErpAuth.getToken();
             if (!token) return;
@@ -2566,6 +2675,7 @@
                     return;
                 }
 
+                setLoaderMessage('Loading accounts...');
                 // 1. Fetch Clients
                 const clientRes = await fetch('/api/clients', { headers: { 'Authorization': 'Bearer ' + token } });
                 if (!clientRes.ok) {
@@ -2594,6 +2704,7 @@
                     };
                 });
 
+                setLoaderMessage('Loading purchase orders...');
                 // 2. Fetch Purchase Orders
                 const poRes = await fetch('/api/purchase-orders', { headers: { 'Authorization': 'Bearer ' + token } });
                 if (poRes.ok) {
@@ -2628,6 +2739,7 @@
                     });
                 }
 
+                setLoaderMessage('Loading invoices...');
                 // 3. Fetch Invoices
                 const invRes = await fetch('/api/invoices', { headers: { 'Authorization': 'Bearer ' + token } });
                 if (invRes.ok) {
@@ -2640,6 +2752,7 @@
                     });
                 }
 
+                setLoaderMessage('Loading payments...');
                 // 4. Fetch Payments
                 const payRes = await fetch('/api/payments', { headers: { 'Authorization': 'Bearer ' + token } });
                 if (payRes.ok) {
@@ -2653,8 +2766,8 @@
                 }
 
                 // 5. Finalize Boot
-                // The frontend reads refreshed ledger math from the backend.
-                updateSidebarNav();
+                setLoaderMessage('Building dashboard...');
+                await new Promise(function (resolve) { requestAnimationFrame(function () { requestAnimationFrame(resolve); }); });
 
                 // UNHIDE THE TOP RIGHT USER MENU AFTER LOGIN
                 document.getElementById('userMenuTop').style.display = 'flex';
@@ -2679,6 +2792,13 @@
                     document.getElementById('topbarTitle').innerText = 'Portfolio Dashboard';
                     renderLandingPage();
                 }
+
+                setTimeout(function () {
+                    if (typeof enhanceTableWrappers === 'function') enhanceTableWrappers();
+                    if (typeof scheduleAgGridTopScroll === 'function') {
+                        scheduleAgGridTopScroll(document.getElementById('dispatchAgGrid'));
+                    }
+                }, 0);
 
             } catch (e) {
                 console.error("Initialization Error:", e);
@@ -4346,19 +4466,22 @@
             const total = basic + (applyGst ? basic * 0.18 : 0);
 
             let tdsInput = document.getElementById('tdsVal');
-
-            if (terms) {
-                if (terms.tdsEnabled) {
-                    let baseAmtForTds = terms.tdsBase === 'total' ? total : basic;
-                    tdsInput.value = (baseAmtForTds * (terms.dynamicTdsRate || 0)).toFixed(2);
+            const isEditing = document.getElementById('editMode')?.value === 'true';
+            // TDS is manual per invoice while editing; PO rules only suggest on new entry.
+            if (!isEditing && tdsInput) {
+                if (terms) {
+                    if (terms.tdsEnabled) {
+                        let baseAmtForTds = terms.tdsBase === 'total' ? total : basic;
+                        tdsInput.value = (baseAmtForTds * (terms.dynamicTdsRate || 0)).toFixed(2);
+                    } else {
+                        tdsInput.value = '0.00';
+                    }
                 } else {
-                    tdsInput.value = '0.00';
-                }
-            } else {
-                if (document.getElementById('applyTds') && document.getElementById('applyTds').checked) {
-                    tdsInput.value = (basic * 0.001).toFixed(2);
-                } else {
-                    tdsInput.value = '0.00';
+                    if (document.getElementById('applyTds') && document.getElementById('applyTds').checked) {
+                        tdsInput.value = (basic * 0.001).toFixed(2);
+                    } else {
+                        tdsInput.value = '0.00';
+                    }
                 }
             }
 
@@ -4471,8 +4594,8 @@
                     retention = 0;
                 }
 
-                const netPayable = total - advance;
-                const balance = Math.max(0, netPayable - (inv.paid || 0));
+                const netPayable = Math.max(0, total - advance - tds);
+                const balance = netPayable - (inv.paid || 0);
 
                 // --- STRICT RELATIONAL API CALL ---
                 const token = ErpAuth.getToken();
@@ -4642,23 +4765,22 @@
             const holdGst = document.getElementById('optHoldGst') ? document.getElementById('optHoldGst').checked : false;
             const onlyGst = document.getElementById('optOnlyGst') ? document.getElementById('optOnlyGst').checked : false;
 
-            // Payment allocation list should always show pending invoices for the opened client,
-            // independent of ledger table filters (status/date/search/etc).
-            let pendingInvoices = appData[currentClient].invoices.filter(inv => !inv.isNote && !isInvoiceCleared(inv));
+            // Ledger allocation list is PO-scoped: keep it empty until a PO is selected.
+            // Other filters (project/sub/status/date/search) can narrow the selected PO rows.
+            let pendingInvoices = appData[currentClient].invoices.filter(inv => isPendingPaymentAllocatable(inv));
             const selectedLedgerPos = getMultiSelectValues('poSelectOptions');
             const selectedProjects = getMultiSelectValues('projectSelectOptions');
             const hasPoFilter = selectedLedgerPos.length > 0;
             const hasProjectFilter = selectedProjects.length > 0;
-            if (!hasPoFilter && !hasProjectFilter) {
+            if (!hasPoFilter) {
                 pendingInvoices = [];
             } else {
                 pendingInvoices = pendingInvoices.filter(inv => {
-                    const poMatch = hasPoFilter ? selectedLedgerPos.includes(inv.poNo) : false;
+                    const poMatch = selectedLedgerPos.includes(inv.poNo);
                     const poMeta = (((appData[currentClient] || {}).poTerms || {})[inv.poNo]) || {};
                     const projectMatch = hasProjectFilter ? (!!poMeta.projectName && selectedProjects.includes(poMeta.projectName)) : false;
-                    if (hasPoFilter && hasProjectFilter) return poMatch || projectMatch;
-                    if (hasPoFilter) return poMatch;
-                    return projectMatch;
+                    if (hasProjectFilter) return poMatch && projectMatch;
+                    return poMatch;
                 });
             }
             pendingInvoices.sort((a, b) => compareInvoicesForLedger(a, b, true));
@@ -4666,12 +4788,13 @@
             if (pendingInvoices.length > 0) hasPending = true;
 
             pendingInvoices.forEach(inv => {
+                const invBal = ledgerBalance(inv);
                 let targetBal = 0;
-                if (holdRet) targetBal += (inv.retention || 0);
-                if (holdGst) targetBal += (inv.gst || 0);
+                if (!inv.isNote && holdRet) targetBal += (inv.retention || 0);
+                if (!inv.isNote && holdGst) targetBal += (inv.gst || 0);
 
                 let projectedAdv = 0;
-                if (!onlyGst && document.getElementById('optApplyAdv') && document.getElementById('optApplyAdv').checked) {
+                if (!inv.isNote && !onlyGst && document.getElementById('optApplyAdv') && document.getElementById('optApplyAdv').checked) {
                     const poNo = inv.poNo;
                     if (poNo && poNo !== 'UNASSIGNED' && appData[currentClient].poTerms && appData[currentClient].poTerms[poNo]) {
                         const terms = appData[currentClient].poTerms[poNo];
@@ -4681,16 +4804,16 @@
                             const baseAmt = terms.base === 'basic' ? inv.basic : inv.total;
                             const maxAllowed = baseAmt * (terms.adv / 100);
                             const shortfall = maxAllowed - (inv.advance || 0);
-                            if (shortfall > 0) projectedAdv = Math.min(shortfall, availablePool, inv.balance);
+                            if (shortfall > 0) projectedAdv = Math.min(shortfall, availablePool, invBal);
                         }
                     }
                 }
 
                 let suggestedAmt = 0;
-                if (onlyGst) {
-                    suggestedAmt = Math.min(inv.gst || 0, inv.balance);
+                if (!inv.isNote && onlyGst) {
+                    suggestedAmt = Math.min(inv.gst || 0, invBal);
                 } else {
-                    suggestedAmt = Math.max(0, inv.balance - targetBal - projectedAdv);
+                    suggestedAmt = Math.max(0, invBal - targetBal - projectedAdv);
                 }
 
                 let isChecked = ''; let fillVal = '';
@@ -4708,19 +4831,30 @@
                 }
 
                 let subTag = inv.subEntity ? `<span style="color:var(--brand-primary);font-weight:800;">${inv.subEntity}</span> | ` : '';
+                const noteBadge = inv.isNote && inv.noteType === 'DN'
+                    ? '<span class="status-pill pill-danger" style="font-size:0.55rem; padding:2px 4px; margin-right:4px;">DN</span>'
+                    : '';
+                const metaTail = inv.isNote
+                    ? `Bal: ${formatCur(invBal)}`
+                    : `Bal: ${formatCur(invBal)} | Ret: ${formatCur(inv.retention || 0)} | GST: ${formatCur(inv.gst || 0)}`;
                 boxList.innerHTML += `
                                             <div class="checkbox-item" style="display:flex; justify-content:space-between; align-items:center; padding: 6px 10px; border-bottom: 1px solid transparent;">
                                                 <div style="display:flex; align-items:center; gap:10px; flex:1;">
                                                     <input type="checkbox" class="payment-check" value="${inv.id}" id="chk_${inv.id}" data-suggested="${suggestedAmt}" ${isChecked} onchange="toggleInvoicePayment('${esc(inv.id)}', ${suggestedAmt}); checkMasterPaymentSelect();">
                                                     <label for="chk_${inv.id}" style="margin:0; cursor:pointer; width:100%; display:flex; align-items:center;">
-                                                        <strong style="color:var(--text-dark);">${inv.id}</strong>
-                                                        <span style="color:var(--text-muted); font-size:0.75rem; margin-left:8px;">(${subTag}${inv.invDate || '-'} | Bal: ${formatCur(inv.balance)} | Ret: ${formatCur(inv.retention || 0)} | GST: ${formatCur(inv.gst || 0)})</span>
+                                                        ${noteBadge}<strong style="color:var(--text-dark);">${inv.id}</strong>
+                                                        <span style="color:var(--text-muted); font-size:0.75rem; margin-left:8px;">(${subTag}${inv.invDate || '-'} | ${metaTail})</span>
                                                     </label>
                                                 </div>
                                                 <input type="number" class="specific-pay-input" id="pay_input_${inv.id}" data-inv-id="${inv.id}" value="${fillVal}" placeholder="Amount" style="width:100px; height:28px; padding:4px 8px; text-align:right; font-weight:600; color:var(--brand-primary); font-size:0.8rem; border-color:var(--border-dark);" onkeyup="checkInvoicePayment('${esc(inv.id)}')" onchange="checkInvoicePayment('${esc(inv.id)}')">
                                            </div>`;
             });
-            if (!hasPending) boxList.innerHTML = '<div style="padding:16px; color:var(--text-muted); font-size:0.8rem; font-weight:500;">No pending invoices match current filters.</div>';
+            if (!hasPending) {
+                const msg = hasPoFilter
+                    ? 'No pending invoices or debit notes match current filters.'
+                    : 'Select a PO from the PO dropdown to show pending invoices and debit notes.';
+                boxList.innerHTML = `<div style="padding:16px; color:var(--text-muted); font-size:0.8rem; font-weight:500;">${msg}</div>`;
+            }
         }
 
         async function refreshInvoiceAllocationList() {
@@ -5000,22 +5134,21 @@
             const rows = Array.isArray(appData[name]._unallocatedRegister) ? appData[name]._unallocatedRegister : [];
             if (!rows.length) return 0;
             const poFilterSet = getSelectedLedgerPoFilterSet();
+            if (!poFilterSet || !poFilterSet.size) return 0;
             let total = 0;
             rows.forEach((entry) => {
                 const status = String(entry.status || '').toLowerCase();
                 const bal = Number(entry.balance || 0);
                 if (status !== 'open' || bal <= 0) return;
                 const po = deriveUnallocatedSourcePo(entry, name);
-                if (poFilterSet && poFilterSet.size) {
-                    if (po === 'MULTI' || !poFilterSet.has(po)) return;
-                }
+                if (po === 'MULTI' || !poFilterSet.has(po)) return;
                 total += bal;
             });
             return Number(total || 0);
         }
 
         function paymentLogMatchesPoFilter(log, poFilterSet, invoicePoById) {
-            if (!poFilterSet) return true;
+            if (!poFilterSet || !poFilterSet.size) return false;
             const allocs = Array.isArray(log.allocations) ? log.allocations : [];
             if (!allocs.length) return false;
             return allocs.some(a => {
@@ -5082,7 +5215,7 @@
                             `;
             });
             if (history.length === 0) {
-                const msg = poFilterSet ? 'No transactions found for selected PO filter.' : 'No transactions recorded yet.';
+                const msg = poFilterSet ? 'No transactions found for selected PO filter.' : 'Select a PO from the PO dropdown to view transaction history.';
                 tbody.innerHTML = `<tr><td colspan="5" style="text-align:center; padding: 20px; color:var(--text-muted); font-size:0.8rem;">${msg}</td></tr>`;
             }
             document.getElementById('paymentHistoryModal').style.display = 'flex';
@@ -5188,11 +5321,12 @@
 
             const sel = document.getElementById('afpInvoiceSelect');
             sel.innerHTML = '<option value="">— Select Invoice —</option>';
-            const allInv = (appData[currentClient].invoices || []).filter(i => !i.isNote);
+            const allInv = (appData[currentClient].invoices || []).filter(i => isPendingPaymentAllocatable(i));
             allInv.sort((a, b) => compareInvoicesForLedger(a, b, false));
             allInv.forEach(inv => {
-                const bal = Number(inv.balance || 0);
-                const label = `${inv.id}  (${inv.invDate || '-'} | Bal: ${formatCur(bal)})`;
+                const bal = ledgerBalance(inv);
+                const dnTag = inv.isNote && inv.noteType === 'DN' ? ' [DN] ' : ' ';
+                const label = `${dnTag}${inv.id}  (${inv.invDate || '-'} | Bal: ${formatCur(bal)})`;
                 sel.innerHTML += `<option value="${esc(inv.id)}" data-bal="${bal}">${escHtml(label)}</option>`;
             });
 
@@ -5349,6 +5483,7 @@
             if (log.type === 'RECEIPT') {
                 document.getElementById('targetPaymentVal').value = log.amount;
                 if (document.getElementById('paymentNote')) document.getElementById('paymentNote').value = log.note || '';
+                if (document.getElementById('paymentDate')) document.getElementById('paymentDate').value = log.date || getSelectedPaymentDate();
                     triggerUpdate();
                 window.scrollTo({ top: 0, behavior: 'smooth' });
                 await customApplet({
@@ -5389,10 +5524,11 @@
 
             const token = ErpAuth.getToken();
             const clientObj = appData[currentClient];
+            const paymentDate = getSelectedPaymentDate();
             const payload = {
                 client_id: clientObj.sql_id,
                 id: Date.now().toString(),
-                date: new Date().toISOString().split('T')[0],
+                date: paymentDate,
                 amount: payment,
                 note: paymentNote,
                 mode: 'cascade',
@@ -5539,8 +5675,9 @@
                 let overpaidWarning = '';
                 for (const t of targets) {
                     const inv = clientInvoices.find(i => i.id === t.inv_id);
-                    if (inv && t.amount > (inv.balance || 0) + 0.01) {
-                        overpaidWarning += `• ${escHtml(t.inv_id)}: allocating ${formatCur(t.amount)} vs balance ${formatCur(inv.balance || 0)}<br>`;
+                    const invBal = inv ? ledgerBalance(inv) : 0;
+                    if (inv && t.amount > invBal + 0.01) {
+                        overpaidWarning += `• ${escHtml(t.inv_id)}: allocating ${formatCur(t.amount)} vs balance ${formatCur(invBal)}<br>`;
                     }
                 }
                 if (overpaidWarning) {
@@ -5556,7 +5693,7 @@
             const payload = {
                 client_id: clientObj.sql_id,
                 id: Date.now().toString(),
-                date: new Date().toISOString().split('T')[0],
+                date: getSelectedPaymentDate(),
                 amount: originalPayment,
                 note: paymentNote,
                 mode: useCascade ? 'cascade' : 'targeted',
@@ -5634,10 +5771,11 @@
 
             const token = ErpAuth.getToken();
             const clientObj = appData[currentClient];
+            const paymentDate = getSelectedPaymentDate();
             const payload = {
                 client_id: clientObj.sql_id,
                 id: Date.now().toString(),
-                date: new Date().toISOString().split('T')[0],
+                date: paymentDate,
                 amount: amt,
                 note: paymentNote,
                 mode: 'cascade',
@@ -5682,7 +5820,7 @@
             if (checkboxes.length === 0) {
                 let conf = await customApplet({ title: "Auto-Allocate Unallocated", message: `Auto-allocate ${formatCur(unalloc)} from Unallocated pool to all pending invoices (FIFO)?`, type: "confirm" });
                 if (!conf) return;
-                targetInvoices = clientInvoices.filter(i => !isInvoiceCleared(i)).sort((a, b) => compareInvoicesForLedger(a, b, true));
+                targetInvoices = clientInvoices.filter(i => isPendingPaymentAllocatable(i)).sort((a, b) => compareInvoicesForLedger(a, b, true));
             } else {
                 let conf = await customApplet({ title: "Allocate Unallocated", message: `Cascade up to ${formatCur(unalloc)} from Unallocated pool across the selected invoices?`, type: "confirm" });
                 if (!conf) return;
@@ -5694,10 +5832,11 @@
             const targets = targetInvoices.map(inv => ({ inv_id: inv.id, amount: 0 }));
             const token = ErpAuth.getToken();
             const clientObj = appData[currentClient];
+            const paymentDate = getSelectedPaymentDate();
             const payload = {
                 client_id: clientObj.sql_id,
                 id: Date.now().toString(),
-                date: new Date().toISOString().split('T')[0],
+                date: paymentDate,
                 amount: unalloc,
                 note: paymentNote,
                 mode: checkboxes.length > 0 ? 'targeted' : 'cascade',
@@ -5742,14 +5881,15 @@
         
 
         function getCellHtml(col, inv, today, isGlobal, isAdmin, clientName, clientActive) {
-            const isCredit = (Number(inv.balance) || 0) < -TINY_BAL_THRESHOLD;  // deliberately overpaid (beyond rounding noise)
-            const cleared = isCredit || isInvoiceCleared(inv);
+            const bal = ledgerBalance(inv);
+            const isCredit = isInvoiceCreditBalance(inv);
+            const cleared = !inv.isNote && !isCredit && isInvoiceCleared(inv);
             let balClass = isCredit ? '' : (cleared ? 'text-success' : 'text-danger');
             let isInlineEdit = (inv.id === inlineEditId);
             let inpStyle = "height:28px; padding:2px 6px; font-size:0.75rem; border: 1px solid var(--brand-primary); border-radius: 4px; box-sizing: border-box; background: #fff;";
 
             // BLANK OUT UNNECESSARY FIELDS FOR CN/DN
-            if (inv.isNote && ['subEntity', 'poNo', 'lrNo', 'basic', 'gst', 'tds', 'retention'].includes(col.id)) {
+            if (inv.isNote && ['subEntity', 'lrNo', 'basic', 'gst', 'tds', 'retention'].includes(col.id)) {
                 return `<td style="text-align:center; color:var(--text-muted);">-</td>`;
             }
 
@@ -5771,6 +5911,11 @@
                     return `<td><span style="font-weight:600; color:var(--brand-secondary);">${inv.subEntity || '-'}</span></td>`;
                 case 'poNo':
                     if (isInlineEdit) return `<td><input type="text" id="inl_po" value="${inv.poNo === 'UNASSIGNED' ? '' : esc(inv.poNo)}" style="${inpStyle} width:90px;"></td>`;
+                    if (inv.isNote) {
+                        const poTxt = inv.poNo && inv.poNo !== 'UNASSIGNED' ? inv.poNo : '-';
+                        const targetTxt = inv.noteTargetInvoice ? `<br><span style="font-size:0.68rem; color:var(--text-muted);">Against Inv: <b>${esc(inv.noteTargetInvoice)}</b></span>` : '';
+                        return `<td><span style="font-weight:600;">${poTxt}</span>${targetTxt}</td>`;
+                    }
                     let poBadge = '';
                     const poPool = getPoAdvancePool(clientName);
                     if (inv.poNo && inv.poNo !== 'UNASSIGNED' && poPool[inv.poNo] > 0) {
@@ -5783,7 +5928,7 @@
                 case 'invNo':
                     let noteBadge = inv.isNote ? ` <span class="status-pill ${inv.noteType === 'CN' ? 'pill-success' : 'pill-danger'}" style="font-size:0.55rem; padding: 2px 4px;">${inv.noteType}</span>` : '';
                     if (inv.isNote && inv.noteTargetInvoice) {
-                        return `<td class="fw-bold">${inv.id} against ${inv.noteTargetInvoice}${noteBadge}</td>`;
+                        return `<td class="fw-bold">${inv.id}${noteBadge}<br><span style="font-size:0.72rem; color:var(--text-muted); font-weight:600;">Issued against invoice <b>${esc(inv.noteTargetInvoice)}</b></span></td>`;
                     }
                     return `<td class="fw-bold">${inv.id}${noteBadge}</td>`;
                 case 'invDate':
@@ -5792,18 +5937,26 @@
                 case 'status':
                     if (isInlineEdit) return `<td style="text-align: center;"><input type="date" id="inl_due" value="${inv.dueDate || ''}" title="Due Date" style="${inpStyle} width:110px;"></td>`;
                     let dateDisplay = inv.dueDate || '-';
-                    if (isCredit) dateDisplay = `<span class="status-pill" style="background:#eff6ff; color:#1d4ed8; border:1px solid #93c5fd; font-weight:800;">CREDIT</span>`;
-                    else if (!cleared && inv.dueDate && inv.dueDate < today) dateDisplay = `<span class="status-pill pill-danger" style="margin-bottom:4px;">OVERDUE</span><br><span style="font-size:0.7rem; color:var(--text-muted);">${inv.dueDate}</span>`;
-                    else if (cleared) dateDisplay = `<span class="status-pill pill-success">CLEARED</span>`;
+                    if (inv.isNote && inv.noteType === 'CN') {
+                        dateDisplay = `<span class="status-pill" style="background:#eff6ff; color:#1d4ed8; border:1px solid #93c5fd; font-weight:800;">CREDIT NOTE</span>`;
+                    } else if (inv.isNote && inv.noteType === 'DN') {
+                        dateDisplay = `<span class="status-pill pill-danger">DEBIT NOTE</span>`;
+                    } else if (isCredit) {
+                        dateDisplay = `<span class="status-pill" style="background:#eff6ff; color:#1d4ed8; border:1px solid #93c5fd; font-weight:800;">CREDIT</span>`;
+                    } else if (cleared) {
+                        dateDisplay = `<span class="status-pill pill-success">CLEARED</span>`;
+                    } else if (inv.dueDate && inv.dueDate < today) {
+                        dateDisplay = `<span class="status-pill pill-danger" style="margin-bottom:4px;">OVERDUE</span><br><span style="font-size:0.7rem; color:var(--text-muted);">${inv.dueDate}</span>`;
+                    }
                     return `<td style="text-align: center;">${dateDisplay}</td>`;
                 case 'lrNo':
                     if (isInlineEdit) return `<td><input type="text" id="inl_lr" value="${esc(inv.lrNo || '')}" style="${inpStyle} width:90px;"></td>`;
                     return `<td style="color:var(--text-muted); font-family:monospace; text-align: left;">${inv.lrNo || '-'}</td>`;
                 case 'basic':
                     if (isInlineEdit) return `<td style="text-align: right;"><input type="number" id="inl_basic" value="${inv.basic}" style="${inpStyle} width:80px; text-align:right;"></td>`;
-                    return `<td style="text-align: right;">${formatCur(inv.basic)}</td>`;
+                    return `<td style="text-align: right;">${formatCurRounded(inv.basic)}</td>`;
                 case 'gst': return `<td style="text-align: right;">${formatCur(inv.gst)}</td>`;
-                case 'gross': return `<td style="text-align: right;" class="fw-bold ${inv.isNote && inv.noteType === 'CN' ? 'text-success' : ''}">${formatCur(inv.total)}</td>`;
+                case 'gross': return `<td style="text-align: right;" class="fw-bold ${inv.isNote && inv.noteType === 'CN' ? 'text-success' : ''}">${formatCurRounded(inv.total)}</td>`;
                 case 'advance':
                     if (isInlineEdit) return `<td style="text-align: right;"><input type="number" id="inl_adv" value="${inv.advance || 0}" style="${inpStyle} width:70px; text-align:right;"></td>`;
                     return `<td style="text-align: right; color: var(--warning); font-weight: 600;">${formatCur(inv.advance || 0)}</td>`;
@@ -5825,16 +5978,28 @@
                     let totalRealized = (inv.paid || 0);
                     return `<td class="fw-bold text-success" style="text-align: right;">${formatCur(totalRealized)}</td>`;
                 case 'balance':
-                    if (isCredit) {
-                        return `<td style="text-align: right; color: #2563eb; font-weight: 800;">${formatCur(inv.balance)}<br><span style="font-size:0.62rem; color:#3b82f6; font-weight:700; letter-spacing:0.04em;">CREDIT</span></td>`;
+                    if (inv.isNote && inv.noteType === 'CN') {
+                        return `<td style="text-align: right; color: #2563eb; font-weight: 800;">${formatBalanceCur(inv)}</td>`;
                     }
-                    return `<td class="${balClass}" style="text-align: right;">${formatCur(inv.balance)}</td>`;
+                    if (inv.isNote && inv.noteType === 'DN') {
+                        return `<td style="text-align: right; color: var(--danger); font-weight: 800;">${formatBalanceCur(inv)}</td>`;
+                    }
+                    if (isCredit) {
+                        return `<td style="text-align: right; color: #2563eb; font-weight: 800;">${formatBalanceCur(inv)}</td>`;
+                    }
+                    return `<td class="${balClass}" style="text-align: right;">${formatBalanceCur(inv)}</td>`;
                 case 'paymentBreakdown':
                     let historyHtml = '';
                     if (appData[clientName] && appData[clientName].paymentHistory) {
                         appData[clientName].paymentHistory.forEach(log => {
                             if (log.allocations) {
-                                let alloc = log.allocations.find(a => (a.type === 'invoice' && a.invId === inv.id) || (a.type === 'po_advance_applied' && a.invId === inv.id) || (a.type === 'note_allocation' && (a.invId === inv.id || a.noteId === inv.id)));
+                                let alloc = log.allocations.find(a => {
+                                    if (a.type === 'invoice' && a.invId === inv.id) return true;
+                                    if (a.type === 'po_advance_applied' && a.invId === inv.id) return true;
+                                    // Note linkage is shown on the CN/DN row only, not on the target invoice.
+                                    if (inv.isNote && a.type === 'note_allocation' && a.noteId === inv.id) return true;
+                                    return false;
+                                });
                                 if (alloc) {
                                     let typeIcon = alloc.type === 'po_advance_applied' ? '🟡' : (log.type === 'UNALLOCATED_APPLIED' ? '🟣' : (log.type === 'NOTE_APPLIED' ? '📝' : '🟢'));
                                     let displayLabel = log.note ? esc(log.note) : log.date;
@@ -5875,6 +6040,7 @@
             if (metricKey === 'gross') return Number(inv.total || 0);
             if (metricKey === 'realized') return Number(inv.paid || 0);
             if (metricKey === 'netPayable') return Number(inv.netPayable || 0);
+            if (metricKey === 'balance') return ledgerBalance(inv);
             return Number(inv[metricKey] || 0);
         }
 
@@ -5949,6 +6115,8 @@
                 end: document.getElementById('fltEnd').value,
                 search: document.getElementById('fltSearch').value.toLowerCase().trim()
             };
+            const requiresPoSelection = true;
+            const hasRequiredPoSelection = filters.pos && filters.pos.length > 0;
 
             let clientsToRender = currentClient === 'ALL' ? Object.keys(appData).filter(k => k !== '_settings').sort() : [currentClient];
 
@@ -5961,13 +6129,15 @@
             let aggBasic = 0, aggGst = 0, aggGross = 0, aggRet = 0, aggDue = 0, aggPaid = 0, aggAdv = 0, aggTds = 0;
             let flatInvoices = [];
 
-            clientsToRender.forEach(client => {
-                if (!appData[client] || !appData[client].invoices) return;
-                let cActive = appData[client].active !== false;
-                appData[client].invoices.forEach(inv => {
-                    if (isInvoiceMatchingFilters(inv, client, filters, today)) flatInvoices.push({ ...inv, clientName: client, cActive: cActive });
+            if (!requiresPoSelection || hasRequiredPoSelection) {
+                clientsToRender.forEach(client => {
+                    if (!appData[client] || !appData[client].invoices) return;
+                    let cActive = appData[client].active !== false;
+                    appData[client].invoices.forEach(inv => {
+                        if (isInvoiceMatchingFilters(inv, client, filters, today)) flatInvoices.push({ ...inv, clientName: client, cActive: cActive });
+                    });
                 });
-            });
+            }
 
             flatInvoices.sort((a, b) => {
                 if (currentSort.col === 'invDate') {
@@ -5991,7 +6161,7 @@
                     }
                 } else {
                     if (currentSort.col === 'status') {
-                        const _sk = inv => (Number(inv.balance) || 0) < -TINY_BAL_THRESHOLD ? 'ZZ' : (isInvoiceCleared(inv) ? 'Z' : (inv.dueDate || 'A'));
+                        const _sk = inv => isInvoiceCreditBalance(inv) ? 'ZZ' : (isInvoiceCleared(inv) ? 'Z' : (inv.dueDate || 'A'));
                         valA = _sk(a); valB = _sk(b);
                     }
                     else if (['basic', 'gst', 'tds', 'retention', 'advance', 'balance'].includes(currentSort.col)) {
@@ -6044,10 +6214,19 @@
                 tableHTML += rowHtml;
             });
 
-            if (flatInvoices.length === 0) tableHTML = `<tr><td colspan="${visibleColCount}" style="text-align:center; padding: 40px; color: var(--text-muted); font-size: 0.85rem; font-weight: 500;">No records found matching current filters.</td></tr>`;
+            if (flatInvoices.length === 0) {
+                const emptyMsg = hasRequiredPoSelection
+                    ? 'No records found matching current filters.'
+                    : 'Select a PO number from the dropdown to view ledger entries.';
+                tableHTML = `<tr><td colspan="${visibleColCount}" style="text-align:center; padding: 40px; color: var(--text-muted); font-size: 0.85rem; font-weight: 500;">${emptyMsg}</td></tr>`;
+            }
 
             tbody.innerHTML = tableHTML;
             tbody.classList.remove('fade-in'); void tbody.offsetWidth; tbody.classList.add('fade-in');
+            if (typeof enhanceTableWrappers === 'function') {
+                const ledgerWrap = tbody.closest('.table-wrapper');
+                if (ledgerWrap) enhanceTableWrappers(ledgerWrap.parentElement || document);
+            }
 
             const tfoot = document.getElementById('invoiceTableFoot');
             if (flatInvoices.length > 0) {
@@ -6060,7 +6239,11 @@
                         else if (col.id === 'advance') footHtml += `<td style="color:var(--warning); text-align: right; font-weight:800;">${formatCur(roundMoneyTotal(aggAdv))}</td>`;
                         else if (col.id === 'tds') footHtml += `<td style="color:var(--text-dark); text-align: right; font-weight:800;">${formatCur(roundMoneyTotal(aggTds))}</td>`;
                         else if (col.id === 'retention') footHtml += `<td style="color:var(--text-dark); text-align: right; font-weight:800;">${formatCur(roundMoneyTotal(aggRet))}</td>`;
-                        else if (col.id === 'balance') footHtml += `<td style="color:var(--danger); text-align: right; font-weight:800;">${formatCur(roundMoneyTotal(aggDue))}</td>`;
+                        else if (col.id === 'balance') {
+                            const footBal = roundMoneyTotal(aggDue);
+                            const footLabel = footBal < 0 ? ' (net credit)' : '';
+                            footHtml += `<td style="color:${balanceTotalColor(footBal)}; text-align: right; font-weight:800;" title="Sum of Total Due column (CN and overpayments reduce the total)">${formatCur(footBal)}${footLabel}</td>`;
+                        }
                         else if (col.id === 'realized') footHtml += `<td style="color:var(--success); text-align: right; font-weight:800;">${formatCur(roundMoneyTotal(aggPaid))}</td>`;
                         else if (col.id === 'status') footHtml += `<td style="text-align:right; color:var(--text-muted); font-size:0.75rem; text-transform:uppercase; font-weight:800;">PAGE TOTALS:</td>`;
                         else footHtml += `<td></td>`;
@@ -6074,7 +6257,10 @@
 
             document.getElementById('dashTotalInvoiced').innerText = formatCur(roundMoneyTotal(sumBilled));
             document.getElementById('dashTotalReceived').innerText = formatCur(roundMoneyTotal(sumReceived));
-            document.getElementById('dashTotalOutstanding').innerText = formatCur(roundMoneyTotal(sumOut));
+            const outEl = document.getElementById('dashTotalOutstanding');
+            const outTotal = roundMoneyTotal(sumOut);
+            outEl.innerText = formatCur(outTotal);
+            outEl.style.color = balanceTotalColor(outTotal);
             const collectionRate = sumBilled > 0 ? (sumReceived / sumBilled) * 100 : 0;
             if (document.getElementById('dashCollectionRate')) {
                 document.getElementById('dashCollectionRate').innerText = `${collectionRate.toFixed(1)}%`;
@@ -6159,22 +6345,33 @@
             const poMeta = (((appData[clientName] || {}).poTerms || {})[inv.poNo]) || {};
             const projectName = poMeta.projectName || '';
 
-            if (excludeField !== 'pos' && filters.pos && filters.pos.length > 0 && !filters.pos.includes(inv.poNo)) return false;
+            const hasPoFilter = excludeField !== 'pos' && filters.pos && filters.pos.length > 0;
+            const hasProjectFilter = excludeField !== 'projects' && filters.projects && filters.projects.length > 0;
+            if (hasPoFilter && hasProjectFilter) {
+                const poMatch = filters.pos.includes(inv.poNo);
+                const projectMatch = !!(projectName && filters.projects.includes(projectName));
+                if (!poMatch && !projectMatch) return false;
+            } else {
+                if (hasPoFilter && !filters.pos.includes(inv.poNo)) return false;
+                if (hasProjectFilter && (!projectName || !filters.projects.includes(projectName))) return false;
+            }
+            if (excludeField === 'pos' && filters.projects && filters.projects.length > 0 && (!projectName || !filters.projects.includes(projectName))) return false;
+            if (excludeField === 'projects' && filters.pos && filters.pos.length > 0 && !filters.pos.includes(inv.poNo)) return false;
             if (excludeField !== 'subs' && filters.subs && filters.subs.length > 0 && (!inv.subEntity || !filters.subs.includes(inv.subEntity))) return false;
-            if (excludeField !== 'projects' && filters.projects && filters.projects.length > 0 && (!projectName || !filters.projects.includes(projectName))) return false;
             if (excludeField !== 'fiscalYears' && filters.fiscalYears && filters.fiscalYears.length > 0 && (!inv.fiscalYear || !filters.fiscalYears.includes(inv.fiscalYear))) return false;
 
             if (filters.hideCompletedPos && poMeta.isCompleted) return false;
             if (filters.status) {
-                const _cleared = isInvoiceCleared(inv);
-                if (filters.status === 'CLEARED' && !_cleared) return false;
-                if (filters.status === 'PENDING' && _cleared) return false;
-                if (filters.status === 'OVERDUE' && (_cleared || !inv.dueDate || inv.dueDate >= todayDate)) return false;
+                const credit = isInvoiceCreditBalance(inv);
+                const cleared = isInvoiceCleared(inv);
+                if (filters.status === 'CLEARED' && !cleared) return false;
+                if (filters.status === 'PENDING' && (cleared || credit)) return false;
+                if (filters.status === 'OVERDUE' && (credit || cleared || !inv.dueDate || inv.dueDate >= todayDate)) return false;
             }
             if (filters.start && (!inv.invDate || inv.invDate < filters.start)) return false;
             if (filters.end && (!inv.invDate || inv.invDate > filters.end)) return false;
             if (filters.search) {
-                const allText = `${clientName} ${inv.subEntity || ''} ${inv.poNo} ${inv.id} ${inv.lrNo || ''} ${inv.basic} ${inv.gst} ${inv.total} ${inv.advance} ${inv.tds} ${inv.retention} ${inv.netPayable} ${inv.paid} ${inv.balance} ${projectName}`.toLowerCase();
+                const allText = `${clientName} ${inv.subEntity || ''} ${inv.poNo} ${inv.id} ${inv.lrNo || ''} ${inv.basic} ${inv.gst} ${inv.total} ${inv.advance} ${inv.tds} ${inv.retention} ${inv.netPayable} ${inv.paid} ${inv.balance} ${ledgerBalance(inv)} ${projectName}`.toLowerCase();
                 if (!allText.includes(filters.search)) return false;
             }
             return true;
@@ -6251,40 +6448,7 @@
         }
 
         function isInvoiceMatchingFilters(inv, clientName, filters, todayDate) {
-            if (filters.client && clientName !== filters.client) return false;
-            const hasPoFilter = Array.isArray(filters.pos) && filters.pos.length > 0;
-            const hasProjectFilter = Array.isArray(filters.projects) && filters.projects.length > 0;
-            if (!hasPoFilter && !hasProjectFilter) return false;
-            const poMatches = hasPoFilter ? filters.pos.includes(inv.poNo) : false;
-            const poMeta = (((appData[clientName] || {}).poTerms || {})[inv.poNo]) || {};
-            const projectName = poMeta.projectName || '';
-            const projectMatches = hasProjectFilter ? (!!projectName && filters.projects.includes(projectName)) : false;
-            if (hasPoFilter && hasProjectFilter) {
-                if (!(poMatches || projectMatches)) return false;
-            } else if (hasPoFilter && !poMatches) {
-                return false;
-            } else if (hasProjectFilter && !projectMatches) {
-                return false;
-            }
-            if (filters.subs && filters.subs.length > 0 && (!inv.subEntity || !filters.subs.includes(inv.subEntity))) return false;
-            if (filters.fiscalYears && filters.fiscalYears.length > 0 && (!inv.fiscalYear || !filters.fiscalYears.includes(inv.fiscalYear))) return false;
-            if (filters.hideCompletedPos) {
-                const poMeta = (((appData[clientName] || {}).poTerms || {})[inv.poNo]) || {};
-                if (poMeta.isCompleted) return false;
-            }
-            if (filters.status) {
-                const _cleared = isInvoiceCleared(inv);
-                if (filters.status === 'CLEARED' && !_cleared) return false;
-                if (filters.status === 'PENDING' && _cleared) return false;
-                if (filters.status === 'OVERDUE' && (_cleared || !inv.dueDate || inv.dueDate >= todayDate)) return false;
-            }
-            if (filters.start && (!inv.invDate || inv.invDate < filters.start)) return false;
-            if (filters.end && (!inv.invDate || inv.invDate > filters.end)) return false;
-            if (filters.search) {
-                const allText = `${clientName} ${inv.subEntity || ''} ${inv.poNo} ${inv.id} ${inv.lrNo || ''} ${inv.basic} ${inv.gst} ${inv.total} ${inv.advance} ${inv.tds} ${inv.retention} ${inv.netPayable} ${inv.paid} ${inv.balance}`.toLowerCase();
-                if (!allText.includes(filters.search)) return false;
-            }
-            return true;
+            return invoiceMatchesFiltersForOptions(inv, clientName, filters, null, todayDate);
         }
 
         function inlineUpdateCustom(client, invId, colId, val) {
@@ -6545,7 +6709,7 @@
                             case 'poNo': val = inv.poNo || ''; break;
                             case 'invNo': val = inv.id; break;
                             case 'invDate': val = inv.invDate || ''; break;
-                            case 'status': val = (Number(inv.balance) || 0) < -TINY_BAL_THRESHOLD ? 'CREDIT' : (isInvoiceCleared(inv) ? 'CLEARED' : (inv.dueDate && inv.dueDate < today ? 'OVERDUE' : 'PENDING')); break;
+                            case 'status': val = isInvoiceCreditBalance(inv) ? 'CREDIT' : (isInvoiceCleared(inv) ? 'CLEARED' : (inv.dueDate && inv.dueDate < today ? 'OVERDUE' : 'PENDING')); break;
                             case 'lrNo': val = inv.lrNo || ''; break;
                             case 'basic': val = getVal(inv.basic); break;
                             case 'gst': val = getVal(inv.gst); break;
@@ -6624,7 +6788,7 @@
                     if (bulkData.retention_held !== '') inv.retention = parseFloat(bulkData.retention_held);
 
                     inv.netPayable = (inv.total || 0) - (inv.advance || 0);
-                    inv.balance = Math.max(0, inv.netPayable - (inv.paid || 0));
+                    inv.balance = (inv.netPayable || 0) - (inv.paid || 0);
 
                     // Send to SQL
                     try {
@@ -6792,7 +6956,10 @@
             document.getElementById('aggCount').innerText = checkedBoxes.length;
             document.getElementById('aggGross').innerText = formatCur(roundMoneyTotal(sumGross));
             document.getElementById('aggPaid').innerText = formatCur(roundMoneyTotal(sumPaid));
-            document.getElementById('aggBal').innerText = formatCur(roundMoneyTotal(sumBal));
+            const aggBalEl = document.getElementById('aggBal');
+            const aggBalTotal = roundMoneyTotal(sumBal);
+            aggBalEl.innerText = formatCur(aggBalTotal);
+            aggBalEl.style.color = balanceTotalColor(aggBalTotal);
 
             let dynResult = 0;
             if (dynValues.length > 0) {
@@ -7566,7 +7733,7 @@
             sel.innerHTML = '<option value="">-- Leave Unassigned (Account Level) --</option>';
             appData[currentClient].invoices.forEach(inv => {
                 if (!inv.isNote && !isInvoiceCleared(inv)) {
-                    sel.innerHTML += `<option value="${esc(inv.id)}">${esc(inv.id)} (Curr Bal: ${formatCur(inv.balance)})</option>`;
+                    sel.innerHTML += `<option value="${escHtml(inv.id)}">${escHtml(inv.id)} (Curr Bal: ${formatCur(inv.balance)})</option>`;
                 }
             });
 
@@ -7621,7 +7788,7 @@
             document.getElementById('dnCnModal').style.display = 'none';
                 await silentDataRefresh();
             triggerUpdate();
-                await customApplet({ title: "Note Issued", message: `${type === 'CN' ? 'Credit' : 'Debit'} Note <b>${noteNo}</b> successfully issued and mathematically applied.` });
+                await customApplet({ title: "Note Issued", message: `${type === 'CN' ? 'Credit' : 'Debit'} Note <b>${noteNo}</b> added as a separate ledger entry. The linked invoice due is unchanged.` });
             });
         }
 
@@ -8377,6 +8544,9 @@
                 onColumnResized: (e) => {
                     if (!e?.finished) return;
                     rememberDispatchGridLayout(dispatchGridState.currentPoNo, e.api);
+                    if (typeof scheduleAgGridTopScroll === 'function') {
+                        scheduleAgGridTopScroll(document.getElementById('dispatchAgGrid'));
+                    }
                 },
                 components: {
                     DispatchMaterialGroupHeader: window.DispatchMaterialGroupHeader
@@ -8432,6 +8602,9 @@
                 }
             };
             dispatchGridState.gridApi = agGrid.createGrid(gridEl, options);
+            if (typeof scheduleAgGridTopScroll === 'function') {
+                scheduleAgGridTopScroll(gridEl);
+            }
             return dispatchGridState.gridApi;
         }
 
@@ -8610,6 +8783,9 @@
                 pending: totalPending,
                 invoices: rowData.length
             });
+            if (typeof scheduleAgGridTopScroll === 'function') {
+                scheduleAgGridTopScroll(document.getElementById('dispatchAgGrid'));
+            }
         }
 
         async function deleteDispatchEntry(invoiceNo, dispatchItemId) {
@@ -10132,23 +10308,43 @@
 
 
     </script>
-</body>
-<script>
-    // Register PWA Service Worker
-    if ('serviceWorker' in navigator) {
-        window.addEventListener('load', () => {
-            fetch('./sw.js', { method: 'HEAD' })
-                .then((res) => {
-                    if (!res.ok) return null;
-                    return navigator.serviceWorker.register('./sw.js');
-                })
-                .then((reg) => {
-                    if (reg) console.log('Service Worker registered successfully.', reg);
-                })
-                .catch(err => console.error('Service Worker registration failed:', err));
-        });
-    }
-</script>
-</body>
+    <script>
+        (function initAchintPwa() {
+            if (!('serviceWorker' in navigator)) return;
 
+            window.addEventListener('load', function () {
+                navigator.serviceWorker
+                    .register('/sw.js', { scope: '/' })
+                    .then(function (reg) {
+                        console.log('Achint ERP service worker registered.', reg.scope);
+                    })
+                    .catch(function (err) {
+                        console.warn('Service worker registration failed:', err);
+                    });
+            });
+
+            var deferredInstall;
+            window.addEventListener('beforeinstallprompt', function (e) {
+                e.preventDefault();
+                deferredInstall = e;
+                var btn = document.getElementById('pwaInstallBtn');
+                if (btn) btn.style.display = 'inline-flex';
+            });
+
+            window.AchintPwa = {
+                promptInstall: function () {
+                    if (!deferredInstall) {
+                        return Promise.resolve({ outcome: 'unavailable' });
+                    }
+                    deferredInstall.prompt();
+                    return deferredInstall.userChoice.finally(function () {
+                        deferredInstall = null;
+                        var btn = document.getElementById('pwaInstallBtn');
+                        if (btn) btn.style.display = 'none';
+                    });
+                },
+            };
+        })();
+    </script>
+</body>
 </html>

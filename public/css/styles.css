@@ -723,6 +723,8 @@
             box-shadow: var(--shadow-sm);
             min-height: 88px;
             transition: transform var(--motion-base) var(--motion-ease), box-shadow var(--motion-base) var(--motion-ease);
+        }
+
         /* Dense data rows should feel snappy, avoid heavy motion */
         #dispatchView .dispatch-table tbody tr,
         #globalTable tbody tr,
@@ -747,11 +749,10 @@
                 transform: none !important;
             }
         }
-        }
 
-            .kpi-card:hover {
-                transform: translateY(-1px);
-                box-shadow: var(--shadow-md);
+        .kpi-card:hover {
+            transform: translateY(-1px);
+            box-shadow: var(--shadow-md);
         }
 
             .kpi-card::after {
@@ -959,6 +960,44 @@
                 color: var(--text-muted);
             }
 
+        /* Top + bottom horizontal scroll (synced via hscroll-top.js). */
+        .hscroll-sync {
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+
+        .hscroll-top {
+            overflow-x: auto;
+            overflow-y: hidden;
+            height: 14px;
+            flex: 0 0 auto;
+            margin-bottom: -1px;
+            border: 1px solid var(--border);
+            border-bottom: none;
+            border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+            background: #f1f5f9;
+            scrollbar-gutter: stable;
+        }
+
+        .hscroll-top-inner {
+            height: 1px;
+            pointer-events: none;
+        }
+
+        .hscroll-sync .hscroll-body {
+            border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+        }
+
+        .hscroll-sync--grid .hscroll-top {
+            border-color: #e5e7eb;
+            border-radius: 12px 12px 0 0;
+        }
+
+        .hscroll-sync--grid .hscroll-grid-host {
+            border-radius: 0 0 12px 12px;
+        }
+
         .table-wrapper {
             overflow-x: auto;
             border: 1px solid var(--border);
@@ -966,6 +1005,11 @@
             background: #fff;
             box-shadow: var(--shadow-sm);
             scrollbar-gutter: stable;
+        }
+
+        .hscroll-sync > .table-wrapper.hscroll-body {
+            border-top: none;
+            border-radius: 0 0 var(--radius-lg) var(--radius-lg);
         }
 
         table {
@@ -2713,4 +2757,141 @@
             border: 1px solid #bfdbfe;
             background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%);
             }
+
+        /* =========================================================
+           Interaction polish — smoother feel, lighter compositing
+           (visual only; no application logic changes)
+           ========================================================= */
+        /* Vertical scroll hosts only — overscroll-y on horizontal .table-wrapper blocks wheel chaining to .scroll-area */
+        .scroll-area,
+        .nav-menu,
+        .modal-body {
+            scroll-behavior: smooth;
+            -webkit-overflow-scrolling: touch;
+            overscroll-behavior-y: contain;
+        }
+
+        .client-card {
+            transition:
+                transform var(--motion-base) var(--motion-ease),
+                box-shadow var(--motion-base) var(--motion-ease),
+                border-color var(--motion-base) var(--motion-ease);
+        }
+
+        .nav-item {
+            transition:
+                background-color var(--motion-fast) var(--motion-ease),
+                color var(--motion-fast) var(--motion-ease),
+                transform var(--motion-fast) var(--motion-ease) !important;
+        }
+
+        .nav-item:active {
+            transform: scale(0.98);
+        }
+
+        /* Backdrop blur on every control is costly during scroll — keep glass on panels only */
+        .sidebar {
+            -webkit-backdrop-filter: none !important;
+            backdrop-filter: none !important;
+            background: linear-gradient(165deg, #081a3a 0%, #0a224a 100%) !important;
+        }
+
+        .topbar {
+            -webkit-backdrop-filter: none !important;
+            backdrop-filter: none !important;
+            background: #ffffff !important;
+            border-bottom: 1px solid var(--border) !important;
+            box-shadow: 0 1px 0 rgba(15, 23, 42, 0.06) !important;
+        }
+
+        .btn-primary,
+        .btn-outline,
+        .btn-success,
+        .btn-accent,
+        .btn-danger,
+        input:not([type="checkbox"]),
+        select,
+        .multi-select-box,
+        textarea {
+            -webkit-backdrop-filter: none !important;
+            backdrop-filter: none !important;
+        }
+
+        .table-wrapper,
+        #dispatchView .dispatch-table-wrap,
+        .modal-overlay .modal-content,
+        #customAppletOverlay .modal-content {
+            -webkit-backdrop-filter: none !important;
+            backdrop-filter: none !important;
+            background: #ffffff !important;
+            contain: none !important;
+        }
+
+        .nav-item,
+        .kpi-card,
+        .card,
+        .dispatch-stat,
+        .btn-primary,
+        .btn-outline {
+            will-change: auto !important;
+        }
+
+        .table-wrapper tbody tr,
+        #dispatchView .dispatch-table tbody tr,
+        #globalTable tbody tr {
+            transition: background-color 80ms ease !important;
+        }
+
+        button:active:not(:disabled) {
+            transform: scale(0.98) !important;
+        }
+
+        .modal-overlay.modal-visible {
+            animation: erp-overlay-in 160ms var(--motion-ease) both;
+        }
+
+        .modal-overlay.modal-visible .modal-content {
+            animation: erp-modal-in 200ms var(--motion-ease) both;
+        }
+
+        @keyframes erp-overlay-in {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        @keyframes erp-modal-in {
+            from {
+                opacity: 0;
+                transform: translateY(10px) scale(0.98);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0) scale(1);
+            }
+        }
+
+        [id$="View"].view-enter {
+            animation: erp-view-in 220ms var(--motion-ease) both;
+        }
+
+        @keyframes erp-view-in {
+            from {
+                opacity: 0;
+                transform: translateY(8px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* Animate the landing panel once; avoid per-card stagger (janky with many clients). */
+        #landingView.view-enter .client-grid .client-card {
+            animation: none;
+        }
+
+        #erpGlobalLoader {
+            transition: opacity 180ms ease, visibility 180ms ease;
+        }
+
     

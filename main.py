@@ -222,6 +222,23 @@ _write_serialization_lock = threading.Lock()
 Base.metadata.create_all(bind=engine)
 
 
+def _maybe_run_legacy_import():
+    """Import legacy ERP snapshot on first boot when old_erp.sqlite is present."""
+    legacy_path = Path(os.getenv("LEGACY_DB_PATH", "old_erp.sqlite"))
+    marker = Path(".legacy_import_once.marker")
+    if not legacy_path.exists():
+        return
+    if marker.exists():
+        return
+    try:
+        from migrate_sqlite import run_import
+
+        run_import(force=False)
+        log.info("legacy ERP data imported from %s", legacy_path)
+    except Exception as exc:
+        log.exception("legacy import failed: %s", exc)
+
+
 def ensure_schema_columns():
     conn = sqlite3.connect(str(DB_FILE_PATH))
     cur = conn.cursor()
@@ -383,6 +400,7 @@ async def lifespan(app: FastAPI):
     optional bootstrap admin account if env-configured.
     """
     ensure_schema_columns()
+    _maybe_run_legacy_import()
     start_daily_backup_worker()
     db = SessionLocal()
     try:
@@ -2207,6 +2225,72 @@ def align_dispatch_schema(current_user: User = Depends(get_current_user), db: Se
     return align_existing_dispatch_schema(db)
 
 
+def note_display_balance(inv: Invoice) -> float:
+    """Signed Total Due for CN/DN rows (negative for credit notes)."""
+    if is_debit_note(inv):
+        return invoice_outstanding_balance(inv)
+    stored = float(inv.balance or 0.0)
+    total_num = float(inv.total or 0.0)
+    ntype = str(inv.note_type or "").strip().upper()
+    note_abs = abs(total_num)
+    if ntype == "CN":
+        if stored < -0.009:
+            return stored
+        if note_abs > 0.009:
+            return total_num if total_num <= 0 else -note_abs
+        return stored
+    return stored
+
+
+def is_debit_note(inv: Invoice) -> bool:
+    return bool(inv.is_note) and str(inv.note_type or "").strip().upper() == "DN"
+
+
+def invoice_eligible_for_payment_allocation(inv: Invoice) -> bool:
+    """Regular invoices and debit notes can receive bank/unallocated allocations."""
+    return not inv.is_note or is_debit_note(inv)
+
+
+def invoice_outstanding_balance(inv: Invoice) -> float:
+    """Amount still due on a row (matches frontend ledgerBalance for DN rows)."""
+    if is_debit_note(inv):
+        net = float(inv.net_payable or 0.0)
+        paid = float(inv.paid or 0.0)
+        if net > 0.009:
+            return max(0.0, net - paid)
+        stored = float(inv.balance or 0.0)
+        if stored > 0.009:
+            return stored
+        note_amt = abs(float(inv.total or 0.0))
+        if note_amt > 0.009:
+            return note_amt
+        return max(0.0, stored)
+    return float(inv.balance or 0.0)
+
+
+def sync_note_row_balance(inv: Invoice) -> None:
+    """Set CN/DN row balances only; never changes linked invoice rows."""
+    if not inv.is_note:
+        return
+    inv.advance_adj = 0.0
+    inv.tds_ded = 0.0
+    inv.retention_held = 0.0
+    note_amt = abs(float(inv.total or 0.0))
+    ntype = str(inv.note_type or "").strip().upper()
+    if ntype == "CN":
+        inv.net_payable = 0.0
+        inv.paid = 0.0
+        inv.balance = -note_amt
+    elif ntype == "DN":
+        inv.net_payable = note_amt
+        inv.paid = 0.0
+        inv.balance = note_amt
+    else:
+        inv.net_payable = 0.0
+        inv.paid = 0.0
+        inv.balance = float(inv.total or 0.0)
+
+
 def recalculate_client_ledger(client_id: int, db: Session, preserve_manual_paid: bool = False):
     """
     The Master Math Engine: Calculates all invoices, deducts payments, 
@@ -2254,27 +2338,31 @@ def recalculate_client_ledger(client_id: int, db: Session, preserve_manual_paid:
     # imports that seed an opening ``paid`` figure aren't wiped out by the
     # post-create recalc when no payment record exists yet.
     for inv in invoices:
+        if inv.is_note:
+            ntype = str(inv.note_type or "").strip().upper()
+            if ntype == "CN":
+                sync_note_row_balance(inv)
+                continue
+            if ntype == "DN":
+                note_amt = abs(float(inv.total or 0.0))
+                inv.advance_adj = 0.0
+                inv.tds_ded = 0.0
+                inv.retention_held = 0.0
+                inv.net_payable = note_amt
+                # paid / balance are derived from receipt allocations in step 2.
+                continue
+            sync_note_row_balance(inv)
+            continue
+
         manual_paid_pre = float(inv.paid or 0.0)
         po_obj = po_map.get(inv.po_id) if inv.po_id else None
         if po_obj is not None:
             ret_base_amount = invoice_amount_for_po_base(inv, po_obj.ret_base or "total")
-            tds_base_kind = (getattr(po_obj, "tds_base", None) or po_obj.ret_base or "basic")
-            tds_base_amount = invoice_amount_for_po_base(inv, tds_base_kind)
 
-            # Keep retention/TDS/advance synchronized with the latest PO terms.
+            # Retention/advance follow PO terms; TDS is user-entered per invoice (never overwritten here).
             retention_pct = float(po_obj.ret_pct or 0.0)
             inv.retention_held = max(0.0, ret_base_amount * (retention_pct / 100.0))
-
-            tds_rate_raw = float(po_obj.tds_rate or 0.0)
-            # TDS rate is stored as a percentage value (e.g. 0.1 => 0.1%).
-            tds_fraction = max(0.0, tds_rate_raw) / 100.0
-            tds_threshold = float(po_obj.tds_threshold or 0.0)
-            tds_applicable = (
-                bool(po_obj.tds_enabled)
-                and tds_base_amount >= tds_threshold
-                and tds_fraction > 0.0
-            )
-            inv.tds_ded = max(0.0, tds_base_amount * tds_fraction) if tds_applicable else 0.0
+            inv.tds_ded = max(0.0, float(inv.tds_ded or 0.0))
 
             adv_pct = float(po_obj.adv_pct or 0.0)
             max_adv_allowed = max(0.0, ret_base_amount * (adv_pct / 100.0)) if adv_pct > 0 else 0.0
@@ -2302,7 +2390,10 @@ def recalculate_client_ledger(client_id: int, db: Session, preserve_manual_paid:
     # silently hide that credit and break pool-total accounting.
     total_excess = 0.0
     for inv in invoices:
+        if inv.is_note and not is_debit_note(inv):
+            continue
         alloc_paid = float(alloc_paid_by_inv.get(inv.invoice_no, 0.0))
+        # CN rows are not paid via receipt allocation; DN rows are (like invoices).
         derived_paid = alloc_paid
         if preserve_manual_paid:
             manual_seed = float(getattr(inv, "_manual_paid_seed", 0.0) or 0.0)
@@ -2557,6 +2648,26 @@ def get_invoices(fiscal_years: Optional[str] = Query(default=None, description="
             target_inv = (alloc.target_inv_id or "").strip()
             if note_id and target_inv and note_id not in note_target_by_note_id:
                 note_target_by_note_id[note_id] = target_inv
+        # Fallback for legacy/malformed rows where note_allocation linkage may
+        # be missing but NOTE_APPLIED details still capture the target invoice.
+        unresolved_note_nos = [n for n in note_invoice_nos if n not in note_target_by_note_id]
+        if unresolved_note_nos:
+            note_pays = db.query(PaymentHistory).filter(
+                PaymentHistory.client_id.in_([inv.client_id for inv in invoices if inv.is_note]),
+                PaymentHistory.type == "NOTE_APPLIED"
+            ).all()
+            note_apply_re = re.compile(r"\bNote\s+(.+?)\s+applied\s+to\s+(.+?)\s*$", re.IGNORECASE)
+            for pay in note_pays:
+                details = str(pay.details or "").strip()
+                if not details:
+                    continue
+                m = note_apply_re.search(details)
+                if not m:
+                    continue
+                note_id = m.group(1).strip()
+                target_inv = m.group(2).strip()
+                if note_id in unresolved_note_nos and target_inv and note_id not in note_target_by_note_id:
+                    note_target_by_note_id[note_id] = target_inv
     result = []
     for inv in invoices:
         po_str = 'UNASSIGNED'
@@ -2569,6 +2680,24 @@ def get_invoices(fiscal_years: Optional[str] = Query(default=None, description="
             if po_obj:
                 po_str = po_obj.po_no
                 po_completed = bool(po_obj.is_completed)
+        # Fallback: for notes, derive PO from linked target invoice if this row
+        # has no PO relation (guards legacy rows and partial data).
+        if inv.is_note and po_str == 'UNASSIGNED':
+            note_target = note_target_by_note_id.get(inv.invoice_no)
+            if note_target:
+                target_inv_obj = db.query(Invoice).options(joinedload(Invoice.purchase_order)).filter(
+                    Invoice.invoice_no == note_target,
+                    Invoice.client_id == inv.client_id
+                ).first()
+                if target_inv_obj:
+                    if target_inv_obj.purchase_order:
+                        po_str = target_inv_obj.purchase_order.po_no
+                        po_completed = bool(target_inv_obj.purchase_order.is_completed)
+                    elif target_inv_obj.po_id:
+                        po_obj = db.query(PurchaseOrder).filter(PurchaseOrder.id == target_inv_obj.po_id).first()
+                        if po_obj:
+                            po_str = po_obj.po_no
+                            po_completed = bool(po_obj.is_completed)
         if (not include_completed_po) and po_completed:
             continue
         inv_fy = fiscal_year_label(inv.inv_date, fy_start_month, fy_start_day)
@@ -2604,7 +2733,7 @@ def get_invoices(fiscal_years: Optional[str] = Query(default=None, description="
             "retention": inv.retention_held,
             "netPayable": inv.net_payable,
             "paid": inv.paid,
-            "balance": inv.balance,
+            "balance": note_display_balance(inv) if inv.is_note else inv.balance,
             "isNote": inv.is_note,
             "noteType": inv.note_type,
             "noteReason": inv.note_reason,
@@ -2638,8 +2767,11 @@ def create_invoice(inv: InvoiceCreate, request: Request, current_user: User = De
     due_d = datetime.datetime.strptime(inv.due_date, '%Y-%m-%d').date() if inv.due_date else None
     rounded_basic = round_inr_nearest(inv.basic)
     rounded_total = round_inr_nearest(inv.total)
-    server_net_payable = max(0.0, float(rounded_total or 0.0) - float(inv.advance_adj or 0.0))
-    server_balance = max(0.0, server_net_payable - float(inv.paid or 0.0))
+    server_net_payable = max(
+        0.0,
+        float(rounded_total or 0.0) - float(inv.advance_adj or 0.0) - float(inv.tds_ded or 0.0),
+    )
+    server_balance = float(server_net_payable) - float(inv.paid or 0.0)
 
     new_inv = Invoice(
         client_id=inv.client_id, po_id=po_id, invoice_no=inv.invoice_no,
@@ -2725,9 +2857,12 @@ def update_invoice(invoice_no: str, inv: InvoiceUpdate, request: Request, curren
     db_inv.advance_adj = inv.advance_adj
     db_inv.tds_ded = inv.tds_ded
     db_inv.retention_held = inv.retention_held
-    db_inv.net_payable = max(0.0, float(db_inv.total or 0.0) - float(db_inv.advance_adj or 0.0))
+    db_inv.net_payable = max(
+        0.0,
+        float(db_inv.total or 0.0) - float(db_inv.advance_adj or 0.0) - float(db_inv.tds_ded or 0.0),
+    )
     db_inv.paid = inv.paid
-    db_inv.balance = max(0.0, float(db_inv.net_payable or 0.0) - float(db_inv.paid or 0.0))
+    db_inv.balance = float(db_inv.net_payable or 0.0) - float(db_inv.paid or 0.0)
     db_inv.is_note = inv.is_note
     db_inv.note_type = inv.note_type
     db_inv.note_reason = inv.note_reason
@@ -3007,8 +3142,11 @@ def update_invoice_inline_fields(invoice_no: str, payload: InvoiceInlineUpdate, 
     if payload.total is not None:
         inv.total = max(0.0, round_inr_nearest(payload.total))
         # Keep payable consistency when total is edited inline.
-        inv.net_payable = max(0.0, float(inv.total or 0.0) - float(inv.advance_adj or 0.0))
-        inv.balance = max(0.0, float(inv.net_payable or 0.0) - float(inv.paid or 0.0))
+        inv.net_payable = max(
+            0.0,
+            float(inv.total or 0.0) - float(inv.advance_adj or 0.0) - float(inv.tds_ded or 0.0),
+        )
+        inv.balance = float(inv.net_payable or 0.0) - float(inv.paid or 0.0)
 
     db.commit()
     recalculate_client_ledger(inv.client_id, db)
@@ -3187,10 +3325,8 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
         raise HTTPException(status_code=400, detail="Payment id already exists.")
 
     date_obj = datetime.datetime.strptime(payment.date, '%Y-%m-%d').date()
-    invoices = db.query(Invoice).filter(
-        Invoice.client_id == payment.client_id,
-        Invoice.is_note == False
-    ).all()
+    invoices = db.query(Invoice).filter(Invoice.client_id == payment.client_id).all()
+    invoices = [inv for inv in invoices if invoice_eligible_for_payment_allocation(inv)]
     inv_map = {inv.invoice_no: inv for inv in invoices}
     po_by_id = {po.id: po for po in db.query(PurchaseOrder).filter(PurchaseOrder.client_id == payment.client_id).all()}
 
@@ -3198,14 +3334,20 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
     if payment.mode == "targeted" and payment.targets:
         for t in payment.targets:
             inv = inv_map.get(t.inv_id)
-            if inv and (inv.balance or 0) > 0:
-                if payment.advance_only:
+            if not inv:
+                continue
+            req_amt = max(0.0, float(t.amount or 0.0))
+            outstanding = invoice_outstanding_balance(inv)
+            if payment.advance_only:
+                if outstanding > 0.009 or req_amt > 0.009:
                     selected.append((inv, -1.0))
-                else:
-                    selected.append((inv, max(0.0, float(t.amount or 0.0))))
+            elif req_amt > 0.009:
+                selected.append((inv, req_amt))
+            elif outstanding > 0.009:
+                selected.append((inv, -1.0))
     else:
         selected = [(inv, -1.0) for inv in sorted(
-            [i for i in invoices if (i.balance or 0) > 0],
+            [i for i in invoices if invoice_outstanding_balance(i) > 0.009],
             key=lambda x: invoice_ledger_sort_key(x.inv_date, x.invoice_no),
         )]
 
@@ -3272,7 +3414,7 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
                 if (po_by_id.get(inv.po_id).po_no if inv.po_id and po_by_id.get(inv.po_id) else None) == scoped_po
             ]
         for inv, requested in selected:
-            if payment.apply_adv and not payment.only_gst:
+            if payment.apply_adv and not payment.only_gst and not inv.is_note:
                 po_obj = po_by_id.get(inv.po_id) if inv.po_id else None
                 po_no = po_obj.po_no if po_obj else None
                 adv_pct = float(po_obj.adv_pct or 0.0) if po_obj else 0.0
@@ -3295,7 +3437,7 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
                 continue
             if remaining <= 0:
                 break
-            inv_balance = float(inv.balance or 0.0)
+            inv_balance = invoice_outstanding_balance(inv)
 
             # Overpayment: only honoured when mode=targeted and a specific
             # positive amount was requested for this invoice. Cascade mode
@@ -3306,7 +3448,7 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
                 and requested > 0
             )
 
-            if not allow_overpay_this and inv_balance <= 0:
+            if not allow_overpay_this and inv_balance <= 0.009:
                 continue
 
             desired = remaining if requested < 0 else requested
@@ -3314,6 +3456,9 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
             if allow_overpay_this:
                 # No allocatable cap — the user explicitly chose to overpay.
                 allocatable = float(desired)
+            elif is_debit_note(inv):
+                # DN rows have no GST/retention buckets — apply to full outstanding due.
+                allocatable = inv_balance
             elif payment.only_gst:
                 allocatable = min(float(inv.gst or 0.0), inv_balance)
             else:
@@ -3338,14 +3483,17 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
     if remaining > 0 and payment.fund_source == "receipt" and payment.excess_action == "allocate_pending":
         selected_ids = {inv.invoice_no for inv, _ in selected}
         pending_invoices = sorted(
-            [i for i in invoices if (i.balance or 0) > 0 and i.invoice_no not in selected_ids],
+            [
+                i for i in invoices
+                if invoice_outstanding_balance(i) > 0.009 and i.invoice_no not in selected_ids
+            ],
             key=lambda x: invoice_ledger_sort_key(x.inv_date, x.invoice_no),
         )
         for inv in pending_invoices:
             if remaining <= 0:
                 break
-            inv_balance = float(inv.balance or 0.0)
-            if inv_balance <= 0:
+            inv_balance = invoice_outstanding_balance(inv)
+            if inv_balance <= 0.009:
                 continue
             amount_to_apply = min(inv_balance, remaining)
             allocs_for_db.append((inv.invoice_no, amount_to_apply))
@@ -3436,33 +3584,8 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
         db.flush()
         _auto_apply_po_advance(payment.client_id, db, payment.move_to_po.strip())
 
-    # When drawing from the unallocated pool, drain the open
-    # UnallocatedPaymentRegister entries in FIFO order so that the register
-    # table stays in sync with client.excess_funds.  Without this the
-    # "Unallocated Receipts Available" panel (which reads the register) keeps
-    # showing the old balance even after the pool has been consumed.
     if payment.fund_source == "unallocated" and payment_amount > 0:
-        to_deduct = float(payment_amount)
-        open_regs = (
-            db.query(UnallocatedPaymentRegister)
-            .filter(
-                UnallocatedPaymentRegister.client_id == payment.client_id,
-                UnallocatedPaymentRegister.status == "open",
-                UnallocatedPaymentRegister.balance > 0,
-            )
-            .order_by(UnallocatedPaymentRegister.id.asc())
-            .all()
-        )
-        for reg in open_regs:
-            if to_deduct <= 0:
-                break
-            reg_bal = float(reg.balance or 0.0)
-            take = min(reg_bal, to_deduct)
-            reg.balance = round(reg_bal - take, 2)
-            if reg.balance < 0.01:
-                reg.balance = 0.0
-                reg.status = "used"
-            to_deduct -= take
+        _drain_unallocated_register(db, payment.client_id, payment_amount)
 
     db.commit()
     recalculate_client_ledger(payment.client_id, db)
@@ -3536,6 +3659,87 @@ def _build_unallocated_register_note(source_kind: str, raw_note: Optional[str], 
     payload = "|".join(parts)
     tail = (raw_note or "").strip()
     return f"[{payload}] {tail}".strip()
+
+
+def _drain_unallocated_register(db: Session, client_id: int, amount: float) -> None:
+    """Consume open register balances FIFO when drawing from the unallocated pool."""
+    to_deduct = round_inr_nearest(max(0.0, float(amount or 0.0)))
+    if to_deduct <= 0:
+        return
+    open_regs = (
+        db.query(UnallocatedPaymentRegister)
+        .filter(
+            UnallocatedPaymentRegister.client_id == client_id,
+            UnallocatedPaymentRegister.status == "open",
+            UnallocatedPaymentRegister.balance > 0,
+        )
+        .order_by(UnallocatedPaymentRegister.id.asc())
+        .all()
+    )
+    for reg in open_regs:
+        if to_deduct <= 0:
+            break
+        reg_bal = float(reg.balance or 0.0)
+        take = min(reg_bal, to_deduct)
+        reg.balance = round_inr_nearest(reg_bal - take)
+        if reg.balance < 0.01:
+            reg.balance = 0.0
+            reg.status = "used"
+        to_deduct = round_inr_nearest(to_deduct - take)
+
+
+def _restore_unallocated_register_consumption(
+    db: Session,
+    client_id: int,
+    amount: float,
+    *,
+    note: str = "",
+    source_payment_id: Optional[str] = None,
+) -> float:
+    """Credit register rows LIFO after reversing a UNALLOCATED_APPLIED payment."""
+    remaining = round_inr_nearest(max(0.0, float(amount or 0.0)))
+    if remaining <= 0:
+        return 0.0
+
+    regs = (
+        db.query(UnallocatedPaymentRegister)
+        .filter(
+            UnallocatedPaymentRegister.client_id == client_id,
+            UnallocatedPaymentRegister.status.in_(["used", "open"]),
+        )
+        .order_by(UnallocatedPaymentRegister.id.desc())
+        .all()
+    )
+    for reg in regs:
+        if remaining <= 0:
+            break
+        headroom = round_inr_nearest(float(reg.amount or 0.0) - float(reg.balance or 0.0))
+        if headroom < 0.01:
+            continue
+        add = min(headroom, remaining)
+        reg.balance = round_inr_nearest(float(reg.balance or 0.0) + add)
+        if reg.balance >= float(reg.amount or 0.0) - 0.01:
+            reg.balance = float(reg.amount or 0.0)
+        reg.status = "open"
+        remaining = round_inr_nearest(remaining - add)
+
+    if remaining > 0.01:
+        db.add(
+            UnallocatedPaymentRegister(
+                client_id=client_id,
+                source_payment_id=source_payment_id,
+                created_on=datetime.date.today(),
+                amount=float(remaining),
+                balance=float(remaining),
+                status="open",
+                note=_build_unallocated_register_note(
+                    "pool_restored",
+                    note or "Reversed unallocated allocation",
+                ),
+            )
+        )
+        remaining = 0.0
+    return float(amount or 0.0)
 
 
 def _parse_unallocated_register_note(note: Optional[str]) -> tuple[str, Optional[str], Optional[str], str]:
@@ -3639,6 +3843,14 @@ def delete_payment(payment_id: str, request: Request, current_user: User = Depen
     db_pay = db.query(PaymentHistory).filter(PaymentHistory.id == payment_id).first()
     if db_pay:
         client_id = db_pay.client_id
+        if db_pay.type == "UNALLOCATED_APPLIED":
+            _restore_unallocated_register_consumption(
+                db,
+                client_id,
+                float(db_pay.amount or 0.0),
+                note=db_pay.note or "",
+                source_payment_id=payment_id,
+            )
         linked_allocs = db.query(PaymentAllocation).filter(PaymentAllocation.payment_id == payment_id).all()
         linked_unalloc_pay = db.query(UnallocatedPaymentRegister).filter(
             UnallocatedPaymentRegister.source_payment_id == payment_id
@@ -3701,6 +3913,14 @@ def redistribute_payment(payment_id: str, current_user: User = Depends(get_curre
         "note": db_pay.note or ""
     }
     client_id = db_pay.client_id
+    if db_pay.type == "UNALLOCATED_APPLIED":
+        _restore_unallocated_register_consumption(
+            db,
+            client_id,
+            float(db_pay.amount or 0.0),
+            note=db_pay.note or "",
+            source_payment_id=payment_id,
+        )
     linked_allocs = db.query(PaymentAllocation).filter(PaymentAllocation.payment_id == payment_id).all()
     po_nos_to_reset = {
         str(al.target_po_no).strip()
@@ -3964,12 +4184,13 @@ def issue_note(req: NoteIssueRequest, request: Request, current_user: User = Dep
 
     note_date = datetime.datetime.strptime(req.date, '%Y-%m-%d').date() if req.date else datetime.date.today()
     total_amt = -req.amount if req.note_type == "CN" else req.amount
+    target_invoice_id = (req.target_invoice_id or "").strip() or None
     target_invoice = None
     note_po_id = None
     note_target_po_no = None
-    if req.target_invoice_id:
+    if target_invoice_id:
         target_invoice = db.query(Invoice).filter(
-            Invoice.invoice_no == req.target_invoice_id,
+            Invoice.invoice_no == target_invoice_id,
             Invoice.client_id == req.client_id
         ).first()
         if not target_invoice:
@@ -4005,7 +4226,7 @@ def issue_note(req: NoteIssueRequest, request: Request, current_user: User = Dep
     )
     db.add(new_note)
 
-    if req.target_invoice_id:
+    if target_invoice_id:
         pay_id = str(int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000))
         db_pay = PaymentHistory(
             id=pay_id,
@@ -4013,7 +4234,7 @@ def issue_note(req: NoteIssueRequest, request: Request, current_user: User = Dep
             date=note_date,
             type='NOTE_APPLIED',
             amount=float(req.amount),
-            details=f"{'Credit' if req.note_type == 'CN' else 'Debit'} Note {req.note_no} applied to {req.target_invoice_id}",
+            details=f"{'Credit' if req.note_type == 'CN' else 'Debit'} Note {req.note_no} applied to {target_invoice_id}",
             note=req.reason
         )
         db.add(db_pay)
@@ -4021,7 +4242,7 @@ def issue_note(req: NoteIssueRequest, request: Request, current_user: User = Dep
         db.add(PaymentAllocation(
             payment_id=db_pay.id,
             alloc_type='note_allocation',
-            target_inv_id=req.target_invoice_id,
+            target_inv_id=target_invoice_id,
             target_po_no=note_target_po_no,
             note_id=req.note_no,
             amount=float(req.amount)
@@ -4033,19 +4254,23 @@ def issue_note(req: NoteIssueRequest, request: Request, current_user: User = Dep
         entity_type="note",
         entity_id=req.note_no,
         action=f"issue:{req.note_type}",
-        summary=f"Issued {req.note_type} {req.note_no} ({req.amount:.2f}) against invoice {req.target_invoice_id or 'N/A'}",
+        summary=f"Issued {req.note_type} {req.note_no} ({req.amount:.2f}) against invoice {target_invoice_id or 'N/A'}",
         details={
             "client_id": req.client_id,
             "note_type": req.note_type,
             "amount": float(req.amount),
-            "target_invoice_id": req.target_invoice_id,
+            "target_invoice_id": target_invoice_id,
             "target_po_no": note_target_po_no,
             "reason": req.reason,
         },
         request=request,
     )
     db.commit()
-    recalculate_client_ledger(req.client_id, db)
+    db.refresh(new_note)
+    # Do not run full client ledger recalc here — it can change the target invoice's
+    # advance/TDS/retention from PO rules. Notes are separate ledger rows only.
+    sync_note_row_balance(new_note)
+    db.commit()
     return {"success": True}
 
 
@@ -4422,6 +4647,39 @@ async def upload_po(
 
     return {"success": True, "results": results}
 
+# --- PWA assets (served from site root for manifest / service worker scope) ---
+@app.get("/manifest.webmanifest")
+def serve_pwa_manifest():
+    return FileResponse(
+        "public/manifest.webmanifest",
+        media_type="application/manifest+json",
+    )
+
+
+@app.get("/sw.js")
+def serve_service_worker():
+    return FileResponse(
+        "public/sw.js",
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/offline.html")
+def serve_offline_page():
+    return FileResponse("public/offline.html")
+
+
+@app.get("/icon-192.png")
+def serve_icon_192():
+    return FileResponse("public/icon-192.png", media_type="image/png")
+
+
+@app.get("/icon-512.png")
+def serve_icon_512():
+    return FileResponse("public/icon-512.png", media_type="image/png")
+
+
 # --- Static File Routing (CRITICAL: MUST BE THE ABSOLUTE LAST LINES OF THE FILE) ---
 app.mount("/static", StaticFiles(directory="public"), name="static")
 
@@ -4435,4 +4693,5 @@ if __name__ == "__main__":
     # box, or a container without code changes. See .env.example.
     host = os.getenv("HOST", "127.0.0.1").strip() or "127.0.0.1"
     port = int(os.getenv("PORT", "3000"))
-    uvicorn.run(app, host=host, port=port)
+    # Import string avoids __main__ vs main circular imports from routers/*.py.
+    uvicorn.run("main:app", host=host, port=port)

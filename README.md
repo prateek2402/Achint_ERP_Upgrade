@@ -24,16 +24,24 @@ python -m playwright install chromium     # only needed once for e2e tests
 # Copy the env template and edit the values you want to override.
 copy .env.example .env
 
-python main.py        # prod-like: no auto-reload
+# Server control (recommended on Windows)
+.\server.cmd start              # background, this PC only (127.0.0.1)
+.\server.cmd start -Network     # background, LAN (0.0.0.0) — set HOST in .env or use this flag
+.\server.cmd start -Dev         # foreground with hot reload (Ctrl+C to stop)
+.\server.cmd stop
+.\server.cmd status
+.\server.cmd restart -Network
 
-# Windows hot-reload: prefer this over raw `uvicorn --reload`; the latter sends
-# Ctrl+C to the worker on each reload and can spam KeyboardInterrupt tracebacks
-# while stdlib/third-party imports finish. This wrapper debounces reloads and
-# ignores tests/backups/__pycache__ noise.
+# Auto-start when Windows boots (run once as Administrator):
+.\server.cmd install-startup
+# Or double-click: scripts\windows\register-startup-task.cmd
+# Remove: .\server.cmd remove-startup
+
+# Or: python main.py / .\scripts\run-dev.ps1 (same as server.cmd start -Dev)
 .\scripts\run-dev.ps1
 ```
 
-The SPA is served at <http://127.0.0.1:3000/> by the same process.
+The SPA is served at <http://127.0.0.1:3000/> (or your LAN IP when using `-Network`).
 
 ## Tests
 

@@ -337,6 +337,115 @@ def test_delete_then_readd_invoice_drops_old_allocations(client: TestClient):
     assert inv["paid"] == pytest.approx(0.0)
 
 
+def test_reverse_unallocated_applied_restores_register_for_applet(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "UNALLOC-REV-CLIENT"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+
+    inv = client.post(
+        "/api/invoices",
+        json={
+            "client_id": client_id,
+            "po_no": "PO-UR-1",
+            "invoice_no": "INV-UR-1",
+            "sub_entity": "",
+            "lr_no": "",
+            "inv_date": "2026-04-01",
+            "due_date": None,
+            "basic": 1000.0,
+            "gst": 0.0,
+            "total": 1000.0,
+            "advance_adj": 0.0,
+            "tds_ded": 0.0,
+            "retention_held": 0.0,
+            "net_payable": 0.0,
+            "paid": 0.0,
+            "balance": 0.0,
+            "is_note": False,
+            "note_type": None,
+            "note_reason": None,
+            "dispatch_items": [],
+        },
+        headers=auth_header(token),
+    )
+    assert inv.status_code == 200, inv.text
+
+    seed = client.post(
+        "/api/payments/allocate",
+        json={
+            "client_id": client_id,
+            "id": "PAY-UR-SEED",
+            "date": datetime.date.today().isoformat(),
+            "amount": 500.0,
+            "note": "seed receipt",
+            "mode": "targeted",
+            "targets": [{"inv_id": "INV-UR-1", "amount": 200.0}],
+            "hold_ret": False,
+            "hold_gst": False,
+            "only_gst": False,
+            "apply_adv": False,
+            "advance_only": False,
+            "fund_source": "receipt",
+            "move_to_po": None,
+            "po_no": None,
+            "clear_po_pool": False,
+            "excess_action": "park",
+        },
+        headers=auth_header(token),
+    )
+    assert seed.status_code == 200, seed.text
+
+    regs_before = client.get(
+        f"/api/registers/unallocated-payments?client_id={client_id}",
+        headers=auth_header(token),
+    ).json()
+    open_before = [r for r in regs_before if r.get("status") == "open" and float(r.get("balance") or 0) > 0]
+    assert sum(float(r["balance"]) for r in open_before) == pytest.approx(300.0, abs=0.02)
+
+    applied = client.post(
+        "/api/payments/allocate",
+        json={
+            "client_id": client_id,
+            "id": "PAY-UR-APPLY",
+            "date": datetime.date.today().isoformat(),
+            "amount": 150.0,
+            "note": "from pool",
+            "mode": "targeted",
+            "targets": [{"inv_id": "INV-UR-1", "amount": 150.0}],
+            "hold_ret": False,
+            "hold_gst": False,
+            "only_gst": False,
+            "apply_adv": False,
+            "advance_only": False,
+            "fund_source": "unallocated",
+            "move_to_po": None,
+            "po_no": None,
+            "clear_po_pool": False,
+            "excess_action": "park",
+        },
+        headers=auth_header(token),
+    )
+    assert applied.status_code == 200, applied.text
+
+    regs_after_apply = client.get(
+        f"/api/registers/unallocated-payments?client_id={client_id}",
+        headers=auth_header(token),
+    ).json()
+    open_after_apply = [r for r in regs_after_apply if r.get("status") == "open" and float(r.get("balance") or 0) > 0]
+    assert sum(float(r["balance"]) for r in open_after_apply) == pytest.approx(150.0, abs=0.02)
+
+    deleted = client.delete("/api/payments/PAY-UR-APPLY", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+
+    regs_after_reverse = client.get(
+        f"/api/registers/unallocated-payments?client_id={client_id}",
+        headers=auth_header(token),
+    ).json()
+    open_after_reverse = [r for r in regs_after_reverse if r.get("status") == "open" and float(r.get("balance") or 0) > 0]
+    assert sum(float(r["balance"]) for r in open_after_reverse) == pytest.approx(300.0, abs=0.02)
+
+
 def test_delete_payment_unallocates_invoices_and_restores_balance(client: TestClient):
     token = login(client, "admin", "Admin@1234")
     cr = client.post("/api/clients", json={"name": "PAY-DEL-CLIENT"}, headers=auth_header(token))
@@ -440,14 +549,36 @@ def test_po_terms_update_recalculates_client_ledger(client: TestClient):
     assert inv["balance"] == pytest.approx(inv["netPayable"] - inv["paid"])
 
 
-def test_po_tds_terms_update_changes_invoice_balance(client: TestClient):
+def test_manual_tds_persists_after_po_recalculate(client: TestClient):
     token = login(client, "admin", "Admin@1234")
     client_id = create_client_po_invoice(client, token)
 
-    # Raise invoice total above threshold so TDS should apply after PO update.
-    upd = client.patch(
-        "/api/invoices/INV-001/inline",
-        json={"total": 10000.0},
+    recalc = client.post(f"/api/clients/{client_id}/ledger/recalculate", headers=auth_header(token))
+    assert recalc.status_code == 200, recalc.text
+
+    manual_tds = 42.5
+    upd = client.put(
+        "/api/invoices/INV-001",
+        json={
+            "client_id": client_id,
+            "po_no": "PO-001",
+            "invoice_no": "INV-001",
+            "sub_entity": "Unit-1",
+            "lr_no": "LR-11",
+            "inv_date": "2026-04-01",
+            "due_date": "2026-04-15",
+            "basic": 1000.0,
+            "gst": 180.0,
+            "total": 1180.0,
+            "advance_adj": 0.0,
+            "tds_ded": manual_tds,
+            "retention_held": 0.0,
+            "net_payable": 0.0,
+            "paid": 0.0,
+            "balance": 0.0,
+            "is_note": False,
+            "dispatch_items": [],
+        },
         headers=auth_header(token),
     )
     assert upd.status_code == 200, upd.text
@@ -462,31 +593,29 @@ def test_po_tds_terms_update_changes_invoice_balance(client: TestClient):
         "ret_base": "total",
         "tds_base": "total",
         "tds_enabled": True,
-        "tds_rate": 0.1,
-        "tds_threshold": 5000.0,
+        "tds_rate": 10.0,
+        "tds_threshold": 0.0,
         "baseline_items": [],
     }, headers=auth_header(token))
     assert update_po.status_code == 200, update_po.text
 
     invs = client.get("/api/invoices", headers=auth_header(token)).json()
     inv = next(i for i in invs if i["id"] == "INV-001")
-    assert inv["tds"] == pytest.approx(10.0)
-    assert inv["netPayable"] == pytest.approx(9990.0)
-    assert inv["balance"] == pytest.approx(9990.0)
+    assert inv["tds"] == pytest.approx(manual_tds, abs=0.01)
+    assert inv["netPayable"] == pytest.approx(1180.0 - manual_tds, abs=0.01)
 
 
-def test_po_tds_on_basic_not_gross(client: TestClient):
+def test_manual_tds_zero_when_po_tds_enabled_but_not_entered(client: TestClient):
     token = login(client, "admin", "Admin@1234")
     client_id = create_client_po_invoice(client, token)
 
-    upd = client.patch(
+    client.patch(
         "/api/invoices/INV-001/inline",
         json={"total": 10000.0},
         headers=auth_header(token),
     )
-    assert upd.status_code == 200, upd.text
 
-    update_po = client.post("/api/purchase-orders", json={
+    client.post("/api/purchase-orders", json={
         "client_id": client_id,
         "po_no": "PO-001",
         "contact_person": "Ops",
@@ -500,14 +629,11 @@ def test_po_tds_on_basic_not_gross(client: TestClient):
         "tds_threshold": 500.0,
         "baseline_items": [],
     }, headers=auth_header(token))
-    assert update_po.status_code == 200, update_po.text
 
     invs = client.get("/api/invoices", headers=auth_header(token)).json()
     inv = next(i for i in invs if i["id"] == "INV-001")
-    # basic is 1000 (rounded from create payload); TDS 0.1% on basic, not on gross 10000.
-    assert inv["basic"] == pytest.approx(1000.0)
-    assert inv["tds"] == pytest.approx(1.0)
-    assert inv["netPayable"] == pytest.approx(10000.0 - 1.0)
+    assert inv["tds"] == pytest.approx(0.0, abs=0.01)
+    assert inv["netPayable"] == pytest.approx(10000.0, abs=0.01)
 
 
 def test_po_advance_auto_apply_existing_and_new_invoices(client: TestClient):
@@ -695,6 +821,15 @@ def test_note_issue_inherits_invoice_po_and_target_link(client: TestClient):
     token = login(client, "admin", "Admin@1234")
     client_id = create_client_po_invoice(client, token)
 
+    # Re-open ledger so paid is allocation-driven (fixture seeds a manual paid figure).
+    recalc = client.post(f"/api/clients/{client_id}/ledger/recalculate", headers=auth_header(token))
+    assert recalc.status_code == 200, recalc.text
+
+    invs_before = client.get("/api/invoices", headers=auth_header(token))
+    assert invs_before.status_code == 200
+    inv_before = next(i for i in invs_before.json() if i["id"] == "INV-001")
+    balance_before = float(inv_before["balance"])
+
     note_payload = {
         "client_id": client_id,
         "note_no": "CN-001",
@@ -711,6 +846,196 @@ def test_note_issue_inherits_invoice_po_and_target_link(client: TestClient):
     assert invs.status_code == 200
     cn = next(i for i in invs.json() if i["id"] == "CN-001")
     assert cn["isNote"] is True
+    assert cn["poNo"] == "PO-001"
+    assert cn["noteTargetInvoice"] == "INV-001"
+    assert float(cn["balance"]) == pytest.approx(-50.0, abs=0.01)
+    # Target invoice due is unchanged; CN effect is on the note row and ledger totals only.
+
+    inv_after = next(i for i in invs.json() if i["id"] == "INV-001")
+    assert float(inv_after["balance"]) == pytest.approx(balance_before, abs=0.01)
+    assert float(inv_after["paid"]) == pytest.approx(float(inv_before["paid"]), abs=0.01)
+    assert float(inv_after["netPayable"]) == pytest.approx(float(inv_before["netPayable"]), abs=0.01)
+
+
+def test_debit_note_does_not_change_target_invoice_balance(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    recalc = client.post(f"/api/clients/{client_id}/ledger/recalculate", headers=auth_header(token))
+    assert recalc.status_code == 200, recalc.text
+
+    invs_before = client.get("/api/invoices", headers=auth_header(token))
+    inv_before = next(i for i in invs_before.json() if i["id"] == "INV-001")
+    balance_before = float(inv_before["balance"])
+
+    dn_payload = {
+        "client_id": client_id,
+        "note_no": "DN-001",
+        "date": "2026-04-11",
+        "note_type": "DN",
+        "amount": 25.0,
+        "reason": "extra charge",
+        "target_invoice_id": "INV-001",
+    }
+    dn = client.post("/api/notes/issue", json=dn_payload, headers=auth_header(token))
+    assert dn.status_code == 200, dn.text
+
+    invs = client.get("/api/invoices", headers=auth_header(token))
+    inv_after = next(i for i in invs.json() if i["id"] == "INV-001")
+    assert float(inv_after["balance"]) == pytest.approx(balance_before, abs=0.01)
+    dn_row = next(i for i in invs.json() if i["id"] == "DN-001")
+    assert dn_row["poNo"] == "PO-001"
+    assert float(dn_row["balance"]) == pytest.approx(25.0, abs=0.01)
+
+
+def test_payment_allocation_applies_to_debit_note(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    recalc = client.post(f"/api/clients/{client_id}/ledger/recalculate", headers=auth_header(token))
+    assert recalc.status_code == 200, recalc.text
+
+    dn = client.post("/api/notes/issue", json={
+        "client_id": client_id,
+        "note_no": "DN-PAY-001",
+        "date": "2026-04-13",
+        "note_type": "DN",
+        "amount": 40.0,
+        "reason": "extra freight",
+        "target_invoice_id": "INV-001",
+    }, headers=auth_header(token))
+    assert dn.status_code == 200, dn.text
+
+    alloc = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-DN-001",
+        "date": "2026-04-14",
+        "amount": 15.0,
+        "note": "partial on DN",
+        "mode": "targeted",
+        "targets": [{"inv_id": "DN-PAY-001", "amount": 15.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert alloc.status_code == 200, alloc.text
+
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    inv = next(i for i in invs if i["id"] == "INV-001")
+    dn_row = next(i for i in invs if i["id"] == "DN-PAY-001")
+    assert float(dn_row["paid"]) == pytest.approx(15.0, abs=0.01)
+    assert float(dn_row["balance"]) == pytest.approx(25.0, abs=0.01)
+    # Target invoice must remain independent of DN payment.
+    assert float(inv["balance"]) == pytest.approx(float(inv["netPayable"]) - float(inv["paid"]), abs=0.01)
+
+
+def test_debit_note_allocation_with_only_gst_option_enabled(client: TestClient):
+    """DN rows must allocate even when Only GST / holds are checked (no GST on notes)."""
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    client.post(f"/api/clients/{client_id}/ledger/recalculate", headers=auth_header(token))
+    dn = client.post("/api/notes/issue", json={
+        "client_id": client_id,
+        "note_no": "DN-GST-001",
+        "date": "2026-04-15",
+        "note_type": "DN",
+        "amount": 30.0,
+        "reason": "charge",
+        "target_invoice_id": "INV-001",
+    }, headers=auth_header(token))
+    assert dn.status_code == 200, dn.text
+
+    alloc = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-DN-GST-001",
+        "date": "2026-04-16",
+        "amount": 12.0,
+        "note": "pay DN with only_gst on",
+        "mode": "targeted",
+        "targets": [{"inv_id": "DN-GST-001", "amount": 12.0}],
+        "hold_ret": True,
+        "hold_gst": True,
+        "only_gst": True,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert alloc.status_code == 200, alloc.text
+    assert alloc.json().get("allocation_count", 0) >= 1
+
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    dn_row = next(i for i in invs if i["id"] == "DN-GST-001")
+    assert float(dn_row["paid"]) == pytest.approx(12.0, abs=0.01)
+    assert float(dn_row["balance"]) == pytest.approx(18.0, abs=0.01)
+
+
+def test_debit_note_api_balance_reflects_payments(client: TestClient):
+    """GET /api/invoices balance for DN must decrease after allocation (not stick at gross)."""
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+    client.post(f"/api/clients/{client_id}/ledger/recalculate", headers=auth_header(token))
+    client.post("/api/notes/issue", json={
+        "client_id": client_id,
+        "note_no": "DN-API-BAL",
+        "date": "2026-04-17",
+        "note_type": "DN",
+        "amount": 100.0,
+        "reason": "test",
+        "target_invoice_id": "INV-001",
+    }, headers=auth_header(token))
+
+    before = next(i for i in client.get("/api/invoices", headers=auth_header(token)).json() if i["id"] == "DN-API-BAL")
+    assert float(before["balance"]) == pytest.approx(100.0, abs=0.01)
+
+    client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-DN-API-BAL",
+        "date": "2026-04-18",
+        "amount": 40.0,
+        "mode": "targeted",
+        "targets": [{"inv_id": "DN-API-BAL", "amount": 40.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "excess_action": "park",
+    }, headers=auth_header(token))
+
+    after = next(i for i in client.get("/api/invoices", headers=auth_header(token)).json() if i["id"] == "DN-API-BAL")
+    assert float(after["paid"]) == pytest.approx(40.0, abs=0.01)
+    assert float(after["balance"]) == pytest.approx(60.0, abs=0.01)
+
+
+def test_note_issue_trims_target_invoice_id_for_linking(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    recalc = client.post(f"/api/clients/{client_id}/ledger/recalculate", headers=auth_header(token))
+    assert recalc.status_code == 200, recalc.text
+
+    note_payload = {
+        "client_id": client_id,
+        "note_no": "CN-TRIM-001",
+        "date": "2026-04-12",
+        "note_type": "CN",
+        "amount": 10.0,
+        "reason": "trim check",
+        "target_invoice_id": "  INV-001  ",
+    }
+    note = client.post("/api/notes/issue", json=note_payload, headers=auth_header(token))
+    assert note.status_code == 200, note.text
+
+    invs = client.get("/api/invoices", headers=auth_header(token))
+    assert invs.status_code == 200
+    cn = next(i for i in invs.json() if i["id"] == "CN-TRIM-001")
     assert cn["poNo"] == "PO-001"
     assert cn["noteTargetInvoice"] == "INV-001"
 
@@ -789,3 +1114,104 @@ def test_payment_allocate_validation_edge_case(client: TestClient):
     res = client.post("/api/payments/allocate", json=bad_payload, headers=auth_header(token))
     assert res.status_code == 400
     assert "greater than zero" in res.json()["detail"].lower()
+
+
+def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
+    import json
+    import sqlite3
+
+    import migrate_sqlite as mig
+    from models import Client, Invoice, User
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old.sqlite"
+    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
+    monkeypatch.chdir(tmp_path)
+
+    def _legacy_invoice(no: str, total: float = 100.0) -> dict:
+        return {
+            "id": no,
+            "poNo": "UNASSIGNED",
+            "invDate": "2026-01-01",
+            "dueDate": "2026-02-01",
+            "basic": total,
+            "gst": 0.0,
+            "total": total,
+            "advance": 0.0,
+            "tds": 0.0,
+            "retention": 0.0,
+            "netPayable": total,
+            "paid": 0.0,
+            "balance": total,
+        }
+
+    app_data = {
+        "_settings": {"exchangeRate": 83.0, "customColumns": []},
+        "ClientA": {
+            "active": True,
+            "excess": 0.0,
+            "invoices": [_legacy_invoice("INV-A-NEW", 500.0)],
+            "paymentHistory": [],
+            "poTerms": {},
+        },
+        "ClientB": {
+            "active": True,
+            "excess": 0.0,
+            "invoices": [_legacy_invoice("INV-B-1", 200.0)],
+            "paymentHistory": [],
+            "poTerms": {},
+        },
+    }
+    conn = sqlite3.connect(str(legacy_db))
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT, role TEXT)")
+    conn.execute("CREATE TABLE erp_data (id INTEGER PRIMARY KEY, json_data TEXT)")
+    conn.execute("INSERT INTO users VALUES (1, 'legacyadmin', 'pass', 'admin')")
+    conn.execute("INSERT INTO erp_data VALUES (1, ?)", (json.dumps(app_data),))
+    conn.commit()
+    conn.close()
+
+    _, SessionLocal = mig.open_target_session()
+    db = SessionLocal()
+    db.add(User(username="localadmin", hashed_password=mig.hash_password("secret"), role="admin"))
+    client_a = Client(name="ClientA", active=True, excess_funds=0.0)
+    client_c = Client(name="ClientC", active=True, excess_funds=0.0)
+    db.add(client_a)
+    db.add(client_c)
+    db.flush()
+    db.add(
+        Invoice(
+            client_id=client_a.id,
+            invoice_no="INV-A-OLD",
+            basic=10.0,
+            total=10.0,
+            net_payable=10.0,
+            balance=10.0,
+        )
+    )
+    db.add(
+        Invoice(
+            client_id=client_c.id,
+            invoice_no="INV-C-1",
+            basic=50.0,
+            total=50.0,
+            net_payable=50.0,
+            balance=50.0,
+        )
+    )
+    db.commit()
+    db.close()
+
+    mig.run_import(mode="merge", clients="ClientA", legacy_path=str(legacy_db))
+
+    db = SessionLocal()
+    names = sorted(c.name for c in db.query(Client).all())
+    assert names == ["ClientA", "ClientC"]
+
+    client_a_row = db.query(Client).filter(Client.name == "ClientA").one()
+    inv_nos = {inv.invoice_no for inv in db.query(Invoice).filter(Invoice.client_id == client_a_row.id).all()}
+    assert "INV-A-NEW" in inv_nos
+    assert "INV-A-OLD" not in inv_nos
+
+    assert db.query(User).filter(User.username == "localadmin").count() == 1
+    assert db.query(User).filter(User.username == "legacyadmin").count() == 0
+    db.close()

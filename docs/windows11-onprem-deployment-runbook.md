@@ -33,12 +33,21 @@ This runbook deploys AchintERP on one Windows 11 plant machine, with auto-start 
 
 ## 3) Auto-start after reboot
 
-Run in elevated PowerShell:
+Run once as Administrator (from the repo root):
 
-`.\scripts\windows\register-startup-task.ps1 -TaskName "AchintERP-AutoStart" -AppRoot C:\AchintERP -DelaySeconds 45`
+```cmd
+server.cmd install-startup
+```
+
+Or double-click `scripts\windows\register-startup-task.cmd` (also elevates).
+
+This registers scheduled task **AchintERP-AutoStart** (45s after boot) which runs `server.cmd start -Network`.
+
+Remove auto-start: `server.cmd remove-startup` or `scripts\windows\unregister-startup-task.cmd`
 
 Validation:
 - `Get-ScheduledTask -TaskName AchintERP-AutoStart | Format-List State,TaskName,Actions,Triggers`
+- Optional test without reboot: `Start-ScheduledTask -TaskName AchintERP-AutoStart` then `server.cmd status`
 - Reboot machine and confirm app returns on `http://localhost:3000`.
 
 ## 4) Power outage recovery (BIOS/UEFI)

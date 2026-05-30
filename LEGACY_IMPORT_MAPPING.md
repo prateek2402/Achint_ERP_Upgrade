@@ -115,3 +115,20 @@ The legacy database contains:
 - No dispatch items referencing missing invoice IDs
 - Recomputed client balances non-negative and internally consistent
 - Count reconciliation between source and target entities
+
+## Selective merge import (production clients only)
+
+Use `--mode merge` to replace **named clients only** in `erp_database.sqlite` without truncating the whole database. Other clients, and (by default) local users, are kept. Merge does **not** write `.legacy_import_once.marker` (startup auto-import is unchanged).
+
+```powershell
+# List clients in the legacy export
+.\venv\Scripts\python.exe migrate_sqlite.py list-clients --legacy-path old_erp.sqlite
+
+# Dry-run: validate names and write plan to legacy_import_status.json
+.\venv\Scripts\python.exe migrate_sqlite.py --mode merge --clients "BALCO,AM/NS Gujarat" --legacy-path old_erp.sqlite --dry-run
+
+# Apply merge (stop the server first; back up erp_database.sqlite)
+.\venv\Scripts\python.exe migrate_sqlite.py --mode merge --clients-file clients_to_import.txt --legacy-path old_erp.sqlite
+```
+
+Optional flags for merge: `--import-users`, `--import-settings` (both default off). Full replace remains the default: `migrate_sqlite.py` or `migrate_sqlite.py --mode replace --force`.
