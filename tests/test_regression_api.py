@@ -182,6 +182,73 @@ def test_auth_and_permission_guards(client: TestClient):
     assert as_admin.status_code == 200
 
 
+def test_admin_create_user_does_not_touch_invoice_advance_code(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+
+    created = client.post(
+        "/api/users",
+        json={"username": "new.user", "password": "NewUser@12345", "role": "user"},
+        headers=auth_header(token),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["id"] > 0
+
+    # The new row must be usable immediately; a server-side post-commit crash
+    # would leave the admin seeing a failed create while the username is taken.
+    new_login = client.post("/api/login", json={"username": "new.user", "password": "NewUser@12345"})
+    assert new_login.status_code == 200, new_login.text
+
+    duplicate = client.post(
+        "/api/users",
+        json={"username": "NEW.USER", "password": "NewUser@12345", "role": "user"},
+        headers=auth_header(token),
+    )
+    assert duplicate.status_code == 400
+
+
+def test_po_status_update_and_delete_guards(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    status = client.put(
+        "/api/purchase-orders/PO-001/status",
+        json={"is_completed": True, "is_hidden": False},
+        headers=auth_header(token),
+    )
+    assert status.status_code == 200, status.text
+
+    pos = client.get("/api/purchase-orders", headers=auth_header(token))
+    assert pos.status_code == 200, pos.text
+    po1 = next(p for p in pos.json() if p["po_no"] == "PO-001")
+    assert po1["is_completed"] is True
+
+    linked_delete = client.delete("/api/purchase-orders/PO-001", headers=auth_header(token))
+    assert linked_delete.status_code == 400
+    assert "linked to invoices" in linked_delete.json()["detail"]
+
+    empty_po = client.post("/api/purchase-orders", json={
+        "client_id": client_id,
+        "po_no": "PO-EMPTY",
+        "contact_person": "Ops",
+        "project_name": "Empty",
+        "adv_pct": 0.0,
+        "ret_pct": 0.0,
+        "ret_base": "total",
+        "tds_enabled": False,
+        "tds_rate": 0.0,
+        "tds_threshold": 0.0,
+        "baseline_items": [],
+    }, headers=auth_header(token))
+    assert empty_po.status_code == 200, empty_po.text
+
+    empty_delete = client.delete("/api/purchase-orders/PO-EMPTY", headers=auth_header(token))
+    assert empty_delete.status_code == 200, empty_delete.text
+
+    pos_after = client.get("/api/purchase-orders", headers=auth_header(token))
+    assert pos_after.status_code == 200, pos_after.text
+    assert not any(p["po_no"] == "PO-EMPTY" for p in pos_after.json())
+
+
 def test_payment_allocations_use_invid_field(client: TestClient):
     """Locks the /api/payments allocation contract so the SPA Payment Log cell keeps working.
 
