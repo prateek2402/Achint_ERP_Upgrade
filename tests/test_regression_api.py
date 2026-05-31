@@ -1215,3 +1215,56 @@ def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
     assert db.query(User).filter(User.username == "localadmin").count() == 1
     assert db.query(User).filter(User.username == "legacyadmin").count() == 0
     db.close()
+
+
+def test_startup_legacy_import_does_not_replace_non_empty_database(tmp_path, monkeypatch):
+    import json
+    import sqlite3
+
+    from models import Client, User
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old_erp.sqlite"
+    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
+    monkeypatch.setenv("LEGACY_DB_PATH", str(legacy_db))
+    monkeypatch.chdir(tmp_path)
+
+    legacy_data = {
+        "_settings": {"exchangeRate": 83.0, "customColumns": []},
+        "LEGACY-CLIENT": {
+            "active": True,
+            "excess": 0.0,
+            "invoices": [],
+            "paymentHistory": [],
+            "poTerms": {},
+        },
+    }
+    conn = sqlite3.connect(str(legacy_db))
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT, role TEXT)")
+    conn.execute("CREATE TABLE erp_data (id INTEGER PRIMARY KEY, json_data TEXT)")
+    conn.execute("INSERT INTO users VALUES (1, 'legacyadmin', 'pass', 'admin')")
+    conn.execute("INSERT INTO erp_data VALUES (1, ?)", (json.dumps(legacy_data),))
+    conn.commit()
+    conn.close()
+
+    test_engine = create_engine(f"sqlite:///{target_db}", connect_args={"check_same_thread": False})
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+    Base.metadata.create_all(bind=test_engine)
+    monkeypatch.setattr(app_module, "SessionLocal", TestingSessionLocal)
+    monkeypatch.setattr(app_module, "DB_FILE_PATH", Path(target_db))
+
+    db = TestingSessionLocal()
+    db.add(User(username="liveadmin", hashed_password=app_module.hash_password("secret"), role="admin"))
+    db.add(Client(name="LIVE-CLIENT", active=True, excess_funds=0.0))
+    db.commit()
+    db.close()
+
+    app_module._maybe_run_legacy_import()
+
+    db = TestingSessionLocal()
+    assert db.query(Client).filter(Client.name == "LIVE-CLIENT").count() == 1
+    assert db.query(User).filter(User.username == "liveadmin").count() == 1
+    assert db.query(Client).filter(Client.name == "LEGACY-CLIENT").count() == 0
+    assert db.query(User).filter(User.username == "legacyadmin").count() == 0
+    db.close()
+    assert not (tmp_path / ".legacy_import_once.marker").exists()
