@@ -223,7 +223,10 @@ Base.metadata.create_all(bind=engine)
 
 
 def _maybe_run_legacy_import():
-    """Import legacy ERP snapshot on first boot when old_erp.sqlite is present."""
+    """Import legacy ERP snapshot on first boot when explicitly enabled."""
+    auto_import = os.getenv("LEGACY_AUTO_IMPORT", "0").strip().lower()
+    if auto_import not in {"1", "true", "yes", "on"}:
+        return
     legacy_path = Path(os.getenv("LEGACY_DB_PATH", "old_erp.sqlite"))
     marker = Path(".legacy_import_once.marker")
     if not legacy_path.exists():
