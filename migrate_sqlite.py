@@ -141,7 +141,6 @@ def truncate_target_tables(db):
     db.query(Client).delete()
     db.query(User).delete()
     db.query(SystemSettings).delete()
-    db.commit()
 
 
 def empty_counts() -> dict:
@@ -693,8 +692,6 @@ def run_import(
     try:
         if mode == "replace":
             truncate_target_tables(db)
-        else:
-            db.commit()
 
         if do_settings:
             import_settings_block(db, app_data)
@@ -730,7 +727,6 @@ def run_import(
                 assert_no_global_collisions(db, data, exclude_client_id=exclude_id)
                 if existing:
                     delete_client_for_reimport(db, existing)
-                    db.commit()
 
             block = import_client_block(db, client_name, data, used_payment_ids)
             merge_counts(report, block)

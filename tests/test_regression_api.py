@@ -1,4 +1,6 @@
 import datetime
+import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -180,6 +182,16 @@ def test_auth_and_permission_guards(client: TestClient):
     # Admin happy path still works.
     as_admin = client.post("/api/clients", json={"name": "OK-CLIENT"}, headers=auth_header(admin_token))
     assert as_admin.status_code == 200
+
+    # Admin can create a user and the created account can authenticate.
+    create_user = client.post(
+        "/api/users",
+        json={"username": "new.user", "password": "NewUser@12345", "role": "user"},
+        headers=auth_header(admin_token),
+    )
+    assert create_user.status_code == 200, create_user.text
+    assert create_user.json()["success"] is True
+    assert login(client, "new.user", "NewUser@12345")
 
 
 def test_payment_allocations_use_invid_field(client: TestClient):
@@ -1116,10 +1128,184 @@ def test_payment_allocate_validation_edge_case(client: TestClient):
     assert "greater than zero" in res.json()["detail"].lower()
 
 
-def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
-    import json
-    import sqlite3
+def _legacy_invoice_payload(no: str, total: float = 100.0) -> dict:
+    return {
+        "id": no,
+        "poNo": "UNASSIGNED",
+        "invDate": "2026-01-01",
+        "dueDate": "2026-02-01",
+        "basic": total,
+        "gst": 0.0,
+        "total": total,
+        "advance": 0.0,
+        "tds": 0.0,
+        "retention": 0.0,
+        "netPayable": total,
+        "paid": 0.0,
+        "balance": total,
+    }
 
+
+def _write_legacy_snapshot(db_path: Path, app_data: dict, users: list[tuple] | None = None) -> None:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT, role TEXT)")
+        conn.execute("CREATE TABLE erp_data (id INTEGER PRIMARY KEY, json_data TEXT)")
+        for idx, row in enumerate(users or [], start=1):
+            username, password, role = row
+            conn.execute("INSERT INTO users VALUES (?, ?, ?, ?)", (idx, username, password, role))
+        conn.execute("INSERT INTO erp_data VALUES (1, ?)", (json.dumps(app_data),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_startup_legacy_import_requires_explicit_opt_in(tmp_path, monkeypatch):
+    import migrate_sqlite as mig
+
+    legacy_db = tmp_path / "old_erp.sqlite"
+    legacy_db.write_bytes(b"placeholder")
+    calls = []
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEGACY_DB_PATH", str(legacy_db))
+    monkeypatch.delenv("LEGACY_AUTO_IMPORT", raising=False)
+    monkeypatch.setattr(mig, "run_import", lambda force=False: calls.append(force))
+
+    app_module._maybe_run_legacy_import()
+    assert calls == []
+
+    monkeypatch.setenv("LEGACY_AUTO_IMPORT", "1")
+    app_module._maybe_run_legacy_import()
+    assert calls == [False]
+
+
+def test_replace_import_failure_rolls_back_existing_data(tmp_path, monkeypatch):
+    import migrate_sqlite as mig
+    from models import Client, Invoice, User
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old.sqlite"
+    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
+    monkeypatch.chdir(tmp_path)
+    _write_legacy_snapshot(
+        legacy_db,
+        {
+            "_settings": {"exchangeRate": 83.0, "customColumns": []},
+            "ClientA": {
+                "active": True,
+                "excess": 0.0,
+                "invoices": [_legacy_invoice_payload("INV-A-NEW", 500.0)],
+                "paymentHistory": [],
+                "poTerms": {},
+            },
+        },
+    )
+
+    _, SessionLocal = mig.open_target_session()
+    db = SessionLocal()
+    db.add(User(username="localadmin", hashed_password=mig.hash_password("secret"), role="admin"))
+    existing = Client(name="ExistingClient", active=True, excess_funds=0.0)
+    db.add(existing)
+    db.flush()
+    db.add(
+        Invoice(
+            client_id=existing.id,
+            invoice_no="INV-EXISTING",
+            basic=10.0,
+            total=10.0,
+            net_payable=10.0,
+            balance=10.0,
+        )
+    )
+    db.commit()
+    db.close()
+
+    def fail_import(*_args, **_kwargs):
+        raise RuntimeError("simulated import failure")
+
+    monkeypatch.setattr(mig, "import_client_block", fail_import)
+    with pytest.raises(RuntimeError, match="simulated import failure"):
+        mig.run_import(mode="replace", legacy_path=str(legacy_db), force=True)
+
+    db = SessionLocal()
+    assert db.query(User).filter(User.username == "localadmin").count() == 1
+    assert db.query(Client).filter(Client.name == "ExistingClient").count() == 1
+    assert db.query(Invoice).filter(Invoice.invoice_no == "INV-EXISTING").count() == 1
+    assert not mig.RUN_MARKER_PATH.exists()
+    db.close()
+
+
+def test_merge_import_failure_rolls_back_deleted_client(tmp_path, monkeypatch):
+    import migrate_sqlite as mig
+    from models import Client, Invoice
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old.sqlite"
+    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
+    monkeypatch.chdir(tmp_path)
+    _write_legacy_snapshot(
+        legacy_db,
+        {
+            "_settings": {"exchangeRate": 83.0, "customColumns": []},
+            "ClientA": {
+                "active": True,
+                "excess": 0.0,
+                "invoices": [_legacy_invoice_payload("INV-A-NEW", 500.0)],
+                "paymentHistory": [],
+                "poTerms": {},
+            },
+        },
+    )
+
+    _, SessionLocal = mig.open_target_session()
+    db = SessionLocal()
+    client_a = Client(name="ClientA", active=True, excess_funds=0.0)
+    client_c = Client(name="ClientC", active=True, excess_funds=0.0)
+    db.add(client_a)
+    db.add(client_c)
+    db.flush()
+    db.add(
+        Invoice(
+            client_id=client_a.id,
+            invoice_no="INV-A-OLD",
+            basic=10.0,
+            total=10.0,
+            net_payable=10.0,
+            balance=10.0,
+        )
+    )
+    db.add(
+        Invoice(
+            client_id=client_c.id,
+            invoice_no="INV-C-1",
+            basic=50.0,
+            total=50.0,
+            net_payable=50.0,
+            balance=50.0,
+        )
+    )
+    db.commit()
+    db.close()
+
+    def fail_import(*_args, **_kwargs):
+        raise RuntimeError("simulated merge failure")
+
+    monkeypatch.setattr(mig, "import_client_block", fail_import)
+    with pytest.raises(RuntimeError, match="simulated merge failure"):
+        mig.run_import(mode="merge", clients="ClientA", legacy_path=str(legacy_db))
+
+    db = SessionLocal()
+    names = sorted(c.name for c in db.query(Client).all())
+    assert names == ["ClientA", "ClientC"]
+    client_a_row = db.query(Client).filter(Client.name == "ClientA").one()
+    inv_nos = {inv.invoice_no for inv in db.query(Invoice).filter(Invoice.client_id == client_a_row.id).all()}
+    assert inv_nos == {"INV-A-OLD"}
+    assert db.query(Invoice).filter(Invoice.invoice_no == "INV-A-NEW").count() == 0
+    db.close()
+
+
+def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
     import migrate_sqlite as mig
     from models import Client, Invoice, User
 
@@ -1128,47 +1314,24 @@ def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
     monkeypatch.chdir(tmp_path)
 
-    def _legacy_invoice(no: str, total: float = 100.0) -> dict:
-        return {
-            "id": no,
-            "poNo": "UNASSIGNED",
-            "invDate": "2026-01-01",
-            "dueDate": "2026-02-01",
-            "basic": total,
-            "gst": 0.0,
-            "total": total,
-            "advance": 0.0,
-            "tds": 0.0,
-            "retention": 0.0,
-            "netPayable": total,
-            "paid": 0.0,
-            "balance": total,
-        }
-
     app_data = {
         "_settings": {"exchangeRate": 83.0, "customColumns": []},
         "ClientA": {
             "active": True,
             "excess": 0.0,
-            "invoices": [_legacy_invoice("INV-A-NEW", 500.0)],
+            "invoices": [_legacy_invoice_payload("INV-A-NEW", 500.0)],
             "paymentHistory": [],
             "poTerms": {},
         },
         "ClientB": {
             "active": True,
             "excess": 0.0,
-            "invoices": [_legacy_invoice("INV-B-1", 200.0)],
+            "invoices": [_legacy_invoice_payload("INV-B-1", 200.0)],
             "paymentHistory": [],
             "poTerms": {},
         },
     }
-    conn = sqlite3.connect(str(legacy_db))
-    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT, role TEXT)")
-    conn.execute("CREATE TABLE erp_data (id INTEGER PRIMARY KEY, json_data TEXT)")
-    conn.execute("INSERT INTO users VALUES (1, 'legacyadmin', 'pass', 'admin')")
-    conn.execute("INSERT INTO erp_data VALUES (1, ?)", (json.dumps(app_data),))
-    conn.commit()
-    conn.close()
+    _write_legacy_snapshot(legacy_db, app_data, users=[("legacyadmin", "pass", "admin")])
 
     _, SessionLocal = mig.open_target_session()
     db = SessionLocal()
