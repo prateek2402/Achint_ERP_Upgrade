@@ -182,6 +182,60 @@ def test_auth_and_permission_guards(client: TestClient):
     assert as_admin.status_code == 200
 
 
+def test_admin_create_user_returns_success_and_created_user_can_login(client: TestClient):
+    admin_token = login(client, "admin", "Admin@1234")
+
+    created = client.post(
+        "/api/users",
+        json={"username": "new.operator", "password": "NewUser@1234", "role": "user"},
+        headers=auth_header(admin_token),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["success"] is True
+
+    new_token = login(client, "new.operator", "NewUser@1234")
+    assert new_token
+
+
+def test_purchase_order_status_and_delete_admin_paths(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    status = client.put(
+        "/api/purchase-orders/PO-001/status",
+        json={"is_completed": True, "is_hidden": False},
+        headers=auth_header(token),
+    )
+    assert status.status_code == 200, status.text
+
+    pos = client.get("/api/purchase-orders", headers=auth_header(token))
+    assert pos.status_code == 200, pos.text
+    po = next(p for p in pos.json() if p["po_no"] == "PO-001")
+    assert po["is_completed"] is True
+    assert po["completed_at"]
+
+    deletable_po = client.post(
+        "/api/purchase-orders",
+        json={
+            "client_id": client_id,
+            "po_no": "PO-DELETE",
+            "contact_person": "Ops",
+            "project_name": "Disposable",
+            "adv_pct": 0.0,
+            "ret_pct": 0.0,
+            "baseline_items": [],
+        },
+        headers=auth_header(token),
+    )
+    assert deletable_po.status_code == 200, deletable_po.text
+
+    deleted = client.delete("/api/purchase-orders/PO-DELETE", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+    pos_after_delete = client.get("/api/purchase-orders", headers=auth_header(token))
+    assert pos_after_delete.status_code == 200
+    assert all(p["po_no"] != "PO-DELETE" for p in pos_after_delete.json())
+
+
 def test_payment_allocations_use_invid_field(client: TestClient):
     """Locks the /api/payments allocation contract so the SPA Payment Log cell keeps working.
 
@@ -720,6 +774,75 @@ def test_po_advance_auto_apply_existing_and_new_invoices(client: TestClient):
     invs2 = client.get("/api/invoices", headers=auth_header(token)).json()
     inv3 = next(i for i in invs2 if i["id"] == "INV-ADV-3")
     assert inv3["advance"] == pytest.approx(40.0, abs=0.05)
+
+
+def test_po_advance_rebalances_when_terms_shrink(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    adv_pay = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-PO-ADV-SHRINK-1",
+        "date": datetime.date.today().isoformat(),
+        "amount": 400.0,
+        "note": "po advance add",
+        "mode": "targeted",
+        "targets": [],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "move_to_po": "PO-001",
+        "po_no": "PO-001",
+        "clear_po_pool": False,
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert adv_pay.status_code == 200, adv_pay.text
+
+    invs_before = client.get("/api/invoices", headers=auth_header(token)).json()
+    inv_before = next(i for i in invs_before if i["id"] == "INV-001")
+    assert inv_before["advance"] == pytest.approx(50.0, abs=0.01)
+
+    update_po = client.post("/api/purchase-orders", json={
+        "client_id": client_id,
+        "po_no": "PO-001",
+        "contact_person": "Ops",
+        "project_name": "Kiln",
+        "adv_pct": 2.0,
+        "ret_pct": 2.0,
+        "ret_base": "basic",
+        "tds_enabled": True,
+        "tds_rate": 0.1,
+        "tds_threshold": 5000.0,
+        "baseline_items": [
+            {"description": "Brick A", "ordered_qty": 100, "inspected_qty": 0, "uom": "Nos", "material_type": "brick"},
+            {"description": "Castable B", "ordered_qty": 10, "inspected_qty": 0, "uom": "Bags", "material_type": "castable_mortar"},
+        ],
+    }, headers=auth_header(token))
+    assert update_po.status_code == 200, update_po.text
+
+    invs_after = client.get("/api/invoices", headers=auth_header(token)).json()
+    inv_after = next(i for i in invs_after if i["id"] == "INV-001")
+    assert inv_after["advance"] == pytest.approx(20.0, abs=0.01)
+
+    pools = client.get(f"/api/clients/{client_id}/po-advance-pools", headers=auth_header(token))
+    assert pools.status_code == 200, pools.text
+    po_pool = next(p for p in pools.json()["pools"] if p["po_no"] == "PO-001")
+    assert po_pool["pool_remaining"] == pytest.approx(380.0, abs=0.01)
+    assert po_pool["lots"][0]["applied_from_lot"] == pytest.approx(20.0, abs=0.01)
+
+    db = app_module.SessionLocal()
+    try:
+        applied = db.query(app_module.PaymentAllocation).filter(
+            app_module.PaymentAllocation.alloc_type == "po_advance_applied",
+            app_module.PaymentAllocation.target_po_no == "PO-001",
+            app_module.PaymentAllocation.target_inv_id == "INV-001",
+        ).all()
+        assert sum(float(a.amount or 0.0) for a in applied) == pytest.approx(20.0, abs=0.01)
+    finally:
+        db.close()
 
 
 def test_po_advance_pools_api_and_manual_recalculate(client: TestClient):
