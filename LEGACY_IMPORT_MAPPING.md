@@ -118,7 +118,7 @@ The legacy database contains:
 
 ## Selective merge import (production clients only)
 
-Use `--mode merge` to replace **named clients only** in `erp_database.sqlite` without truncating the whole database. Other clients, and (by default) local users, are kept. Merge does **not** write `.legacy_import_once.marker` (startup auto-import is unchanged).
+Use `--mode merge` to replace **named clients only** in `erp_database.sqlite` without truncating the whole database. Other clients, and (by default) local users, are kept. Merge does **not** write `.legacy_import_once.marker`; startup auto-import is disabled unless `LEGACY_AUTO_IMPORT=1` is explicitly set.
 
 ```powershell
 # List clients in the legacy export
