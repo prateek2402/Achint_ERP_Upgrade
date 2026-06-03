@@ -222,21 +222,31 @@ _write_serialization_lock = threading.Lock()
 Base.metadata.create_all(bind=engine)
 
 
+def _env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _maybe_run_legacy_import():
-    """Import legacy ERP snapshot on first boot when old_erp.sqlite is present."""
+    """Optionally import a legacy ERP snapshot on first boot."""
     legacy_path = Path(os.getenv("LEGACY_DB_PATH", "old_erp.sqlite"))
     marker = Path(".legacy_import_once.marker")
+    if not _env_flag_enabled("LEGACY_AUTO_IMPORT"):
+        if legacy_path.exists() and not marker.exists():
+            log.warning(
+                "legacy ERP data file found at %s, but startup import is disabled; "
+                "run migrate_sqlite.py explicitly or set LEGACY_AUTO_IMPORT=1",
+                legacy_path,
+            )
+        return
     if not legacy_path.exists():
         return
     if marker.exists():
         return
-    try:
-        from migrate_sqlite import run_import
 
-        run_import(force=False)
-        log.info("legacy ERP data imported from %s", legacy_path)
-    except Exception as exc:
-        log.exception("legacy import failed: %s", exc)
+    from migrate_sqlite import run_import
+
+    run_import(force=False)
+    log.info("legacy ERP data imported from %s", legacy_path)
 
 
 def ensure_schema_columns():
