@@ -230,6 +230,31 @@ def _maybe_run_legacy_import():
         return
     if marker.exists():
         return
+    db = SessionLocal()
+    try:
+        watched_models = (
+            User,
+            Client,
+            PurchaseOrder,
+            PoBaselineItem,
+            InvoiceDispatchItem,
+            Invoice,
+            PaymentHistory,
+            PaymentAllocation,
+            SystemSettings,
+            UnallocatedPaymentRegister,
+            UnallocatedAdvanceRegister,
+        )
+        for model in watched_models:
+            if db.query(model.id).first() is not None:
+                log.warning(
+                    "legacy import skipped because target database already contains %s rows; "
+                    "run migrate_sqlite.py explicitly if a replace import is intended",
+                    model.__tablename__,
+                )
+                return
+    finally:
+        db.close()
     try:
         from migrate_sqlite import run_import
 
