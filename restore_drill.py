@@ -138,8 +138,16 @@ def check_sqlite_openable(db_path: Path) -> dict:
 def _import_app_against_sandbox(sandbox_db: Path):
     """Set env, then import main + override SessionLocal/engine to point at sandbox."""
     os.environ["APP_DATABASE_URL"] = f"sqlite:///{sandbox_db.as_posix()}"
-    if "main" in sys.modules:
-        del sys.modules["main"]
+    for module_name in (
+        "main",
+        # Routers import dependencies from main at module import time; clear them
+        # with main so the sandbox app does not keep stale auth/session callables.
+        "routers.audit",
+        "routers.reconciliation",
+        "routers.health",
+    ):
+        if module_name in sys.modules:
+            del sys.modules[module_name]
 
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker

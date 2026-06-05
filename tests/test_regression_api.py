@@ -1116,6 +1116,195 @@ def test_payment_allocate_validation_edge_case(client: TestClient):
     assert "greater than zero" in res.json()["detail"].lower()
 
 
+def _write_legacy_db(path: Path, app_data: dict) -> None:
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT, role TEXT)")
+        conn.execute("CREATE TABLE erp_data (id INTEGER PRIMARY KEY, json_data TEXT)")
+        conn.execute("INSERT INTO users VALUES (1, 'legacyadmin', 'pass', 'admin')")
+        conn.execute("INSERT INTO erp_data VALUES (1, ?)", (json.dumps(app_data),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _legacy_invoice(no: str, total: float = 100.0, po_no: str = "UNASSIGNED") -> dict:
+    return {
+        "id": no,
+        "poNo": po_no,
+        "invDate": "2026-01-01",
+        "dueDate": "2026-02-01",
+        "basic": total,
+        "gst": 0.0,
+        "total": total,
+        "advance": 0.0,
+        "tds": 0.0,
+        "retention": 0.0,
+        "netPayable": total,
+        "paid": 0.0,
+        "balance": total,
+    }
+
+
+def test_startup_legacy_auto_import_skips_non_empty_target(tmp_path, monkeypatch):
+    import migrate_sqlite as mig
+    from models import Client
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old_erp.sqlite"
+    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
+    monkeypatch.setenv("LEGACY_DB_PATH", str(legacy_db))
+    monkeypatch.chdir(tmp_path)
+
+    _write_legacy_db(
+        legacy_db,
+        {
+            "_settings": {"exchangeRate": 83.0, "customColumns": []},
+            "LegacyClient": {
+                "active": True,
+                "excess": 0.0,
+                "invoices": [_legacy_invoice("LEGACY-INV", 500.0)],
+                "paymentHistory": [],
+                "poTerms": {},
+            },
+        },
+    )
+
+    engine, SessionLocal = mig.open_target_session()
+    db = SessionLocal()
+    try:
+        db.add(Client(name="LiveClient", active=True, excess_funds=0.0))
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(app_module, "SessionLocal", SessionLocal)
+
+    app_module._maybe_run_legacy_import()
+
+    db = SessionLocal()
+    try:
+        assert sorted(c.name for c in db.query(Client).all()) == ["LiveClient"]
+    finally:
+        db.close()
+        engine.dispose()
+    assert not (tmp_path / ".legacy_import_once.marker").exists()
+
+
+def test_replace_import_failure_rolls_back_existing_target_data(tmp_path, monkeypatch):
+    import migrate_sqlite as mig
+    from models import Client
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old.sqlite"
+    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
+    monkeypatch.chdir(tmp_path)
+
+    _write_legacy_db(
+        legacy_db,
+        {
+            "_settings": {"exchangeRate": 83.0, "customColumns": []},
+            "ClientA": {
+                "active": True,
+                "excess": 0.0,
+                "invoices": [_legacy_invoice("DUP-INV", 100.0)],
+                "paymentHistory": [],
+                "poTerms": {},
+            },
+            "ClientB": {
+                "active": True,
+                "excess": 0.0,
+                "invoices": [_legacy_invoice("DUP-INV", 200.0)],
+                "paymentHistory": [],
+                "poTerms": {},
+            },
+        },
+    )
+
+    engine, SessionLocal = mig.open_target_session()
+    db = SessionLocal()
+    try:
+        db.add(Client(name="LiveClient", active=True, excess_funds=0.0))
+        db.commit()
+    finally:
+        db.close()
+
+    with pytest.raises(Exception):
+        mig.run_import(mode="replace", legacy_path=str(legacy_db), force=True)
+
+    db = SessionLocal()
+    try:
+        assert sorted(c.name for c in db.query(Client).all()) == ["LiveClient"]
+    finally:
+        db.close()
+        engine.dispose()
+    assert not (tmp_path / ".legacy_import_once.marker").exists()
+
+
+def test_merge_import_failure_rolls_back_existing_client_delete(tmp_path, monkeypatch):
+    import migrate_sqlite as mig
+    from models import Client, Invoice
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old.sqlite"
+    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
+    monkeypatch.chdir(tmp_path)
+
+    _write_legacy_db(
+        legacy_db,
+        {
+            "_settings": {"exchangeRate": 83.0, "customColumns": []},
+            "ClientA": {
+                "active": True,
+                "excess": 0.0,
+                "invoices": [_legacy_invoice("INV-A-NEW", 500.0)],
+                "paymentHistory": [],
+                "poTerms": {},
+            },
+        },
+    )
+
+    engine, SessionLocal = mig.open_target_session()
+    db = SessionLocal()
+    try:
+        client_a = Client(name="ClientA", active=True, excess_funds=0.0)
+        db.add(client_a)
+        db.flush()
+        db.add(
+            Invoice(
+                client_id=client_a.id,
+                invoice_no="INV-A-OLD",
+                basic=10.0,
+                total=10.0,
+                net_payable=10.0,
+                balance=10.0,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    def fail_after_existing_client_delete(*args, **kwargs):
+        raise RuntimeError("simulated import failure after delete")
+
+    monkeypatch.setattr(mig, "import_client_block", fail_after_existing_client_delete)
+
+    with pytest.raises(RuntimeError, match="simulated import failure"):
+        mig.run_import(mode="merge", clients="ClientA", legacy_path=str(legacy_db))
+
+    db = SessionLocal()
+    try:
+        client_a = db.query(Client).filter(Client.name == "ClientA").one()
+        inv_nos = {inv.invoice_no for inv in db.query(Invoice).filter(Invoice.client_id == client_a.id).all()}
+        assert inv_nos == {"INV-A-OLD"}
+    finally:
+        db.close()
+        engine.dispose()
+
+
 def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
     import json
     import sqlite3

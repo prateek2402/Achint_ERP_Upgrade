@@ -141,7 +141,6 @@ def truncate_target_tables(db):
     db.query(Client).delete()
     db.query(User).delete()
     db.query(SystemSettings).delete()
-    db.commit()
 
 
 def empty_counts() -> dict:
@@ -229,6 +228,11 @@ def assert_no_global_collisions(db, data: dict, exclude_client_id: int | None = 
     for po_no in (data.get("poTerms") or {}).keys():
         p = str(po_no or "").strip()
         if p:
+            po_nos.append(p)
+    for inv in data.get("invoices") or []:
+        inv = inv or {}
+        p = str(inv.get("poNo") or "").strip()
+        if p and p != "UNASSIGNED":
             po_nos.append(p)
 
     if invoice_nos:
@@ -730,7 +734,6 @@ def run_import(
                 assert_no_global_collisions(db, data, exclude_client_id=exclude_id)
                 if existing:
                     delete_client_for_reimport(db, existing)
-                    db.commit()
 
             block = import_client_block(db, client_name, data, used_payment_ids)
             merge_counts(report, block)
