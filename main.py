@@ -222,6 +222,21 @@ _write_serialization_lock = threading.Lock()
 Base.metadata.create_all(bind=engine)
 
 
+def _target_database_has_rows() -> bool:
+    """Fail-safe guard for startup imports: any existing data means no auto-replace."""
+    db = SessionLocal()
+    try:
+        for model in (Client, PurchaseOrder, Invoice, PaymentHistory, User, SystemSettings):
+            if db.query(model.id).first() is not None:
+                return True
+        return False
+    except Exception as exc:
+        log.warning("legacy import skipped: could not verify target DB is empty: %s", exc)
+        return True
+    finally:
+        db.close()
+
+
 def _maybe_run_legacy_import():
     """Import legacy ERP snapshot on first boot when old_erp.sqlite is present."""
     legacy_path = Path(os.getenv("LEGACY_DB_PATH", "old_erp.sqlite"))
@@ -229,6 +244,12 @@ def _maybe_run_legacy_import():
     if not legacy_path.exists():
         return
     if marker.exists():
+        return
+    if _target_database_has_rows():
+        log.warning(
+            "legacy import skipped: %s exists but target database already contains data",
+            legacy_path,
+        )
         return
     try:
         from migrate_sqlite import run_import
@@ -899,6 +920,7 @@ class PaymentAllocateRequest(BaseModel):
     fund_source: str = "receipt"  # receipt | unallocated
     move_to_po: Optional[str] = None
     po_no: Optional[str] = None
+    source_po_nos: list[str] = []
     clear_po_pool: bool = False
     excess_action: str = "park"  # park | allocate_pending
     allow_overpayment: bool = False  # if True, allow allocating > invoice balance → negative balance
@@ -3309,6 +3331,81 @@ def rename_dispatch_column(payload: DispatchColumnRenameRequest, current_user: U
     }
 
 
+def _normalize_source_po_nos(values: list[str] | None) -> set[str]:
+    return {str(v or "").strip() for v in (values or []) if str(v or "").strip()}
+
+
+def _source_po_for_unallocated_register(db: Session, reg: UnallocatedPaymentRegister) -> str:
+    _source, inv_no, po_no, _rest = _parse_unallocated_register_note(reg.note)
+    if po_no:
+        return po_no
+
+    source_pos: set[str] = set()
+    if inv_no:
+        inv = db.query(Invoice).filter(
+            Invoice.client_id == reg.client_id,
+            Invoice.invoice_no == inv_no,
+        ).first()
+        if inv and inv.po_id:
+            po = db.query(PurchaseOrder).filter(PurchaseOrder.id == inv.po_id).first()
+            if po and po.po_no:
+                source_pos.add(po.po_no)
+
+    if reg.source_payment_id:
+        allocations = db.query(PaymentAllocation).filter(
+            PaymentAllocation.payment_id == reg.source_payment_id
+        ).all()
+        inv_ids = [a.target_inv_id for a in allocations if a.target_inv_id]
+        if inv_ids:
+            rows = (
+                db.query(Invoice, PurchaseOrder)
+                .outerjoin(PurchaseOrder, Invoice.po_id == PurchaseOrder.id)
+                .filter(Invoice.client_id == reg.client_id, Invoice.invoice_no.in_(inv_ids))
+                .all()
+            )
+            for _inv, po in rows:
+                source_pos.add(po.po_no if po and po.po_no else "UNASSIGNED")
+        for alloc in allocations:
+            if alloc.target_po_no:
+                source_pos.add(alloc.target_po_no)
+
+    if len(source_pos) == 1:
+        return next(iter(source_pos))
+    if len(source_pos) > 1:
+        return "MULTI"
+    return "UNASSIGNED"
+
+
+def _open_unallocated_registers(
+    db: Session,
+    client_id: int,
+    source_po_nos: set[str] | None = None,
+) -> list[UnallocatedPaymentRegister]:
+    regs = (
+        db.query(UnallocatedPaymentRegister)
+        .filter(
+            UnallocatedPaymentRegister.client_id == client_id,
+            UnallocatedPaymentRegister.status == "open",
+            UnallocatedPaymentRegister.balance > 0,
+        )
+        .order_by(UnallocatedPaymentRegister.id.asc())
+        .all()
+    )
+    if not source_po_nos:
+        return regs
+    return [reg for reg in regs if _source_po_for_unallocated_register(db, reg) in source_po_nos]
+
+
+def _available_unallocated_register_balance(
+    db: Session,
+    client_id: int,
+    source_po_nos: set[str] | None = None,
+) -> float:
+    return round_inr_nearest(
+        sum(float(reg.balance or 0.0) for reg in _open_unallocated_registers(db, client_id, source_po_nos))
+    )
+
+
 @app.post("/api/payments/allocate")
 def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if current_user.role != "admin":
@@ -3355,7 +3452,12 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
 
-    available_unallocated = float(client.excess_funds or 0.0)
+    source_po_nos = _normalize_source_po_nos(payment.source_po_nos)
+    available_unallocated = (
+        _available_unallocated_register_balance(db, payment.client_id, source_po_nos)
+        if source_po_nos and payment.fund_source == "unallocated"
+        else float(client.excess_funds or 0.0)
+    )
     if payment.fund_source == "unallocated":
         if available_unallocated <= 0:
             raise HTTPException(status_code=400, detail="No unallocated funds available.")
@@ -3585,7 +3687,7 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
         _auto_apply_po_advance(payment.client_id, db, payment.move_to_po.strip())
 
     if payment.fund_source == "unallocated" and payment_amount > 0:
-        _drain_unallocated_register(db, payment.client_id, payment_amount)
+        _drain_unallocated_register(db, payment.client_id, payment_amount, source_po_nos=source_po_nos)
 
     db.commit()
     recalculate_client_ledger(payment.client_id, db)
@@ -3661,21 +3763,18 @@ def _build_unallocated_register_note(source_kind: str, raw_note: Optional[str], 
     return f"[{payload}] {tail}".strip()
 
 
-def _drain_unallocated_register(db: Session, client_id: int, amount: float) -> None:
+def _drain_unallocated_register(
+    db: Session,
+    client_id: int,
+    amount: float,
+    *,
+    source_po_nos: set[str] | None = None,
+) -> None:
     """Consume open register balances FIFO when drawing from the unallocated pool."""
     to_deduct = round_inr_nearest(max(0.0, float(amount or 0.0)))
     if to_deduct <= 0:
         return
-    open_regs = (
-        db.query(UnallocatedPaymentRegister)
-        .filter(
-            UnallocatedPaymentRegister.client_id == client_id,
-            UnallocatedPaymentRegister.status == "open",
-            UnallocatedPaymentRegister.balance > 0,
-        )
-        .order_by(UnallocatedPaymentRegister.id.asc())
-        .all()
-    )
+    open_regs = _open_unallocated_registers(db, client_id, source_po_nos)
     for reg in open_regs:
         if to_deduct <= 0:
             break
@@ -3686,6 +3785,9 @@ def _drain_unallocated_register(db: Session, client_id: int, amount: float) -> N
             reg.balance = 0.0
             reg.status = "used"
         to_deduct = round_inr_nearest(to_deduct - take)
+    if to_deduct > 0.009:
+        scope = f" for PO filter {', '.join(sorted(source_po_nos))}" if source_po_nos else ""
+        raise HTTPException(status_code=400, detail=f"Insufficient unallocated register balance{scope}.")
 
 
 def _restore_unallocated_register_consumption(
