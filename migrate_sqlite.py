@@ -100,7 +100,28 @@ def recalculate_client_ledger(client_id: int, db):
     inv_map = {inv.invoice_no: inv for inv in invoices}
 
     for inv in invoices:
-        inv.net_payable = (inv.total or 0.0) - (inv.advance_adj or 0.0)
+        if inv.is_note:
+            note_amt = abs(float(inv.total or 0.0))
+            note_type = str(inv.note_type or "").strip().upper()
+            inv.advance_adj = 0.0
+            inv.tds_ded = 0.0
+            inv.retention_held = 0.0
+            if note_type == "CN":
+                inv.net_payable = 0.0
+                inv.paid = 0.0
+                inv.balance = -note_amt
+                continue
+            if note_type == "DN":
+                inv.net_payable = note_amt
+                inv.paid = 0.0
+                inv.balance = note_amt
+                continue
+            inv.net_payable = 0.0
+            inv.paid = 0.0
+            inv.balance = float(inv.total or 0.0)
+            continue
+
+        inv.net_payable = max(0.0, (inv.total or 0.0) - (inv.advance_adj or 0.0) - (inv.tds_ded or 0.0))
         inv.paid = 0.0
         inv.balance = inv.net_payable
 
@@ -113,6 +134,8 @@ def recalculate_client_ledger(client_id: int, db):
         for al in allocations:
             if al.alloc_type == "invoice" and al.target_inv_id in inv_map:
                 inv = inv_map[al.target_inv_id]
+                if inv.is_note and str(inv.note_type or "").strip().upper() != "DN":
+                    continue
                 inv.paid += al.amount
                 inv.balance -= al.amount
             if al.alloc_type in ("invoice", "po_advance", "po_advance_applied", "note_allocation"):
@@ -141,7 +164,6 @@ def truncate_target_tables(db):
     db.query(Client).delete()
     db.query(User).delete()
     db.query(SystemSettings).delete()
-    db.commit()
 
 
 def empty_counts() -> dict:
@@ -693,8 +715,6 @@ def run_import(
     try:
         if mode == "replace":
             truncate_target_tables(db)
-        else:
-            db.commit()
 
         if do_settings:
             import_settings_block(db, app_data)
@@ -730,7 +750,6 @@ def run_import(
                 assert_no_global_collisions(db, data, exclude_client_id=exclude_id)
                 if existing:
                     delete_client_for_reimport(db, existing)
-                    db.commit()
 
             block = import_client_block(db, client_name, data, used_payment_ids)
             merge_counts(report, block)

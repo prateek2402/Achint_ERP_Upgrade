@@ -5757,6 +5757,8 @@
         async function moveUnallocatedToPO() {
             let unalloc = getPoFilteredUnallocatedAmount(currentClient);
             if (unalloc <= 0) return await customApplet({ title: "Error", message: "No unallocated funds available." });
+            const poFilterSet = getSelectedLedgerPoFilterSet();
+            const sourcePoNos = poFilterSet ? Array.from(poFilterSet) : [];
 
             let paymentNote = document.getElementById('paymentNote') ? document.getElementById('paymentNote').value.trim() : '';
 
@@ -5786,7 +5788,8 @@
                 apply_adv: false,
                 advance_only: false,
                 fund_source: 'unallocated',
-                move_to_po: poNo
+                move_to_po: poNo,
+                source_po_nos: sourcePoNos
             };
             try {
                 const response = await fetch('/api/payments/allocate', {
@@ -5809,6 +5812,8 @@
         async function applyUnallocatedToInvoices() {
             let unalloc = getPoFilteredUnallocatedAmount(currentClient);
             if (unalloc <= 0) return await customApplet({ title: "Error", message: "No unallocated funds available." });
+            const poFilterSet = getSelectedLedgerPoFilterSet();
+            const sourcePoNos = poFilterSet ? Array.from(poFilterSet) : [];
 
             let paymentNote = document.getElementById('paymentNote') ? document.getElementById('paymentNote').value.trim() : '';
             const checkboxes = document.querySelectorAll('.payment-check:checked');
@@ -5818,9 +5823,13 @@
             let onlyGst = document.getElementById('optOnlyGst') ? document.getElementById('optOnlyGst').checked : false;
             let targetInvoices = [];
             if (checkboxes.length === 0) {
-                let conf = await customApplet({ title: "Auto-Allocate Unallocated", message: `Auto-allocate ${formatCur(unalloc)} from Unallocated pool to all pending invoices (FIFO)?`, type: "confirm" });
+                const scopeText = sourcePoNos.length ? ` pending invoices for selected PO filter (${sourcePoNos.join(', ')})` : ' all pending invoices';
+                let conf = await customApplet({ title: "Auto-Allocate Unallocated", message: `Auto-allocate ${formatCur(unalloc)} from Unallocated pool to${scopeText} (FIFO)?`, type: "confirm" });
                 if (!conf) return;
-                targetInvoices = clientInvoices.filter(i => isPendingPaymentAllocatable(i)).sort((a, b) => compareInvoicesForLedger(a, b, true));
+                targetInvoices = clientInvoices
+                    .filter(i => isPendingPaymentAllocatable(i))
+                    .filter(i => !poFilterSet || !poFilterSet.size || poFilterSet.has(String(i.poNo || 'UNASSIGNED').trim() || 'UNASSIGNED'))
+                    .sort((a, b) => compareInvoicesForLedger(a, b, true));
             } else {
                 let conf = await customApplet({ title: "Allocate Unallocated", message: `Cascade up to ${formatCur(unalloc)} from Unallocated pool across the selected invoices?`, type: "confirm" });
                 if (!conf) return;
@@ -5828,6 +5837,9 @@
                     let inv = clientInvoices.find(i => i.id === chk.value);
                     if (inv) targetInvoices.push(inv);
                 });
+            }
+            if (!targetInvoices.length) {
+                return await customApplet({ title: "Notice", message: "No eligible invoices found for the selected PO filter." });
             }
             const targets = targetInvoices.map(inv => ({ inv_id: inv.id, amount: 0 }));
             const token = ErpAuth.getToken();
@@ -5839,14 +5851,15 @@
                 date: paymentDate,
                 amount: unalloc,
                 note: paymentNote,
-                mode: checkboxes.length > 0 ? 'targeted' : 'cascade',
+                mode: (checkboxes.length > 0 || sourcePoNos.length > 0) ? 'targeted' : 'cascade',
                 targets,
                 hold_ret: holdRet,
                 hold_gst: holdGst,
                 only_gst: onlyGst,
                 apply_adv: false,
                 advance_only: false,
-                fund_source: 'unallocated'
+                fund_source: 'unallocated',
+                source_po_nos: sourcePoNos
             };
 
             try {

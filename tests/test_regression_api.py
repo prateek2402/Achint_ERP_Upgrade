@@ -56,6 +56,19 @@ def auth_header(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def write_legacy_snapshot(path: Path, app_data: dict) -> None:
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT, role TEXT)")
+    conn.execute("CREATE TABLE erp_data (id INTEGER PRIMARY KEY, json_data TEXT)")
+    conn.execute("INSERT INTO users VALUES (1, 'legacyadmin', 'pass', 'admin')")
+    conn.execute("INSERT INTO erp_data VALUES (1, ?)", (json.dumps(app_data),))
+    conn.commit()
+    conn.close()
+
+
 def create_client_po_invoice(client: TestClient, token: str):
     c = client.post("/api/clients", json={"name": "ACME"}, headers=auth_header(token))
     assert c.status_code == 200, c.text
@@ -444,6 +457,117 @@ def test_reverse_unallocated_applied_restores_register_for_applet(client: TestCl
     ).json()
     open_after_reverse = [r for r in regs_after_reverse if r.get("status") == "open" and float(r.get("balance") or 0) > 0]
     assert sum(float(r["balance"]) for r in open_after_reverse) == pytest.approx(300.0, abs=0.02)
+
+
+def test_unallocated_source_po_scope_does_not_drain_other_po_registers(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "UNALLOC-SCOPE-CLIENT"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+
+    for inv_no, po_no, inv_date, total in [
+        ("INV-SCOPE-B", "PO-SCOPE-B", "2026-04-01", 1000.0),
+        ("INV-SCOPE-A", "PO-SCOPE-A", "2026-04-02", 1000.0),
+    ]:
+        inv = client.post(
+            "/api/invoices",
+            json={
+                "client_id": client_id,
+                "po_no": po_no,
+                "invoice_no": inv_no,
+                "sub_entity": "",
+                "lr_no": "",
+                "inv_date": inv_date,
+                "due_date": None,
+                "basic": total,
+                "gst": 0.0,
+                "total": total,
+                "advance_adj": 0.0,
+                "tds_ded": 0.0,
+                "retention_held": 0.0,
+                "net_payable": 0.0,
+                "paid": 0.0,
+                "balance": 0.0,
+                "is_note": False,
+                "note_type": None,
+                "note_reason": None,
+                "dispatch_items": [],
+            },
+            headers=auth_header(token),
+        )
+        assert inv.status_code == 200, inv.text
+
+    for pay_id, inv_no, amount, alloc_amount in [
+        ("PAY-SCOPE-B", "INV-SCOPE-B", 300.0, 100.0),
+        ("PAY-SCOPE-A", "INV-SCOPE-A", 250.0, 100.0),
+    ]:
+        seed = client.post(
+            "/api/payments/allocate",
+            json={
+                "client_id": client_id,
+                "id": pay_id,
+                "date": datetime.date.today().isoformat(),
+                "amount": amount,
+                "note": "seed scoped unallocated",
+                "mode": "targeted",
+                "targets": [{"inv_id": inv_no, "amount": alloc_amount}],
+                "hold_ret": False,
+                "hold_gst": False,
+                "only_gst": False,
+                "apply_adv": False,
+                "advance_only": False,
+                "fund_source": "receipt",
+                "move_to_po": None,
+                "po_no": None,
+                "clear_po_pool": False,
+                "excess_action": "park",
+            },
+            headers=auth_header(token),
+        )
+        assert seed.status_code == 200, seed.text
+
+    applied = client.post(
+        "/api/payments/allocate",
+        json={
+            "client_id": client_id,
+            "id": "PAY-SCOPE-APPLY-A",
+            "date": datetime.date.today().isoformat(),
+            "amount": 150.0,
+            "note": "apply only PO A pool",
+            "mode": "targeted",
+            "targets": [{"inv_id": "INV-SCOPE-A", "amount": 0.0}],
+            "hold_ret": False,
+            "hold_gst": False,
+            "only_gst": False,
+            "apply_adv": False,
+            "advance_only": False,
+            "fund_source": "unallocated",
+            "move_to_po": None,
+            "po_no": None,
+            "source_po_nos": ["PO-SCOPE-A"],
+            "clear_po_pool": False,
+            "excess_action": "park",
+        },
+        headers=auth_header(token),
+    )
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["unallocated_consumed"] == pytest.approx(150.0)
+
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    inv_a = next(i for i in invs if i["id"] == "INV-SCOPE-A")
+    inv_b = next(i for i in invs if i["id"] == "INV-SCOPE-B")
+    assert inv_a["paid"] == pytest.approx(250.0)
+    assert inv_b["paid"] == pytest.approx(100.0)
+
+    regs = client.get(
+        f"/api/registers/unallocated-payments?client_id={client_id}",
+        headers=auth_header(token),
+    ).json()
+    by_payment = {row["source_payment_id"]: row for row in regs}
+    assert by_payment["PAY-SCOPE-A"]["balance"] == pytest.approx(0.0)
+    assert by_payment["PAY-SCOPE-A"]["status"] == "used"
+    assert by_payment["PAY-SCOPE-B"]["balance"] == pytest.approx(200.0)
+    assert by_payment["PAY-SCOPE-B"]["status"] == "open"
 
 
 def test_delete_payment_unallocates_invoices_and_restores_balance(client: TestClient):
@@ -1214,4 +1338,116 @@ def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
 
     assert db.query(User).filter(User.username == "localadmin").count() == 1
     assert db.query(User).filter(User.username == "legacyadmin").count() == 0
+    db.close()
+
+
+def test_startup_legacy_import_skips_when_target_database_has_rows(tmp_path, monkeypatch):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    import migrate_sqlite as mig
+    from models import Base, Client
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old_erp.sqlite"
+    legacy_db.write_bytes(b"not read when target is populated")
+    monkeypatch.chdir(tmp_path)
+
+    test_engine = create_engine(f"sqlite:///{target_db}", connect_args={"check_same_thread": False})
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+    Base.metadata.create_all(bind=test_engine)
+    db = TestingSessionLocal()
+    db.add(Client(name="Live Client", active=True, excess_funds=0.0))
+    db.commit()
+    db.close()
+
+    called = False
+
+    def fail_if_called(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(app_module, "SessionLocal", TestingSessionLocal)
+    monkeypatch.setattr(mig, "run_import", fail_if_called)
+
+    app_module._maybe_run_legacy_import()
+
+    assert called is False
+
+
+def test_replace_import_failure_rolls_back_existing_database(tmp_path, monkeypatch):
+    import migrate_sqlite as mig
+    from models import Client, Invoice
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old.sqlite"
+    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
+    monkeypatch.chdir(tmp_path)
+    write_legacy_snapshot(
+        legacy_db,
+        {
+            "_settings": {"exchangeRate": 83.0, "customColumns": []},
+            "LegacyClient": {"active": True, "excess": 0.0, "invoices": [], "paymentHistory": [], "poTerms": {}},
+        },
+    )
+
+    _, SessionLocal = mig.open_target_session()
+    db = SessionLocal()
+    keep = Client(name="KeepMe", active=True, excess_funds=0.0)
+    db.add(keep)
+    db.flush()
+    db.add(Invoice(client_id=keep.id, invoice_no="INV-KEEP", basic=10.0, total=10.0, net_payable=10.0, balance=10.0))
+    db.commit()
+    db.close()
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("synthetic import failure")
+
+    monkeypatch.setattr(mig, "import_client_block", boom)
+
+    with pytest.raises(RuntimeError, match="synthetic import failure"):
+        mig.run_import(mode="replace", legacy_path=str(legacy_db))
+
+    db = SessionLocal()
+    assert db.query(Client).filter(Client.name == "KeepMe").count() == 1
+    assert db.query(Invoice).filter(Invoice.invoice_no == "INV-KEEP").count() == 1
+    db.close()
+
+
+def test_merge_import_failure_rolls_back_deleted_client(tmp_path, monkeypatch):
+    import migrate_sqlite as mig
+    from models import Client, Invoice
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old.sqlite"
+    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
+    monkeypatch.chdir(tmp_path)
+    write_legacy_snapshot(
+        legacy_db,
+        {
+            "_settings": {"exchangeRate": 83.0, "customColumns": []},
+            "ClientA": {"active": True, "excess": 0.0, "invoices": [], "paymentHistory": [], "poTerms": {}},
+        },
+    )
+
+    _, SessionLocal = mig.open_target_session()
+    db = SessionLocal()
+    client_a = Client(name="ClientA", active=True, excess_funds=0.0)
+    db.add(client_a)
+    db.flush()
+    db.add(Invoice(client_id=client_a.id, invoice_no="INV-A-OLD", basic=10.0, total=10.0, net_payable=10.0, balance=10.0))
+    db.commit()
+    db.close()
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("synthetic merge failure")
+
+    monkeypatch.setattr(mig, "import_client_block", boom)
+
+    with pytest.raises(RuntimeError, match="synthetic merge failure"):
+        mig.run_import(mode="merge", clients="ClientA", legacy_path=str(legacy_db))
+
+    db = SessionLocal()
+    assert db.query(Client).filter(Client.name == "ClientA").count() == 1
+    assert db.query(Invoice).filter(Invoice.invoice_no == "INV-A-OLD").count() == 1
     db.close()
