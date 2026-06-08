@@ -1116,10 +1116,61 @@ def test_payment_allocate_validation_edge_case(client: TestClient):
     assert "greater than zero" in res.json()["detail"].lower()
 
 
-def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
+def _legacy_invoice(no: str, total: float = 100.0) -> dict:
+    return {
+        "id": no,
+        "poNo": "UNASSIGNED",
+        "invDate": "2026-01-01",
+        "dueDate": "2026-02-01",
+        "basic": total,
+        "gst": 0.0,
+        "total": total,
+        "advance": 0.0,
+        "tds": 0.0,
+        "retention": 0.0,
+        "netPayable": total,
+        "paid": 0.0,
+        "balance": total,
+    }
+
+
+def _write_legacy_db(legacy_db: Path, app_data: dict) -> None:
     import json
     import sqlite3
 
+    conn = sqlite3.connect(str(legacy_db))
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT, role TEXT)")
+    conn.execute("CREATE TABLE erp_data (id INTEGER PRIMARY KEY, json_data TEXT)")
+    conn.execute("INSERT INTO users VALUES (1, 'legacyadmin', 'pass', 'admin')")
+    conn.execute("INSERT INTO erp_data VALUES (1, ?)", (json.dumps(app_data),))
+    conn.commit()
+    conn.close()
+
+
+def _seed_client_invoice(SessionLocal, name: str, invoice_no: str, total: float = 10.0) -> None:
+    from models import Client, Invoice
+
+    db = SessionLocal()
+    try:
+        client_row = Client(name=name, active=True, excess_funds=0.0)
+        db.add(client_row)
+        db.flush()
+        db.add(
+            Invoice(
+                client_id=client_row.id,
+                invoice_no=invoice_no,
+                basic=total,
+                total=total,
+                net_payable=total,
+                balance=total,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
     import migrate_sqlite as mig
     from models import Client, Invoice, User
 
@@ -1127,23 +1178,6 @@ def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
     legacy_db = tmp_path / "old.sqlite"
     monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
     monkeypatch.chdir(tmp_path)
-
-    def _legacy_invoice(no: str, total: float = 100.0) -> dict:
-        return {
-            "id": no,
-            "poNo": "UNASSIGNED",
-            "invDate": "2026-01-01",
-            "dueDate": "2026-02-01",
-            "basic": total,
-            "gst": 0.0,
-            "total": total,
-            "advance": 0.0,
-            "tds": 0.0,
-            "retention": 0.0,
-            "netPayable": total,
-            "paid": 0.0,
-            "balance": total,
-        }
 
     app_data = {
         "_settings": {"exchangeRate": 83.0, "customColumns": []},
@@ -1162,13 +1196,7 @@ def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
             "poTerms": {},
         },
     }
-    conn = sqlite3.connect(str(legacy_db))
-    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT, role TEXT)")
-    conn.execute("CREATE TABLE erp_data (id INTEGER PRIMARY KEY, json_data TEXT)")
-    conn.execute("INSERT INTO users VALUES (1, 'legacyadmin', 'pass', 'admin')")
-    conn.execute("INSERT INTO erp_data VALUES (1, ?)", (json.dumps(app_data),))
-    conn.commit()
-    conn.close()
+    _write_legacy_db(legacy_db, app_data)
 
     _, SessionLocal = mig.open_target_session()
     db = SessionLocal()
@@ -1215,3 +1243,147 @@ def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
     assert db.query(User).filter(User.username == "localadmin").count() == 1
     assert db.query(User).filter(User.username == "legacyadmin").count() == 0
     db.close()
+
+
+def test_replace_import_rolls_back_truncate_when_import_fails(tmp_path, monkeypatch):
+    import migrate_sqlite as mig
+    from models import Client, Invoice
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old.sqlite"
+    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
+    monkeypatch.chdir(tmp_path)
+    _write_legacy_db(
+        legacy_db,
+        {
+            "_settings": {"exchangeRate": 83.0, "customColumns": []},
+            "ClientNew": {
+                "active": True,
+                "excess": 0.0,
+                "invoices": [_legacy_invoice("INV-NEW", 500.0)],
+                "paymentHistory": [],
+                "poTerms": {},
+            },
+        },
+    )
+
+    _, SessionLocal = mig.open_target_session()
+    _seed_client_invoice(SessionLocal, "ExistingClient", "INV-EXISTING", 123.0)
+
+    def fail_import_client_block(*args, **kwargs):
+        raise RuntimeError("boom after truncate")
+
+    monkeypatch.setattr(mig, "import_client_block", fail_import_client_block)
+    with pytest.raises(RuntimeError, match="boom after truncate"):
+        mig.run_import(
+            mode="replace",
+            legacy_path=str(legacy_db),
+            force=True,
+            import_users=False,
+            import_settings=False,
+        )
+
+    db = SessionLocal()
+    try:
+        assert db.query(Client).filter(Client.name == "ExistingClient").count() == 1
+        assert db.query(Invoice).filter(Invoice.invoice_no == "INV-EXISTING").count() == 1
+        assert db.query(Client).filter(Client.name == "ClientNew").count() == 0
+    finally:
+        db.close()
+
+
+def test_merge_import_rolls_back_existing_client_delete_when_import_fails(tmp_path, monkeypatch):
+    import migrate_sqlite as mig
+    from models import Client, Invoice
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old.sqlite"
+    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
+    monkeypatch.chdir(tmp_path)
+    _write_legacy_db(
+        legacy_db,
+        {
+            "_settings": {"exchangeRate": 83.0, "customColumns": []},
+            "ClientA": {
+                "active": True,
+                "excess": 0.0,
+                "invoices": [_legacy_invoice("INV-A-NEW", 500.0)],
+                "paymentHistory": [],
+                "poTerms": {},
+            },
+        },
+    )
+
+    _, SessionLocal = mig.open_target_session()
+    _seed_client_invoice(SessionLocal, "ClientA", "INV-A-OLD", 10.0)
+    _seed_client_invoice(SessionLocal, "ClientC", "INV-C-1", 50.0)
+
+    def fail_import_client_block(*args, **kwargs):
+        raise RuntimeError("boom after client delete")
+
+    monkeypatch.setattr(mig, "import_client_block", fail_import_client_block)
+    with pytest.raises(RuntimeError, match="boom after client delete"):
+        mig.run_import(mode="merge", clients="ClientA", legacy_path=str(legacy_db))
+
+    db = SessionLocal()
+    try:
+        assert db.query(Client).filter(Client.name == "ClientA").count() == 1
+        assert db.query(Invoice).filter(Invoice.invoice_no == "INV-A-OLD").count() == 1
+        assert db.query(Client).filter(Client.name == "ClientC").count() == 1
+        assert db.query(Invoice).filter(Invoice.invoice_no == "INV-C-1").count() == 1
+    finally:
+        db.close()
+
+
+def test_startup_legacy_auto_import_skips_populated_target(tmp_path, monkeypatch):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    import migrate_sqlite as mig
+    from models import Base
+
+    target_db = tmp_path / "erp.sqlite"
+    test_engine = create_engine(f"sqlite:///{target_db}", connect_args={"check_same_thread": False})
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+    Base.metadata.create_all(bind=test_engine)
+    _seed_client_invoice(TestingSessionLocal, "ExistingClient", "INV-EXISTING", 123.0)
+    (tmp_path / "old_erp.sqlite").write_bytes(b"legacy db placeholder")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(app_module, "SessionLocal", TestingSessionLocal)
+
+    called = False
+
+    def fail_if_called(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("startup auto-import should not run for populated databases")
+
+    monkeypatch.setattr(mig, "run_import", fail_if_called)
+    app_module._maybe_run_legacy_import()
+
+    assert called is False
+
+
+def test_startup_legacy_auto_import_failure_aborts_startup(tmp_path, monkeypatch):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    import migrate_sqlite as mig
+    from models import Base
+
+    target_db = tmp_path / "empty_erp.sqlite"
+    test_engine = create_engine(f"sqlite:///{target_db}", connect_args={"check_same_thread": False})
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+    Base.metadata.create_all(bind=test_engine)
+    (tmp_path / "old_erp.sqlite").write_bytes(b"legacy db placeholder")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(app_module, "SessionLocal", TestingSessionLocal)
+
+    def fail_import(*args, **kwargs):
+        raise RuntimeError("legacy import failed")
+
+    monkeypatch.setattr(mig, "run_import", fail_import)
+    with pytest.raises(RuntimeError, match="legacy import failed"):
+        app_module._maybe_run_legacy_import()

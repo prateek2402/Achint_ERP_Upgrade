@@ -126,7 +126,7 @@ def recalculate_client_ledger(client_id: int, db):
             total_excess -= alloc_sum
 
     client.excess_funds = max(0.0, total_excess)
-    db.commit()
+    db.flush()
 
 
 def truncate_target_tables(db):
@@ -141,7 +141,7 @@ def truncate_target_tables(db):
     db.query(Client).delete()
     db.query(User).delete()
     db.query(SystemSettings).delete()
-    db.commit()
+    db.flush()
 
 
 def empty_counts() -> dict:
@@ -693,8 +693,6 @@ def run_import(
     try:
         if mode == "replace":
             truncate_target_tables(db)
-        else:
-            db.commit()
 
         if do_settings:
             import_settings_block(db, app_data)
@@ -730,7 +728,6 @@ def run_import(
                 assert_no_global_collisions(db, data, exclude_client_id=exclude_id)
                 if existing:
                     delete_client_for_reimport(db, existing)
-                    db.commit()
 
             block = import_client_block(db, client_name, data, used_payment_ids)
             merge_counts(report, block)
@@ -738,8 +735,6 @@ def run_import(
             client_row = db.query(Client).filter(Client.name == str(client_name).strip()).first()
             if client_row:
                 imported_client_ids.append(client_row.id)
-
-        db.commit()
 
         for cid in imported_client_ids:
             recalculate_client_ledger(cid, db)
@@ -752,6 +747,8 @@ def run_import(
             totals_q = totals_q.filter(Client.id.in_(imported_client_ids))
         for client in totals_q.all():
             report["client_totals"].append(client_totals_row(db, client))
+
+        db.commit()
 
         report["success"] = True
         report["completed_at"] = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
