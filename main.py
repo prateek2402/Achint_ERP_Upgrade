@@ -230,6 +230,20 @@ def _maybe_run_legacy_import():
         return
     if marker.exists():
         return
+    db = SessionLocal()
+    try:
+        has_target_data = any(
+            db.query(model.id).first() is not None
+            for model in (Client, PurchaseOrder, Invoice, PaymentHistory, User)
+        )
+    finally:
+        db.close()
+    if has_target_data:
+        log.warning(
+            "legacy ERP auto-import skipped because target database already contains data; "
+            "run migrate_sqlite.py manually for controlled imports"
+        )
+        return
     try:
         from migrate_sqlite import run_import
 
@@ -1340,8 +1354,6 @@ def update_purchase_order_status(po_no: str, status: POStatusSchema, current_use
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
     po = po_query.first()
     if not po:
         raise HTTPException(status_code=404, detail="PO not found")
@@ -1356,8 +1368,6 @@ def delete_purchase_order(po_no: str, current_user: User = Depends(get_current_u
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
     po = po_query.first()
     if po:
         client_id = po.client_id
@@ -2456,6 +2466,59 @@ def _strip_po_advance_applied_for_po(client_id: int, po_no: str, db: Session) ->
     return len(rows)
 
 
+def _trim_po_advance_applied_to_current_caps(
+    client_id: int,
+    po: PurchaseOrder,
+    invoices: list[Invoice],
+    db: Session,
+    invoice_scope: Optional[set[str]] = None,
+) -> int:
+    """Release applied PO advance that now exceeds invoice/term caps back to the PO pool."""
+    invoice_caps = {
+        inv.invoice_no: max(
+            0.0,
+            invoice_amount_for_po_base(inv, po.ret_base or "total") * (float(po.adv_pct or 0.0) / 100.0),
+        )
+        for inv in invoices
+    }
+    rows_query = db.query(PaymentAllocation).join(
+        PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id
+    ).filter(
+        PaymentHistory.client_id == client_id,
+        PaymentAllocation.alloc_type == "po_advance_applied",
+        PaymentAllocation.target_po_no == po.po_no,
+        PaymentAllocation.target_inv_id.isnot(None),
+    )
+    if invoice_scope is not None:
+        if not invoice_scope:
+            return 0
+        rows_query = rows_query.filter(PaymentAllocation.target_inv_id.in_(invoice_scope))
+
+    rows_by_invoice: dict[str, list[PaymentAllocation]] = defaultdict(list)
+    for row in rows_query.all():
+        rows_by_invoice[str(row.target_inv_id)].append(row)
+
+    changed = 0
+    for inv_no, rows in rows_by_invoice.items():
+        cap = float(invoice_caps.get(inv_no, 0.0))
+        applied = sum(float(row.amount or 0.0) for row in rows)
+        excess = max(0.0, applied - cap)
+        if excess <= 0.009:
+            continue
+        for row in sorted(rows, key=lambda r: int(r.id or 0), reverse=True):
+            if excess <= 0.009:
+                break
+            amount = float(row.amount or 0.0)
+            if amount <= excess + 0.009:
+                db.delete(row)
+                excess -= amount
+            else:
+                row.amount = amount - excess
+                excess = 0.0
+            changed += 1
+    return changed
+
+
 def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = None, invoice_no: Optional[str] = None):
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.client_id == client_id)
     if po_no:
@@ -2469,6 +2532,21 @@ def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = N
         if adv_pct <= 0:
             _strip_po_advance_applied_for_po(client_id, po.po_no, db)
             continue
+
+        invoices = db.query(Invoice).filter(
+            Invoice.client_id == client_id,
+            Invoice.po_id == po.id,
+            Invoice.is_note == False
+        ).all()
+        invoices.sort(key=lambda inv: invoice_ledger_sort_key(inv.inv_date, inv.invoice_no))
+        invoice_scope = None
+        if invoice_no:
+            invoice_scope = {invoice_no}
+            invoices = [inv for inv in invoices if inv.invoice_no == invoice_no]
+            if not invoices:
+                continue
+        _trim_po_advance_applied_to_current_caps(client_id, po, invoices, db, invoice_scope)
+        db.flush()
 
         # Build per-payment advance lots for this PO.
         added_by_payment: dict[str, float] = defaultdict(float)
@@ -2498,14 +2576,6 @@ def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = N
             continue
         lot_idx = 0
 
-        invoices = db.query(Invoice).filter(
-            Invoice.client_id == client_id,
-            Invoice.po_id == po.id,
-            Invoice.is_note == False
-        ).all()
-        invoices.sort(key=lambda inv: invoice_ledger_sort_key(inv.inv_date, inv.invoice_no))
-        if invoice_no:
-            invoices = [inv for inv in invoices if inv.invoice_no == invoice_no]
         if not invoices:
             continue
 
