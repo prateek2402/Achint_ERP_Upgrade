@@ -7,7 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import main as app_module
-from models import Base, User
+from models import Base, Client, User
 
 
 @pytest.fixture()
@@ -108,6 +108,66 @@ def create_client_po_invoice(client: TestClient, token: str):
     inv = client.post("/api/invoices", json=inv_payload, headers=auth_header(token))
     assert inv.status_code == 200, inv.text
     return client_id
+
+
+def test_startup_legacy_import_skips_populated_target_database(tmp_path, monkeypatch):
+    import migrate_sqlite as mig
+
+    db_file = tmp_path / "populated.sqlite"
+    test_engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+    Base.metadata.create_all(bind=test_engine)
+    monkeypatch.setattr(app_module, "SessionLocal", TestingSessionLocal)
+    monkeypatch.chdir(tmp_path)
+    legacy_db = tmp_path / "old_erp.sqlite"
+    legacy_db.write_bytes(b"placeholder")
+
+    db = TestingSessionLocal()
+    db.add(User(username="localadmin", hashed_password=app_module.hash_password("Admin@1234"), role="admin"))
+    db.add(Client(name="Live Client", active=True))
+    db.commit()
+    db.close()
+
+    called = False
+
+    def fake_run_import(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("startup auto-import must not run against populated databases")
+
+    monkeypatch.setattr(mig, "run_import", fake_run_import)
+    app_module._maybe_run_legacy_import()
+
+    assert called is False
+    db = TestingSessionLocal()
+    assert db.query(Client).filter(Client.name == "Live Client").count() == 1
+    assert db.query(User).filter(User.username == "localadmin").count() == 1
+    db.close()
+
+
+def test_purchase_order_status_and_delete_routes_do_not_crash(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    create_client_po_invoice(client, token)
+
+    status = client.put(
+        "/api/purchase-orders/PO-001/status",
+        json={"is_completed": True, "is_hidden": False},
+        headers=auth_header(token),
+    )
+    assert status.status_code == 200, status.text
+
+    pos = client.get("/api/purchase-orders", headers=auth_header(token))
+    assert pos.status_code == 200, pos.text
+    po = next(p for p in pos.json() if p["po_no"] == "PO-001")
+    assert po["is_completed"] is True
+    assert po["completed_at"]
+
+    deleted = client.delete("/api/purchase-orders/PO-001", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+
+    pos_after = client.get("/api/purchase-orders?include_completed=true&include_hidden=true", headers=auth_header(token))
+    assert pos_after.status_code == 200, pos_after.text
+    assert all(p["po_no"] != "PO-001" for p in pos_after.json())
 
 
 def test_invoice_ledger_sort_key_orders_by_date_fy_then_sequence():
@@ -815,6 +875,67 @@ def test_invoice_delete_returns_po_advance_to_pool_for_other_invoices(client: Te
     target_pay = next(p for p in payments.json() if p["id"] == "PAY-PO-ADV-POOL-1")
     assert any(a.get("type") == "po_advance" and a.get("po") == "PO-001" for a in target_pay.get("allocations", []))
     assert not any(a.get("type") == "po_advance_applied" and a.get("invId") == "INV-001" for a in target_pay.get("allocations", []))
+
+
+def test_po_advance_term_shrink_releases_excess_back_to_pool(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    adv_pay = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-PO-ADV-SHRINK-1",
+        "date": datetime.date.today().isoformat(),
+        "amount": 100.0,
+        "note": "po advance add",
+        "mode": "targeted",
+        "targets": [],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "move_to_po": "PO-001",
+        "po_no": "PO-001",
+        "clear_po_pool": False,
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert adv_pay.status_code == 200, adv_pay.text
+
+    before = client.get(f"/api/clients/{client_id}/po-advance-pools", headers=auth_header(token))
+    assert before.status_code == 200, before.text
+    po_before = next(p for p in before.json()["pools"] if p["po_no"] == "PO-001")
+    assert po_before["pool_remaining"] == pytest.approx(50.0, abs=0.01)
+    assert po_before["invoices"][0]["allocated_from_pool"] == pytest.approx(50.0, abs=0.01)
+
+    shrink_terms = client.post("/api/purchase-orders", json={
+        "client_id": client_id,
+        "po_no": "PO-001",
+        "contact_person": "Ops",
+        "project_name": "Kiln",
+        "adv_pct": 2.0,
+        "ret_pct": 2.0,
+        "ret_base": "basic",
+        "tds_enabled": True,
+        "tds_rate": 0.1,
+        "tds_threshold": 5000.0,
+        "baseline_items": [
+            {"description": "Brick A", "ordered_qty": 100, "inspected_qty": 0, "uom": "Nos", "material_type": "brick"},
+            {"description": "Castable B", "ordered_qty": 10, "inspected_qty": 0, "uom": "Bags", "material_type": "castable_mortar"},
+        ],
+    }, headers=auth_header(token))
+    assert shrink_terms.status_code == 200, shrink_terms.text
+
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    inv = next(i for i in invs if i["id"] == "INV-001")
+    assert inv["advance"] == pytest.approx(20.0, abs=0.01)
+
+    after = client.get(f"/api/clients/{client_id}/po-advance-pools", headers=auth_header(token))
+    assert after.status_code == 200, after.text
+    po_after = next(p for p in after.json()["pools"] if p["po_no"] == "PO-001")
+    assert po_after["pool_remaining"] == pytest.approx(80.0, abs=0.01)
+    assert po_after["invoices"][0]["allocated_from_pool"] == pytest.approx(20.0, abs=0.01)
+    assert po_after["lots"][0]["lot_remaining"] == pytest.approx(80.0, abs=0.01)
 
 
 def test_note_issue_inherits_invoice_po_and_target_link(client: TestClient):
