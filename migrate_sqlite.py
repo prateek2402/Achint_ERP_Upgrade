@@ -560,7 +560,10 @@ def ensure_target_schema(db_file: Path) -> None:
     cur = conn.cursor()
     try:
         cur.execute("PRAGMA table_info(purchase_orders)")
-        cols = {row[1] for row in cur.fetchall()}
+        rows = cur.fetchall()
+        if not rows:
+            return
+        cols = {row[1] for row in rows}
         if "contact_person" not in cols:
             cur.execute("ALTER TABLE purchase_orders ADD COLUMN contact_person TEXT")
         if "project_name" not in cols:
