@@ -1991,10 +1991,18 @@
             { id: 'actions', label: 'Actions', visible: true, type: 'core' }
         ];
 
+        function todayLocalIsoDate() {
+            const d = new Date();
+            const yyyy = d.getFullYear();
+            const mm = String(d.getMonth() + 1).padStart(2, '0');
+            const dd = String(d.getDate()).padStart(2, '0');
+            return `${yyyy}-${mm}-${dd}`;
+        }
+
         window.onload = function () {
             const payDateEl = document.getElementById('paymentDate');
             if (payDateEl && !payDateEl.value) {
-                payDateEl.value = new Date().toISOString().split('T')[0];
+                payDateEl.value = todayLocalIsoDate();
             }
             const token = ErpAuth.getToken();
             if (!token) {
@@ -2094,7 +2102,7 @@
         }
 
         function getSelectedPaymentDate() {
-            const today = new Date().toISOString().split('T')[0];
+            const today = todayLocalIsoDate();
             const el = document.getElementById('paymentDate');
             if (!el) return today;
             const v = String(el.value || '').trim();
@@ -4145,7 +4153,7 @@
                 }
                 updateSidebarNav();
 
-                const todayIso = new Date().toISOString().slice(0, 10);
+                const todayIso = todayLocalIsoDate();
                 const dispatchedTodayCount = rows.filter(row => String(row.last_invoice_date || row.invoice_date || '').slice(0, 10) === todayIso).length;
                 const dispatchedTrucksCount = rows.filter(row => Number(row.dispatched_qty || 0) > 0).length;
                 if (activeClient) {
@@ -4760,7 +4768,7 @@
 
             boxList.innerHTML = '';
             let hasPending = false;
-            const today = new Date().toISOString().split('T')[0];
+            const today = todayLocalIsoDate();
             const holdRet = document.getElementById('optHoldRet') ? document.getElementById('optHoldRet').checked : false;
             const holdGst = document.getElementById('optHoldGst') ? document.getElementById('optHoldGst').checked : false;
             const onlyGst = document.getElementById('optOnlyGst') ? document.getElementById('optOnlyGst').checked : false;
@@ -5040,7 +5048,7 @@
             const payload = {
                 client_id: clientObj.sql_id,
                 id: Date.now().toString(),
-                date: new Date().toISOString().split('T')[0],
+                date: todayLocalIsoDate(),
                 amount: 0,
                 note: 'Cleared by user',
                 mode: 'cascade',
@@ -5383,7 +5391,7 @@
             const payload = {
                 client_id: appData[currentClient].sql_id,
                 id: Date.now().toString(),
-                date: new Date().toISOString().split('T')[0],
+                date: todayLocalIsoDate(),
                 amount,
                 note: `From unallocated pool`,
                 mode: 'targeted',
@@ -6102,7 +6110,7 @@
             });
 
             let tableHTML = '';
-            const today = new Date().toISOString().split('T')[0];
+            const today = todayLocalIsoDate();
             const filters = {
                 client: currentClient === 'ALL' ? document.getElementById('fltClient').value : null,
                 pos: getMultiSelectValues('poSelectOptions'),
@@ -6393,7 +6401,7 @@
             if (fyContainer) fyContainer.innerHTML = '';
 
             const filters = getCurrentLedgerFilterState();
-            const today = new Date().toISOString().split('T')[0];
+            const today = todayLocalIsoDate();
             const clientsToProcess = filters.client
                 ? [filters.client]
                 : (currentClient === 'ALL' ? Object.keys(appData).filter(k => k !== '_settings') : [currentClient]);
@@ -6671,7 +6679,7 @@
                 const href = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = href;
-                a.download = `financial_ledger_export_${new Date().toISOString().split('T')[0]}.xlsx`;
+                a.download = `financial_ledger_export_${todayLocalIsoDate()}.xlsx`;
                 document.body.appendChild(a);
                 a.click();
                 document.body.removeChild(a);
@@ -6689,7 +6697,7 @@
             let headers = visibleCols.map(c => `"${c.label}"`).join(',');
             let rows = [headers];
 
-            const today = new Date().toISOString().split('T')[0];
+            const today = todayLocalIsoDate();
 
             checkedBoxes.forEach(box => {
                 let client = box.getAttribute('data-client');
@@ -6731,7 +6739,7 @@
             let encodedUri = encodeURI(csvContent);
             let link = document.createElement("a");
             link.setAttribute("href", encodedUri);
-            link.setAttribute("download", `Achint_ERP_Export_${new Date().toISOString().split('T')[0]}.csv`);
+            link.setAttribute("download", `Achint_ERP_Export_${todayLocalIsoDate()}.csv`);
             document.body.appendChild(link);
             link.click();
             document.body.removeChild(link);
@@ -7066,7 +7074,7 @@
                    </table>`
                 : `<div style="padding:12px; color:var(--text-muted);">No client totals available.</div>`;
 
-            const today = new Date().toISOString().split('T')[0];
+            const today = todayLocalIsoDate();
             let cleared = 0, pendingCount = 0, overdue = 0;
             rows.forEach((r) => {
                 if (isInvoiceCleared(r)) {
@@ -7725,7 +7733,7 @@
             if (!currentClient || currentClient === 'ALL') return customApplet({ title: "Error", message: "Please open a specific client account first." });
 
             document.getElementById('noteNo').value = '';
-            document.getElementById('noteDate').value = new Date().toISOString().split('T')[0];
+            document.getElementById('noteDate').value = todayLocalIsoDate();
             document.getElementById('noteAmt').value = '';
             document.getElementById('noteReason').value = '';
 
@@ -9946,7 +9954,7 @@
                 if (!poNo) return customApplet({ title: "Select PO", message: "Select a PO first." });
                 const defaults = {
                     invoice_no: '',
-                    inv_date: new Date().toISOString().slice(0, 10),
+                    inv_date: todayLocalIsoDate(),
                     lr_no: '',
                     total: '0',
                     description: '',
