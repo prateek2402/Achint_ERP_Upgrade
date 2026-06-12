@@ -110,6 +110,216 @@ def create_client_po_invoice(client: TestClient, token: str):
     return client_id
 
 
+def invoice_payload(client_id: int, invoice_no: str, po_no: str = "UNASSIGNED", total: float = 1000.0) -> dict:
+    return {
+        "client_id": client_id,
+        "po_no": po_no,
+        "invoice_no": invoice_no,
+        "sub_entity": "",
+        "lr_no": "",
+        "inv_date": "2026-04-01",
+        "due_date": None,
+        "basic": total,
+        "gst": 0.0,
+        "total": total,
+        "advance_adj": 0.0,
+        "tds_ded": 0.0,
+        "retention_held": 0.0,
+        "net_payable": 0.0,
+        "paid": 0.0,
+        "balance": 0.0,
+        "is_note": False,
+        "note_type": None,
+        "note_reason": None,
+        "dispatch_items": [],
+    }
+
+
+def test_admin_create_user_returns_success_without_partial_failure(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+
+    created = client.post(
+        "/api/users",
+        json={"username": "new.user", "password": "NewUser@12345", "role": "user"},
+        headers=auth_header(token),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["success"] is True
+
+    users = client.get("/api/users", headers=auth_header(token))
+    assert users.status_code == 200
+    assert any(u["username"] == "new.user" for u in users.json())
+
+
+def test_purchase_order_status_and_delete_do_not_crash(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    c = client.post("/api/clients", json={"name": "PO-STATUS-CLIENT"}, headers=auth_header(token))
+    assert c.status_code == 200, c.text
+    client_id = c.json()["id"]
+
+    po = client.post("/api/purchase-orders", json={
+        "client_id": client_id,
+        "po_no": "PO-STATUS-1",
+        "contact_person": "Ops",
+        "project_name": "Status",
+        "adv_pct": 0.0,
+        "ret_pct": 0.0,
+        "ret_base": "total",
+        "tds_enabled": False,
+        "tds_rate": 0.0,
+        "tds_threshold": 0.0,
+        "baseline_items": [],
+    }, headers=auth_header(token))
+    assert po.status_code == 200, po.text
+
+    status = client.put(
+        "/api/purchase-orders/PO-STATUS-1/status",
+        json={"is_completed": True, "is_hidden": True},
+        headers=auth_header(token),
+    )
+    assert status.status_code == 200, status.text
+
+    pos = client.get("/api/purchase-orders", params={"include_hidden": True}, headers=auth_header(token))
+    assert pos.status_code == 200
+    updated = next(p for p in pos.json() if p["po_no"] == "PO-STATUS-1")
+    assert updated["is_completed"] is True
+    assert updated["is_hidden"] is True
+
+    deleted = client.delete("/api/purchase-orders/PO-STATUS-1", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+
+
+def test_invoice_po_linking_rejects_po_from_another_client(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    ca = client.post("/api/clients", json={"name": "PO-OWNER-A"}, headers=auth_header(token))
+    cb = client.post("/api/clients", json={"name": "PO-OWNER-B"}, headers=auth_header(token))
+    assert ca.status_code == 200, ca.text
+    assert cb.status_code == 200, cb.text
+    client_a = ca.json()["id"]
+    client_b = cb.json()["id"]
+
+    po = client.post("/api/purchase-orders", json={
+        "client_id": client_a,
+        "po_no": "PO-SHARED-1",
+        "contact_person": "Ops",
+        "project_name": "Owner A",
+        "adv_pct": 5.0,
+        "ret_pct": 2.0,
+        "ret_base": "total",
+        "tds_enabled": False,
+        "tds_rate": 0.0,
+        "tds_threshold": 0.0,
+        "baseline_items": [],
+    }, headers=auth_header(token))
+    assert po.status_code == 200, po.text
+
+    cross_po_update = client.post("/api/purchase-orders", json={
+        "client_id": client_b,
+        "po_no": "PO-SHARED-1",
+        "contact_person": "Other",
+        "project_name": "Owner B",
+        "adv_pct": 0.0,
+        "ret_pct": 0.0,
+        "ret_base": "total",
+        "tds_enabled": False,
+        "tds_rate": 0.0,
+        "tds_threshold": 0.0,
+        "baseline_items": [],
+    }, headers=auth_header(token))
+    assert cross_po_update.status_code == 400
+
+    cross_invoice = client.post(
+        "/api/invoices",
+        json=invoice_payload(client_b, "INV-CROSS-PO", "PO-SHARED-1"),
+        headers=auth_header(token),
+    )
+    assert cross_invoice.status_code == 400
+
+    unassigned = client.post(
+        "/api/invoices",
+        json=invoice_payload(client_b, "INV-CROSS-UPDATE", "UNASSIGNED"),
+        headers=auth_header(token),
+    )
+    assert unassigned.status_code == 200, unassigned.text
+    cross_update = client.put(
+        "/api/invoices/INV-CROSS-UPDATE",
+        json=invoice_payload(client_b, "INV-CROSS-UPDATE", "PO-SHARED-1"),
+        headers=auth_header(token),
+    )
+    assert cross_update.status_code == 400
+
+
+def test_invoice_move_reopens_source_receipt_allocation(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    ca = client.post("/api/clients", json={"name": "MOVE-SOURCE"}, headers=auth_header(token))
+    cb = client.post("/api/clients", json={"name": "MOVE-DEST"}, headers=auth_header(token))
+    assert ca.status_code == 200, ca.text
+    assert cb.status_code == 200, cb.text
+    source_id = ca.json()["id"]
+    dest_id = cb.json()["id"]
+
+    inv = client.post(
+        "/api/invoices",
+        json=invoice_payload(source_id, "INV-MOVE-PAID", "UNASSIGNED", 1000.0),
+        headers=auth_header(token),
+    )
+    assert inv.status_code == 200, inv.text
+    pay = client.post("/api/payments/allocate", json={
+        "client_id": source_id,
+        "id": "PAY-MOVE-1",
+        "date": datetime.date.today().isoformat(),
+        "amount": 500.0,
+        "note": "move test receipt",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-MOVE-PAID", "amount": 500.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "move_to_po": None,
+        "po_no": None,
+        "clear_po_pool": False,
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert pay.status_code == 200, pay.text
+
+    moved = client.post(
+        "/api/invoices/INV-MOVE-PAID/transfer",
+        json={"new_client_id": dest_id, "action": "move"},
+        headers=auth_header(token),
+    )
+    assert moved.status_code == 200, moved.text
+
+    invs = client.get("/api/invoices", headers=auth_header(token))
+    assert invs.status_code == 200
+    moved_row = next(i for i in invs.json() if i["id"] == "INV-MOVE-PAID")
+    assert moved_row["client_id"] == dest_id
+    assert moved_row["paid"] == pytest.approx(0.0)
+    assert moved_row["balance"] == pytest.approx(1000.0)
+
+    clients = client.get("/api/clients", headers=auth_header(token))
+    assert clients.status_code == 200
+    source = next(c for c in clients.json() if c["id"] == source_id)
+    assert source["excess_funds"] == pytest.approx(500.0)
+
+    regs = client.get(
+        "/api/registers/unallocated-payments",
+        params={"client_id": source_id},
+        headers=auth_header(token),
+    )
+    assert regs.status_code == 200
+    moved_regs = [r for r in regs.json() if r.get("source_kind") == "invoice_moved" and r.get("source_invoice_no") == "INV-MOVE-PAID"]
+    assert moved_regs
+    assert moved_regs[0]["balance"] == pytest.approx(500.0)
+
+    payments = client.get("/api/payments", headers=auth_header(token))
+    assert payments.status_code == 200
+    payment = next(p for p in payments.json() if p["id"] == "PAY-MOVE-1")
+    assert not any(a.get("invId") == "INV-MOVE-PAID" for a in payment.get("allocations", []))
+
+
 def test_invoice_ledger_sort_key_orders_by_date_fy_then_sequence():
     import datetime
 
