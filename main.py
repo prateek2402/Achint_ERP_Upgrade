@@ -1339,10 +1339,7 @@ def create_purchase_order(po: POCreate, request: Request, current_user: User = D
 def update_purchase_order_status(po_no: str, status: POStatusSchema, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
-    po = po_query.first()
+    po = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no).first()
     if not po:
         raise HTTPException(status_code=404, detail="PO not found")
     po.is_completed = bool(status.is_completed)
@@ -1355,10 +1352,7 @@ def update_purchase_order_status(po_no: str, status: POStatusSchema, current_use
 def delete_purchase_order(po_no: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
-    po = po_query.first()
+    po = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no).first()
     if po:
         client_id = po.client_id
         db.delete(po)
