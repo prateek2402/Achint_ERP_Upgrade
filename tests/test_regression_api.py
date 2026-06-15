@@ -182,6 +182,147 @@ def test_auth_and_permission_guards(client: TestClient):
     assert as_admin.status_code == 200
 
 
+def test_admin_create_user_returns_success_after_commit(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+
+    created = client.post(
+        "/api/users",
+        json={"username": "new.operator", "password": "NewUser@12345", "role": "user"},
+        headers=auth_header(token),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["success"] is True
+
+    users = client.get("/api/users", headers=auth_header(token))
+    assert users.status_code == 200, users.text
+    assert any(u["username"] == "new.operator" for u in users.json())
+
+
+def test_purchase_order_status_and_delete_do_not_crash_on_payload_name(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "PO-STATUS-CLIENT"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+
+    for po_no in ("PO-STATUS-1", "PO-DELETE-1"):
+        po = client.post(
+            "/api/purchase-orders",
+            json={
+                "client_id": client_id,
+                "po_no": po_no,
+                "contact_person": "",
+                "project_name": "",
+                "baseline_items": [],
+            },
+            headers=auth_header(token),
+        )
+        assert po.status_code == 200, po.text
+
+    status = client.put(
+        "/api/purchase-orders/PO-STATUS-1/status",
+        json={"is_completed": True, "is_hidden": False},
+        headers=auth_header(token),
+    )
+    assert status.status_code == 200, status.text
+
+    deleted = client.delete("/api/purchase-orders/PO-DELETE-1", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+
+
+def test_invoice_update_without_dispatch_items_preserves_existing_dispatch(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    before = client.get("/api/invoices", headers=auth_header(token))
+    assert before.status_code == 200, before.text
+    row = next(i for i in before.json() if i["id"] == "INV-001")
+    assert len(row["dispatchItems"]) == 2
+
+    payload = {
+        "client_id": client_id,
+        "po_no": "PO-001",
+        "invoice_no": "INV-001",
+        "sub_entity": row["subEntity"],
+        "lr_no": row["lrNo"],
+        "inv_date": row["invDate"],
+        "due_date": row["dueDate"],
+        "basic": row["basic"] + 100,
+        "gst": row["gst"],
+        "total": row["total"] + 100,
+        "advance_adj": row["advance"],
+        "tds_ded": row["tds"],
+        "retention_held": row["retention"],
+        "net_payable": row["netPayable"] + 100,
+        "paid": row["paid"],
+        "balance": row["balance"] + 100,
+        "is_note": row["isNote"],
+        "note_type": row["noteType"],
+        "note_reason": row["noteReason"],
+    }
+    updated = client.put("/api/invoices/INV-001", json=payload, headers=auth_header(token))
+    assert updated.status_code == 200, updated.text
+
+    after = client.get("/api/invoices", headers=auth_header(token))
+    assert after.status_code == 200, after.text
+    updated_row = next(i for i in after.json() if i["id"] == "INV-001")
+    assert [(d["description"], d["qty"]) for d in updated_row["dispatchItems"]] == [
+        ("Brick A", pytest.approx(5.0)),
+        ("Castable B", pytest.approx(3.0)),
+    ]
+
+
+def test_purchase_order_number_cannot_cross_client_boundaries(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    first_client_id = create_client_po_invoice(client, token)
+    cr = client.post("/api/clients", json={"name": "SECOND-PO-CLIENT"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    second_client_id = cr.json()["id"]
+    assert second_client_id != first_client_id
+
+    po_conflict = client.post(
+        "/api/purchase-orders",
+        json={
+            "client_id": second_client_id,
+            "po_no": "PO-001",
+            "contact_person": "Other",
+            "project_name": "Other",
+            "adv_pct": 99.0,
+            "ret_pct": 99.0,
+            "baseline_items": [],
+        },
+        headers=auth_header(token),
+    )
+    assert po_conflict.status_code == 409, po_conflict.text
+
+    invoice_conflict = client.post(
+        "/api/invoices",
+        json={
+            "client_id": second_client_id,
+            "po_no": "PO-001",
+            "invoice_no": "INV-CROSS-CLIENT",
+            "sub_entity": "",
+            "lr_no": "",
+            "inv_date": "2026-04-02",
+            "due_date": None,
+            "basic": 100.0,
+            "gst": 18.0,
+            "total": 118.0,
+            "advance_adj": 0.0,
+            "tds_ded": 0.0,
+            "retention_held": 0.0,
+            "net_payable": 0.0,
+            "paid": 0.0,
+            "balance": 0.0,
+            "is_note": False,
+            "note_type": None,
+            "note_reason": None,
+            "dispatch_items": [],
+        },
+        headers=auth_header(token),
+    )
+    assert invoice_conflict.status_code == 409, invoice_conflict.text
+
+
 def test_payment_allocations_use_invid_field(client: TestClient):
     """Locks the /api/payments allocation contract so the SPA Payment Log cell keeps working.
 

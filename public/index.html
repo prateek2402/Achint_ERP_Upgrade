@@ -2607,7 +2607,7 @@
         }
 
         function applyRoleSectionCopy() {
-            const role = (sessionStorage.getItem('erp_role') || 'user').toLowerCase();
+            const role = (ErpAuth.getRole() || 'user').toLowerCase();
             const landingTitle = document.getElementById('landingSectionTitle');
             const logisticsTitle = document.getElementById('logisticsBoardTitle');
             const logisticsSubcopy = document.getElementById('logisticsBoardSubcopy');
@@ -2657,14 +2657,14 @@
         async function loadSecuredData() {
             const token = ErpAuth.getToken();
             if (!token) return;
-            const role = (sessionStorage.getItem('erp_role') || '').toLowerCase();
+            const role = (ErpAuth.getRole() || '').toLowerCase();
 
             try {
                 if (role === 'logistics') {
                     document.getElementById('userMenuTop').style.display = 'flex';
                     const topGreeting = document.getElementById('topGreeting');
                     const topInitial = document.getElementById('topUserInitial');
-                    const usernameLabel = sessionStorage.getItem('erp_username') || 'User';
+                    const usernameLabel = ErpAuth.getUsername() || 'User';
                     if (topGreeting) topGreeting.innerText = `${usernameLabel} (LOGISTICS)`;
                     if (topInitial) topInitial.innerText = usernameLabel.charAt(0).toUpperCase();
                     const fxBtn = document.getElementById('btnFxRate');
@@ -2773,15 +2773,15 @@
                 document.getElementById('userMenuTop').style.display = 'flex';
                 const topGreeting = document.getElementById('topGreeting');
                 const topInitial = document.getElementById('topUserInitial');
-                const roleLabel = (sessionStorage.getItem('erp_role') || 'user').toUpperCase();
-                const usernameLabel = sessionStorage.getItem('erp_username') || 'User';
+                const roleLabel = (ErpAuth.getRole() || 'user').toUpperCase();
+                const usernameLabel = ErpAuth.getUsername() || 'User';
                 if (topGreeting) topGreeting.innerText = `${usernameLabel} (${roleLabel})`;
                 if (topInitial) topInitial.innerText = usernameLabel.charAt(0).toUpperCase();
                 applyLedgerTablePrefs();
                 refreshLayoutOptions();
 
                 // Route user based on their role
-                const sessionRole = (sessionStorage.getItem('erp_role') || '').toLowerCase();
+                const sessionRole = (ErpAuth.getRole() || '').toLowerCase();
                 applyRoleDashboardEmphasis(sessionRole);
                 if (sessionRole === 'logistics') {
                     document.getElementById('logisticsLandingView').style.display = 'block';
@@ -2814,7 +2814,7 @@
             if (!token) return;
 
             try {
-                const role = (sessionStorage.getItem('erp_role') || '').toLowerCase();
+                const role = (ErpAuth.getRole() || '').toLowerCase();
                 // Fetch perfectly calculated mathematical truth from Python
                 const [clientRes, poRes, invRes, payRes] = await Promise.all([
                     fetch('/api/clients', { headers: { 'Authorization': 'Bearer ' + token } }),
@@ -2903,7 +2903,7 @@
 
         async function refreshCurrentDispatchContext() {
             const selectedPo = (document.getElementById('dispatchPoSelect')?.value || '').trim();
-            const role = (sessionStorage.getItem('erp_role') || '').toLowerCase();
+            const role = (ErpAuth.getRole() || '').toLowerCase();
             if (role === 'logistics' && currentClient) {
                 const payload = await fetchLogisticsClientDispatchWorkspace(currentClient);
                 applyLogisticsWorkspaceData(payload);
@@ -3025,7 +3025,7 @@
 
         function updateSidebarNav() {
             const nav = document.getElementById('clientNavList');
-            const role = sessionStorage.getItem('erp_role');
+            const role = ErpAuth.getRole();
             const isLogistics = role === 'logistics';
 
             let navHtml = '';
@@ -3270,7 +3270,7 @@
             hideAllViews(); resetFilters(false);
             document.getElementById('clientView').style.display = 'block';
 
-            const isAdmin = sessionStorage.getItem('erp_role') === 'admin';
+            const isAdmin = ErpAuth.getRole() === 'admin';
             const isActive = appData[name] && appData[name].active !== false;
 
             if (isAdmin) {
@@ -3443,7 +3443,7 @@
         }
 
         function goBack() {
-            const role = sessionStorage.getItem('erp_role');
+            const role = ErpAuth.getRole();
             if (role === 'logistics') {
             currentClient = null;
             updateSidebarNav();
@@ -3587,7 +3587,7 @@
             if (backBtn) backBtn.style.display = 'none';
             document.getElementById('logisticsClientPageView').style.display = 'block';
             const clientName = logisticsPortalState.clientPageClient || 'Client';
-            const role = (sessionStorage.getItem('erp_role') || '').toLowerCase();
+            const role = (ErpAuth.getRole() || '').toLowerCase();
             const pageBackBtn = document.getElementById('logisticsClientPageBackBtn');
             if (pageBackBtn) pageBackBtn.innerHTML = role === 'logistics' ? '← Back to All Clients' : '← Back to Ledger';
             document.getElementById('topbarTitle').innerText = `Client Dispatch: ${clientName}`;
@@ -3597,14 +3597,14 @@
         }
 
         function goBackFromClientDispatchPage() {
-            const role = (sessionStorage.getItem('erp_role') || '').toLowerCase();
+            const role = (ErpAuth.getRole() || '').toLowerCase();
             if (role === 'logistics') return openLogisticsClientDirectoryView();
             if (logisticsPortalState.clientPageClient) return openClient(logisticsPortalState.clientPageClient);
             return goBack();
         }
 
         function goBackFromDispatchReconciliation() {
-            const role = (sessionStorage.getItem('erp_role') || '').toLowerCase();
+            const role = (ErpAuth.getRole() || '').toLowerCase();
             const clientName = (currentClient && currentClient !== 'ALL' && currentClient !== 'ADMIN' && currentClient !== 'REPORTS') ? currentClient : (logisticsPortalState.clientPageClient || '');
             if (role === 'logistics') {
                 if (clientName) return openLogisticsClientPage(clientName);
@@ -3754,7 +3754,7 @@
         }
 
         async function openDispatchStatementByClientPo(clientName, poNo) {
-            const role = (sessionStorage.getItem('erp_role') || '').toLowerCase();
+            const role = (ErpAuth.getRole() || '').toLowerCase();
             const client = (clientName || '').trim();
             const po = (poNo || '').trim();
             if (!client) return;
@@ -3999,7 +3999,7 @@
         }
 
         function applyDispatchRoleVisibility() {
-            const isLogistics = (sessionStorage.getItem('erp_role') || '').toLowerCase() === 'logistics';
+            const isLogistics = (ErpAuth.getRole() || '').toLowerCase() === 'logistics';
             const dataEntrySection = document.getElementById('dataEntrySection');
             if (dataEntrySection) {
                 dataEntrySection.style.display = isLogistics ? 'grid' : dataEntrySection.style.display;
@@ -4554,6 +4554,19 @@
             window.scrollTo({ top: 0, behavior: 'smooth' });
         }
 
+        function serializeDispatchItemsForInvoice(inv) {
+            if (!inv || !Array.isArray(inv.dispatchItems)) return [];
+            return inv.dispatchItems
+                .filter(item => item && (item.description || '').trim())
+                .map(item => ({
+                    description: item.description,
+                    qty: Number(item.qty || item.dispatched_qty || 0),
+                    inspected_qty: Number(item.inspected_qty || item.inspectedQty || 0),
+                    uom: item.uom || 'Nos',
+                    rate_per_uom: Number(item.rate_per_uom || item.ratePerUom || 0)
+                }));
+        }
+
         async function saveInlineEdit(id) {
             try {
                 let inv = appData[currentClient].invoices.find(i => i.id === id);
@@ -4618,7 +4631,8 @@
                     net_payable: netPayable,
                     paid: inv.paid || 0,
                     balance: balance,
-                    is_note: inv.isNote || false
+                    is_note: inv.isNote || false,
+                    dispatch_items: serializeDispatchItemsForInvoice(inv)
                 };
 
                 const response = await fetch(`/api/invoices/${encodeURIComponent(id)}`, {
@@ -6082,7 +6096,7 @@
         function renderTableAndDashboard() {
             const thead = document.getElementById('dynamicTableHeader');
             const tbody = document.getElementById('invoiceTableBody');
-            const isAdmin = sessionStorage.getItem('erp_role') === 'admin';
+            const isAdmin = ErpAuth.getRole() === 'admin';
 
             thead.innerHTML = '<tr></tr>';
             const headRow = thead.querySelector('tr');
@@ -6811,7 +6825,8 @@
                                 retention_held: inv.retention,
                                 net_payable: inv.netPayable,
                                 paid: inv.paid,
-                                balance: inv.balance
+                                balance: inv.balance,
+                                dispatch_items: serializeDispatchItemsForInvoice(inv)
                             })
                         });
                         count++;
@@ -7497,7 +7512,7 @@
         }
 
         async function saveInvoice() {
-            const role = (sessionStorage.getItem('erp_role') || '').toLowerCase();
+            const role = (ErpAuth.getRole() || '').toLowerCase();
             const isLogistics = role === 'logistics';
             let poNo = document.getElementById('poNo').value.trim();
             const selPo = document.getElementById('poNoSelect');
@@ -7539,6 +7554,13 @@
 
             const token = ErpAuth.getToken();
             const clientObj = appData[currentClient];
+            const existingInvoice = isEditing
+                ? ((clientObj.invoices || []).find(i => i.id === invNo) || null)
+                : null;
+            const extractedDispatchItems = Array.isArray(window.lastExtractedItems) ? window.lastExtractedItems : [];
+            const dispatchItems = (isEditing && extractedDispatchItems.length === 0)
+                ? serializeDispatchItemsForInvoice(existingInvoice)
+                : extractedDispatchItems;
 
             const payload = {
                 client_id: clientObj.sql_id,
@@ -7558,7 +7580,7 @@
                 paid: 0,
                 balance: 0,
                 is_note: false,
-                dispatch_items: window.lastExtractedItems || []
+                dispatch_items: dispatchItems
             };
             try {
                 let endpoint = isEditing ? `/api/invoices/${encodeURIComponent(invNo)}` : '/api/invoices';
@@ -7840,7 +7862,7 @@
 
 
         async function openDispatchStatementEntry(clientName) {
-            const role = (sessionStorage.getItem('erp_role') || '').toLowerCase();
+            const role = (ErpAuth.getRole() || '').toLowerCase();
             if (role === 'logistics') {
                 return openLogisticsDispatchWorkspace(clientName);
             }
@@ -7866,7 +7888,7 @@
             document.getElementById('topbarTitle').innerHTML = `Fulfillment: ${escHtml(clientName)}${titleAddon}`;
 
             // Restore the Admin Buttons for this specific client
-            const isAdmin = sessionStorage.getItem('erp_role') === 'admin';
+            const isAdmin = ErpAuth.getRole() === 'admin';
             if (isAdmin && appData[clientName]) {
                 const actionsEl = document.getElementById('clientActions');
                 if (actionsEl) actionsEl.style.display = 'flex';
@@ -7983,7 +8005,7 @@
         function renderDispatchHeaders(summaryCols, historyCols) {
             const summaryHead = document.getElementById('dispatchSummaryHead');
             const historyHead = document.getElementById('dispatchHistoryHead');
-            const role = (sessionStorage.getItem('erp_role') || '').toLowerCase();
+            const role = (ErpAuth.getRole() || '').toLowerCase();
             const effectiveHistoryCols = role === 'logistics' ? historyCols.filter(k => k !== 'bill') : historyCols;
             if (summaryHead) {
                 const m = {
