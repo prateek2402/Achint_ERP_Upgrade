@@ -606,6 +606,12 @@ def suggest_legacy_names(unknown: list[str], app_data: dict, n: int = 3) -> dict
 
 
 def ensure_target_schema(db_file: Path) -> None:
+    engine = create_engine(target_database_url(), connect_args={"check_same_thread": False})
+    try:
+        Base.metadata.create_all(bind=engine)
+    finally:
+        engine.dispose()
+
     conn = sqlite3.connect(str(db_file))
     cur = conn.cursor()
     try:
