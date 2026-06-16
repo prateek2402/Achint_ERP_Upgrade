@@ -223,7 +223,14 @@ Base.metadata.create_all(bind=engine)
 
 
 def _maybe_run_legacy_import():
-    """Import legacy ERP snapshot on first boot when old_erp.sqlite is present."""
+    """Optionally import a legacy ERP snapshot on first boot.
+
+    Full legacy import is destructive by design, so startup only attempts it
+    when explicitly enabled and the target database has no application data.
+    """
+    auto_import = os.getenv("LEGACY_AUTO_IMPORT", "").strip().lower() in {"1", "true", "yes", "on"}
+    if not auto_import:
+        return
     legacy_path = Path(os.getenv("LEGACY_DB_PATH", "old_erp.sqlite"))
     marker = Path(".legacy_import_once.marker")
     if not legacy_path.exists():
@@ -231,7 +238,17 @@ def _maybe_run_legacy_import():
     if marker.exists():
         return
     try:
-        from migrate_sqlite import run_import
+        from migrate_sqlite import run_import, target_existing_data_counts
+
+        db = SessionLocal()
+        try:
+            existing_counts = target_existing_data_counts(db)
+        finally:
+            db.close()
+        if any(count > 0 for count in existing_counts.values()):
+            populated = ", ".join(f"{name}={count}" for name, count in existing_counts.items() if count > 0)
+            log.warning("legacy auto-import skipped because target database is not empty (%s)", populated)
+            return
 
         run_import(force=False)
         log.info("legacy ERP data imported from %s", legacy_path)

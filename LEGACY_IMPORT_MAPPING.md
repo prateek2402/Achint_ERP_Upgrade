@@ -118,7 +118,7 @@ The legacy database contains:
 
 ## Selective merge import (production clients only)
 
-Use `--mode merge` to replace **named clients only** in `erp_database.sqlite` without truncating the whole database. Other clients, and (by default) local users, are kept. Merge does **not** write `.legacy_import_once.marker` (startup auto-import is unchanged).
+Use `--mode merge` to replace **named clients only** in `erp_database.sqlite` without truncating the whole database. Other clients, and (by default) local users, are kept. Merge does **not** write `.legacy_import_once.marker`. Startup auto-import is disabled unless `LEGACY_AUTO_IMPORT=1` and the target DB is empty.
 
 ```powershell
 # List clients in the legacy export
@@ -131,4 +131,4 @@ Use `--mode merge` to replace **named clients only** in `erp_database.sqlite` wi
 .\venv\Scripts\python.exe migrate_sqlite.py --mode merge --clients-file clients_to_import.txt --legacy-path old_erp.sqlite
 ```
 
-Optional flags for merge: `--import-users`, `--import-settings` (both default off). Full replace remains the default: `migrate_sqlite.py` or `migrate_sqlite.py --mode replace --force`.
+Optional flags for merge: `--import-users`, `--import-settings` (both default off). Full replace remains the default for `migrate_sqlite.py`, but replacing a populated target now requires `--force`.
