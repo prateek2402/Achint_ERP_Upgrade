@@ -100,7 +100,10 @@ def recalculate_client_ledger(client_id: int, db):
     inv_map = {inv.invoice_no: inv for inv in invoices}
 
     for inv in invoices:
-        inv.net_payable = (inv.total or 0.0) - (inv.advance_adj or 0.0)
+        inv.net_payable = max(
+            0.0,
+            (inv.total or 0.0) - (inv.advance_adj or 0.0) - (inv.tds_ded or 0.0),
+        )
         inv.paid = 0.0
         inv.balance = inv.net_payable
 
@@ -126,7 +129,7 @@ def recalculate_client_ledger(client_id: int, db):
             total_excess -= alloc_sum
 
     client.excess_funds = max(0.0, total_excess)
-    db.commit()
+    db.flush()
 
 
 def truncate_target_tables(db):
@@ -141,7 +144,21 @@ def truncate_target_tables(db):
     db.query(Client).delete()
     db.query(User).delete()
     db.query(SystemSettings).delete()
-    db.commit()
+
+
+def target_existing_data_counts(db) -> dict[str, int]:
+    return {
+        "clients": db.query(Client).count(),
+        "purchase_orders": db.query(PurchaseOrder).count(),
+        "invoices": db.query(Invoice).count(),
+        "payments": db.query(PaymentHistory).count(),
+        "users": db.query(User).count(),
+        "system_settings": db.query(SystemSettings).count(),
+    }
+
+
+def target_has_existing_data(db) -> bool:
+    return any(count > 0 for count in target_existing_data_counts(db).values())
 
 
 def empty_counts() -> dict:
@@ -692,9 +709,14 @@ def run_import(
 
     try:
         if mode == "replace":
+            existing_counts = target_existing_data_counts(db)
+            if any(count > 0 for count in existing_counts.values()) and not force:
+                populated = ", ".join(f"{name}={count}" for name, count in existing_counts.items() if count > 0)
+                raise RuntimeError(
+                    "Target database is not empty; refusing full replace without --force "
+                    f"({populated})."
+                )
             truncate_target_tables(db)
-        else:
-            db.commit()
 
         if do_settings:
             import_settings_block(db, app_data)
@@ -730,7 +752,6 @@ def run_import(
                 assert_no_global_collisions(db, data, exclude_client_id=exclude_id)
                 if existing:
                     delete_client_for_reimport(db, existing)
-                    db.commit()
 
             block = import_client_block(db, client_name, data, used_payment_ids)
             merge_counts(report, block)
@@ -738,8 +759,6 @@ def run_import(
             client_row = db.query(Client).filter(Client.name == str(client_name).strip()).first()
             if client_row:
                 imported_client_ids.append(client_row.id)
-
-        db.commit()
 
         for cid in imported_client_ids:
             recalculate_client_ledger(cid, db)
@@ -755,6 +774,7 @@ def run_import(
 
         report["success"] = True
         report["completed_at"] = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+        db.commit()
         STATUS_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
         if mode == "replace":
             RUN_MARKER_PATH.write_text(report["completed_at"], encoding="utf-8")
@@ -807,7 +827,11 @@ def main():
         choices=["import", "list-clients"],
         help="import (default): load data; list-clients: preview legacy client names.",
     )
-    parser.add_argument("--force", action="store_true", help="Allow re-running full replace when marker exists.")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow full replace when the target has data or the one-time marker exists.",
+    )
     parser.add_argument(
         "--legacy-path",
         default=None,
