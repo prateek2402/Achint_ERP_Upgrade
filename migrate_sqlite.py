@@ -33,6 +33,18 @@ load_dotenv()
 STATUS_PATH = Path("legacy_import_status.json")
 RUN_MARKER_PATH = Path(".legacy_import_once.marker")
 PBKDF2_ROUNDS = 210000
+PROTECTED_TARGET_MODELS = (
+    User,
+    Client,
+    PurchaseOrder,
+    PoBaselineItem,
+    Invoice,
+    InvoiceDispatchItem,
+    PaymentHistory,
+    PaymentAllocation,
+    UnallocatedPaymentRegister,
+    UnallocatedAdvanceRegister,
+)
 
 
 def target_database_url() -> str:
@@ -141,7 +153,10 @@ def truncate_target_tables(db):
     db.query(Client).delete()
     db.query(User).delete()
     db.query(SystemSettings).delete()
-    db.commit()
+
+
+def target_has_existing_data(db) -> bool:
+    return any(db.query(model).first() is not None for model in PROTECTED_TARGET_MODELS)
 
 
 def empty_counts() -> dict:
@@ -254,19 +269,27 @@ def assert_no_global_collisions(db, data: dict, exclude_client_id: int | None = 
             )
 
 
-def import_users_block(db, users_rows: list, counts: dict) -> None:
+def import_users_block(db, users_rows: list, counts: dict, skip_existing: bool = False) -> None:
     counts["users"]["read"] = len(users_rows)
+    existing_usernames: set[str] = set()
+    if skip_existing:
+        existing_usernames = {str(row[0]).strip().casefold() for row in db.query(User.username).all() if row[0]}
     for _, username, password, role in users_rows:
-        if not str(username or "").strip():
+        normalized_username = str(username or "").strip()
+        if not normalized_username:
+            counts["users"]["skipped"] += 1
+            continue
+        if skip_existing and normalized_username.casefold() in existing_usernames:
             counts["users"]["skipped"] += 1
             continue
         db.add(
             User(
-                username=str(username).strip(),
+                username=normalized_username,
                 hashed_password=hash_password(str(password or "")),
                 role=normalize_role(role),
             )
         )
+        existing_usernames.add(normalized_username.casefold())
         counts["users"]["inserted"] += 1
 
 
@@ -691,10 +714,14 @@ def run_import(
     imported_client_ids: list[int] = []
 
     try:
+        if mode == "replace" and not force and target_has_existing_data(db):
+            raise RuntimeError(
+                "Target database is not empty; full replace would delete existing ERP data. "
+                "Re-run with --force only after taking a verified backup."
+            )
+
         if mode == "replace":
             truncate_target_tables(db)
-        else:
-            db.commit()
 
         if do_settings:
             import_settings_block(db, app_data)
@@ -703,9 +730,7 @@ def run_import(
             if mode == "replace":
                 import_users_block(db, users_rows, report["counts"])
             else:
-                db.query(User).delete()
-                db.flush()
-                import_users_block(db, users_rows, report["counts"])
+                import_users_block(db, users_rows, report["counts"], skip_existing=True)
 
         used_payment_ids = load_existing_payment_ids(db) if mode == "merge" else set()
         report["counts"]["clients"]["read"] = len(client_names)
@@ -730,7 +755,6 @@ def run_import(
                 assert_no_global_collisions(db, data, exclude_client_id=exclude_id)
                 if existing:
                     delete_client_for_reimport(db, existing)
-                    db.commit()
 
             block = import_client_block(db, client_name, data, used_payment_ids)
             merge_counts(report, block)
