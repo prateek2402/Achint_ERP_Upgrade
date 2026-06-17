@@ -9,6 +9,11 @@ def upgrade():
         print("✅ Success: Added inspected_qty to PO Baseline Items.")
     except Exception as e:
         print(f"Notice: {e}")
+    try:
+        c.execute("ALTER TABLE invoice_dispatch_items ADD COLUMN inspected_qty FLOAT DEFAULT 0.0;")
+        print("✅ Success: Added inspected_qty to Invoice Dispatch Items.")
+    except Exception as e:
+        print(f"Notice: {e}")
     conn.commit()
     conn.close()
 

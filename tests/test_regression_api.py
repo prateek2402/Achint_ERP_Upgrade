@@ -1,4 +1,5 @@
 import datetime
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -180,6 +181,160 @@ def test_auth_and_permission_guards(client: TestClient):
     # Admin happy path still works.
     as_admin = client.post("/api/clients", json={"name": "OK-CLIENT"}, headers=auth_header(admin_token))
     assert as_admin.status_code == 200
+
+
+def test_purchase_order_status_and_delete_do_not_crash(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    created = client.post("/api/clients", json={"name": "PO-CRASH-CLIENT"}, headers=auth_header(token))
+    assert created.status_code == 200, created.text
+    client_id = created.json()["id"]
+
+    po_payload = {
+        "client_id": client_id,
+        "po_no": "PO-STATUS-1",
+        "contact_person": "Ops",
+        "project_name": "Critical Path",
+        "adv_pct": 0.0,
+        "ret_pct": 0.0,
+        "ret_base": "total",
+        "tds_enabled": False,
+        "tds_rate": 0.0,
+        "tds_threshold": 0.0,
+        "baseline_items": [],
+    }
+    po = client.post("/api/purchase-orders", json=po_payload, headers=auth_header(token))
+    assert po.status_code == 200, po.text
+
+    status = client.put(
+        "/api/purchase-orders/PO-STATUS-1/status",
+        json={"is_completed": True, "is_hidden": True},
+        headers=auth_header(token),
+    )
+    assert status.status_code == 200, status.text
+
+    po_list = client.get(
+        "/api/purchase-orders",
+        params={"include_hidden": "true"},
+        headers=auth_header(token),
+    )
+    assert po_list.status_code == 200, po_list.text
+    updated = next(p for p in po_list.json() if p["po_no"] == "PO-STATUS-1")
+    assert updated["is_completed"] is True
+    assert updated["is_hidden"] is True
+
+    deleted = client.delete("/api/purchase-orders/PO-STATUS-1", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+    after = client.get(
+        "/api/purchase-orders",
+        params={"include_hidden": "true"},
+        headers=auth_header(token),
+    )
+    assert all(p["po_no"] != "PO-STATUS-1" for p in after.json())
+
+
+def test_transfer_move_reopens_source_receipt_allocations(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    source = client.post("/api/clients", json={"name": "MOVE-SOURCE"}, headers=auth_header(token))
+    assert source.status_code == 200, source.text
+    source_id = source.json()["id"]
+    dest = client.post("/api/clients", json={"name": "MOVE-DEST"}, headers=auth_header(token))
+    assert dest.status_code == 200, dest.text
+    dest_id = dest.json()["id"]
+
+    inv_payload = {
+        "client_id": source_id,
+        "po_no": "UNASSIGNED",
+        "invoice_no": "INV-MOVE-1",
+        "sub_entity": "",
+        "lr_no": "",
+        "inv_date": "2026-04-01",
+        "due_date": None,
+        "basic": 500.0,
+        "gst": 0.0,
+        "total": 500.0,
+        "advance_adj": 0.0,
+        "tds_ded": 0.0,
+        "retention_held": 0.0,
+        "net_payable": 0.0,
+        "paid": 0.0,
+        "balance": 0.0,
+        "is_note": False,
+        "note_type": None,
+        "note_reason": None,
+        "dispatch_items": [],
+    }
+    inv = client.post("/api/invoices", json=inv_payload, headers=auth_header(token))
+    assert inv.status_code == 200, inv.text
+
+    pay = client.post("/api/payments/allocate", json={
+        "client_id": source_id,
+        "id": "PAY-MOVE-1",
+        "date": datetime.date.today().isoformat(),
+        "amount": 200.0,
+        "note": "before transfer",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-MOVE-1", "amount": 200.0}],
+        "fund_source": "receipt",
+    }, headers=auth_header(token))
+    assert pay.status_code == 200, pay.text
+
+    moved = client.post(
+        "/api/invoices/INV-MOVE-1/transfer",
+        json={"new_client_id": dest_id, "action": "move"},
+        headers=auth_header(token),
+    )
+    assert moved.status_code == 200, moved.text
+
+    invoices = client.get("/api/invoices", headers=auth_header(token)).json()
+    moved_inv = next(i for i in invoices if i["id"] == "INV-MOVE-1")
+    assert moved_inv["client_id"] == dest_id
+    assert moved_inv["paid"] == pytest.approx(0.0)
+    assert moved_inv["balance"] == pytest.approx(500.0)
+
+    payments = client.get("/api/payments", headers=auth_header(token)).json()
+    source_payment = next(p for p in payments if p["id"] == "PAY-MOVE-1")
+    assert not any(a.get("invId") == "INV-MOVE-1" for a in source_payment.get("allocations", []))
+
+    clients = client.get("/api/clients", headers=auth_header(token)).json()
+    source_client = next(c for c in clients if c["id"] == source_id)
+    assert source_client["excess_funds"] == pytest.approx(200.0)
+
+
+def test_ensure_schema_columns_adds_inspected_qty_to_legacy_tables(tmp_path, monkeypatch):
+    db_file = tmp_path / "legacy_schema.sqlite"
+    conn = sqlite3.connect(db_file)
+    try:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE clients (id INTEGER PRIMARY KEY, name TEXT)")
+        cur.execute("CREATE TABLE purchase_orders (id INTEGER PRIMARY KEY, client_id INTEGER, po_no TEXT)")
+        cur.execute(
+            "CREATE TABLE po_baseline_items ("
+            "id INTEGER PRIMARY KEY, po_id INTEGER, description TEXT, ordered_qty REAL, uom TEXT)"
+        )
+        cur.execute(
+            "CREATE TABLE invoice_dispatch_items ("
+            "id INTEGER PRIMARY KEY, invoice_id INTEGER, description TEXT, dispatched_qty REAL, uom TEXT)"
+        )
+        cur.execute("CREATE TABLE system_settings (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(app_module, "DB_FILE_PATH", Path(db_file))
+    app_module.ensure_schema_columns()
+
+    conn = sqlite3.connect(db_file)
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(po_baseline_items)")
+        baseline_cols = {row[1] for row in cur.fetchall()}
+        cur.execute("PRAGMA table_info(invoice_dispatch_items)")
+        dispatch_cols = {row[1] for row in cur.fetchall()}
+    finally:
+        conn.close()
+
+    assert "inspected_qty" in baseline_cols
+    assert "inspected_qty" in dispatch_cols
 
 
 def test_payment_allocations_use_invid_field(client: TestClient):
