@@ -153,6 +153,13 @@ def test_login_exposes_expiry_fields(client: TestClient):
     assert delta <= app_module.JWT_EXPIRY_HOURS * 3600 + 5  # allow a tiny slop
 
 
+def test_auth_helper_hydrates_session_storage_for_persisted_roles():
+    """Restored localStorage sessions must still satisfy legacy role reads in index.html."""
+    api_js = Path("public/js/api.js").read_text(encoding="utf-8")
+    get_token_body = api_js.split("getToken: function () {", 1)[1].split("},", 1)[0]
+    assert "mirrorLocalSession();" in get_token_body
+
+
 def test_app_logging_module_emits_request_id(caplog):
     from app_logging import REQUEST_ID, configure_logging, get_logger
     configure_logging()

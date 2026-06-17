@@ -51,6 +51,66 @@ def _h(token: str):
     return {"Authorization": f"Bearer {token}"}
 
 
+def test_admin_can_create_user_without_partial_failure(api_client: TestClient):
+    token = _login(api_client)
+
+    created = api_client.post(
+        "/api/users",
+        json={"username": "ops.user", "password": "OpsUser@12345", "role": "user"},
+        headers=_h(token),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["success"] is True
+
+    login = api_client.post("/api/login", json={"username": "ops.user", "password": "OpsUser@12345"})
+    assert login.status_code == 200, login.text
+    assert login.json()["role"] == "user"
+
+
+def test_admin_can_update_and_delete_purchase_order(api_client: TestClient):
+    token = _login(api_client)
+
+    c = api_client.post("/api/clients", json={"name": "PO Admin Co"}, headers=_h(token))
+    assert c.status_code == 200, c.text
+    client_id = c.json()["id"]
+
+    po_payload = {
+        "client_id": client_id,
+        "po_no": "PO-ADMIN-1",
+        "contact_person": "QA",
+        "project_name": "Admin Controls",
+        "adv_pct": 0.0,
+        "ret_pct": 0.0,
+        "ret_base": "total",
+        "tds_enabled": False,
+        "tds_rate": 0.0,
+        "tds_threshold": 0.0,
+        "baseline_items": [],
+    }
+    po = api_client.post("/api/purchase-orders", json=po_payload, headers=_h(token))
+    assert po.status_code == 200, po.text
+
+    status = api_client.put(
+        "/api/purchase-orders/PO-ADMIN-1/status",
+        json={"is_completed": True, "is_hidden": False},
+        headers=_h(token),
+    )
+    assert status.status_code == 200, status.text
+
+    po_list = api_client.get("/api/purchase-orders", headers=_h(token))
+    assert po_list.status_code == 200, po_list.text
+    po_obj = next(p for p in po_list.json() if p["po_no"] == "PO-ADMIN-1")
+    assert po_obj["is_completed"] is True
+    assert po_obj["completed_at"] is not None
+
+    deleted = api_client.delete("/api/purchase-orders/PO-ADMIN-1", headers=_h(token))
+    assert deleted.status_code == 200, deleted.text
+
+    po_list = api_client.get("/api/purchase-orders", headers=_h(token))
+    assert po_list.status_code == 200, po_list.text
+    assert all(p["po_no"] != "PO-ADMIN-1" for p in po_list.json())
+
+
 def test_contract_clients_purchase_orders_invoices_payments(api_client: TestClient):
     token = _login(api_client)
 
