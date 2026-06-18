@@ -37,6 +37,12 @@
     }
     function setOne(key, v) { lsSet(key, v); ssSet(key, v); }
     function remOne(key) { lsRem(key); ssRem(key); }
+    function mirrorLocalSessionToSessionStorage() {
+        [TOKEN_KEY, ROLE_KEY, USER_KEY, EXPIRY_KEY].forEach(function (key) {
+            var v = lsGet(key);
+            if (v != null) ssSet(key, v);
+        });
+    }
 
     function isExpired() {
         var raw = lsGet(EXPIRY_KEY) || ssGet(EXPIRY_KEY);
@@ -51,7 +57,9 @@
         // for sessionStorage.getItem('erp_token') used throughout the app.
         getToken: function () {
             if (isExpired()) { ErpAuth.clearSession(); return null; }
-            return getOne(TOKEN_KEY);
+            var token = getOne(TOKEN_KEY);
+            if (token) mirrorLocalSessionToSessionStorage();
+            return token;
         },
         getRole: function () { return getOne(ROLE_KEY); },
         getUsername: function () { return getOne(USER_KEY); },

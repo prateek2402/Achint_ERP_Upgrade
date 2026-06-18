@@ -182,6 +182,47 @@ def test_auth_and_permission_guards(client: TestClient):
     assert as_admin.status_code == 200
 
 
+def test_admin_user_create_and_po_lifecycle_endpoints(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+
+    created_user = client.post(
+        "/api/users",
+        json={"username": "ops-admin", "password": "OpsAdmin@1234", "role": "user"},
+        headers=auth_header(token),
+    )
+    assert created_user.status_code == 200, created_user.text
+    assert created_user.json()["id"] > 0
+
+    cr = client.post("/api/clients", json={"name": "PO-LIFECYCLE"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+    po_payload = {
+        "client_id": client_id,
+        "po_no": "PO-LIFE-1",
+        "contact_person": "",
+        "project_name": "",
+        "adv_pct": 0.0,
+        "ret_pct": 0.0,
+        "ret_base": "basic",
+        "tds_enabled": False,
+        "tds_rate": 0.0,
+        "tds_threshold": 0.0,
+        "baseline_items": [],
+    }
+    po = client.post("/api/purchase-orders", json=po_payload, headers=auth_header(token))
+    assert po.status_code == 200, po.text
+
+    status = client.put(
+        "/api/purchase-orders/PO-LIFE-1/status",
+        json={"is_completed": True, "is_hidden": False},
+        headers=auth_header(token),
+    )
+    assert status.status_code == 200, status.text
+
+    deleted = client.delete("/api/purchase-orders/PO-LIFE-1", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+
+
 def test_payment_allocations_use_invid_field(client: TestClient):
     """Locks the /api/payments allocation contract so the SPA Payment Log cell keeps working.
 
@@ -267,10 +308,10 @@ def test_delete_then_readd_invoice_drops_old_allocations(client: TestClient):
         "client_id": client_id,
         "id": "PAY-1",
         "date": datetime.date.today().isoformat(),
-        "amount": 500.0,
+        "amount": 5.0,
         "note": "receipt",
         "mode": "targeted",
-        "targets": [{"inv_id": "INV-001", "amount": 500.0}],
+        "targets": [{"inv_id": "INV-001", "amount": 5.0}],
         "hold_ret": False,
         "hold_gst": False,
         "only_gst": False,
@@ -335,6 +376,67 @@ def test_delete_then_readd_invoice_drops_old_allocations(client: TestClient):
     invs = client.get("/api/invoices", headers=auth_header(token)).json()
     inv = next(i for i in invs if i["id"] == "INV-001")
     assert inv["paid"] == pytest.approx(0.0)
+
+
+def test_move_invoice_reopens_old_receipt_allocation(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    old_client_id = create_client_po_invoice(client, token)
+    new_client = client.post("/api/clients", json={"name": "MOVE-DEST"}, headers=auth_header(token))
+    assert new_client.status_code == 200, new_client.text
+    new_client_id = new_client.json()["id"]
+
+    alloc = client.post("/api/payments/allocate", json={
+        "client_id": old_client_id,
+        "id": "PAY-MOVE-1",
+        "date": datetime.date.today().isoformat(),
+        "amount": 500.0,
+        "note": "receipt before move",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-001", "amount": 500.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "move_to_po": None,
+        "po_no": None,
+        "clear_po_pool": False,
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert alloc.status_code == 200, alloc.text
+
+    moved = client.post(
+        "/api/invoices/INV-001/transfer",
+        json={"new_client_id": new_client_id, "action": "move"},
+        headers=auth_header(token),
+    )
+    assert moved.status_code == 200, moved.text
+
+    registers = client.get(
+        "/api/registers/unallocated-payments",
+        params={"client_id": old_client_id},
+        headers=auth_header(token),
+    )
+    assert registers.status_code == 200, registers.text
+    moved_rows = [
+        r for r in registers.json()
+        if r.get("source_kind") == "invoice_moved" and r.get("source_invoice_no") == "INV-001"
+    ]
+    assert moved_rows, f"expected invoice_moved register row, got: {registers.json()}"
+    assert moved_rows[0]["balance"] == pytest.approx(5.0)
+
+    payments = client.get("/api/payments", headers=auth_header(token))
+    assert payments.status_code == 200
+    for payment in payments.json():
+        for allocation in payment.get("allocations", []):
+            assert allocation.get("invId") != "INV-001"
+
+    invoices = client.get("/api/invoices", headers=auth_header(token))
+    assert invoices.status_code == 200
+    moved_invoice = next(i for i in invoices.json() if i["id"] == "INV-001")
+    assert moved_invoice["client_id"] == new_client_id
+    assert moved_invoice["paid"] == pytest.approx(0.0)
 
 
 def test_reverse_unallocated_applied_restores_register_for_applet(client: TestClient):
@@ -1215,3 +1317,138 @@ def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
     assert db.query(User).filter(User.username == "localadmin").count() == 1
     assert db.query(User).filter(User.username == "legacyadmin").count() == 0
     db.close()
+
+
+def test_replace_import_failure_rolls_back_existing_database(tmp_path, monkeypatch):
+    import json
+    import sqlite3
+
+    import migrate_sqlite as mig
+    from models import Client, User
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old.sqlite"
+    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
+    monkeypatch.chdir(tmp_path)
+
+    duplicate_invoice = {
+        "id": "DUP-INV",
+        "poNo": "UNASSIGNED",
+        "invDate": "2026-01-01",
+        "dueDate": "2026-02-01",
+        "basic": 100.0,
+        "gst": 0.0,
+        "total": 100.0,
+        "advance": 0.0,
+        "tds": 0.0,
+        "retention": 0.0,
+        "netPayable": 100.0,
+        "paid": 0.0,
+        "balance": 100.0,
+    }
+    app_data = {
+        "_settings": {"exchangeRate": 83.0, "customColumns": []},
+        "LegacyA": {"active": True, "invoices": [duplicate_invoice], "paymentHistory": [], "poTerms": {}},
+        "LegacyB": {"active": True, "invoices": [duplicate_invoice], "paymentHistory": [], "poTerms": {}},
+    }
+    conn = sqlite3.connect(str(legacy_db))
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT, role TEXT)")
+    conn.execute("CREATE TABLE erp_data (id INTEGER PRIMARY KEY, json_data TEXT)")
+    conn.execute("INSERT INTO users VALUES (1, 'legacyadmin', 'pass', 'admin')")
+    conn.execute("INSERT INTO erp_data VALUES (1, ?)", (json.dumps(app_data),))
+    conn.commit()
+    conn.close()
+
+    _, SessionLocal = mig.open_target_session()
+    db = SessionLocal()
+    db.add(User(username="keepadmin", hashed_password=mig.hash_password("secret"), role="admin"))
+    db.add(Client(name="KeepClient", active=True, excess_funds=0.0))
+    db.commit()
+    db.close()
+
+    with pytest.raises(Exception):
+        mig.run_import(mode="replace", legacy_path=str(legacy_db))
+
+    db = SessionLocal()
+    try:
+        assert db.query(Client).filter(Client.name == "KeepClient").count() == 1
+        assert db.query(User).filter(User.username == "keepadmin").count() == 1
+    finally:
+        db.close()
+
+
+def test_merge_import_failure_keeps_existing_client(tmp_path, monkeypatch):
+    import json
+    import sqlite3
+
+    import migrate_sqlite as mig
+    from models import Client, Invoice
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old.sqlite"
+    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
+    monkeypatch.chdir(tmp_path)
+
+    app_data = {
+        "_settings": {"exchangeRate": 83.0, "customColumns": []},
+        "ClientA": {
+            "active": True,
+            "invoices": [{
+                "id": "INV-A-NEW",
+                "poNo": "UNASSIGNED",
+                "invDate": "2026-01-01",
+                "dueDate": "2026-02-01",
+                "basic": 100.0,
+                "gst": 0.0,
+                "total": 100.0,
+                "advance": 0.0,
+                "tds": 0.0,
+                "retention": 0.0,
+                "netPayable": 100.0,
+                "paid": 0.0,
+                "balance": 100.0,
+            }],
+            "paymentHistory": [],
+            "poTerms": {},
+        },
+    }
+    conn = sqlite3.connect(str(legacy_db))
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT, role TEXT)")
+    conn.execute("CREATE TABLE erp_data (id INTEGER PRIMARY KEY, json_data TEXT)")
+    conn.execute("INSERT INTO erp_data VALUES (1, ?)", (json.dumps(app_data),))
+    conn.commit()
+    conn.close()
+
+    _, SessionLocal = mig.open_target_session()
+    db = SessionLocal()
+    client_a = Client(name="ClientA", active=True, excess_funds=0.0)
+    db.add(client_a)
+    db.flush()
+    db.add(
+        Invoice(
+            client_id=client_a.id,
+            invoice_no="INV-A-OLD",
+            basic=25.0,
+            total=25.0,
+            net_payable=25.0,
+            balance=25.0,
+        )
+    )
+    db.commit()
+    db.close()
+
+    def fail_import_client_block(*args, **kwargs):
+        raise RuntimeError("forced import failure")
+
+    monkeypatch.setattr(mig, "import_client_block", fail_import_client_block)
+
+    with pytest.raises(RuntimeError, match="forced import failure"):
+        mig.run_import(mode="merge", clients="ClientA", legacy_path=str(legacy_db))
+
+    db = SessionLocal()
+    try:
+        client_a = db.query(Client).filter(Client.name == "ClientA").one()
+        inv_nos = {inv.invoice_no for inv in db.query(Invoice).filter(Invoice.client_id == client_a.id).all()}
+        assert inv_nos == {"INV-A-OLD"}
+    finally:
+        db.close()
