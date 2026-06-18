@@ -230,6 +230,20 @@ def _maybe_run_legacy_import():
         return
     if marker.exists():
         return
+    db = SessionLocal()
+    try:
+        has_existing_data = any(
+            db.query(model).first() is not None
+            for model in (User, Client, PurchaseOrder, Invoice, PaymentHistory)
+        )
+    finally:
+        db.close()
+    if has_existing_data:
+        log.warning(
+            "legacy ERP auto-import skipped because target database already contains data; "
+            "run migrate_sqlite.py explicitly for intentional imports"
+        )
+        return
     try:
         from migrate_sqlite import run_import
 
@@ -988,60 +1002,6 @@ def create_user(user_data: UserCreate, current_user: User = Depends(get_current_
     new_user = User(username=username, hashed_password=hash_password(user_data.password), role=normalized_role)
     db.add(new_user)
     db.commit()
-    if inv.po_no and inv.po_no != "UNASSIGNED":
-        po_obj = db.query(PurchaseOrder).filter(
-            PurchaseOrder.client_id == inv.client_id,
-            PurchaseOrder.po_no == inv.po_no
-        ).first()
-        if po_obj and float(po_obj.adv_pct or 0.0) > 0:
-            added_by_payment: dict[str, float] = defaultdict(float)
-            consumed_by_payment: dict[str, float] = defaultdict(float)
-            po_allocs = db.query(PaymentAllocation).join(
-                PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id
-            ).filter(
-                PaymentHistory.client_id == inv.client_id,
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.alloc_type.in_(["po_advance", "po_advance_applied"]),
-            ).all()
-            for al in po_allocs:
-                pid = str(al.payment_id or "").strip()
-                if not pid:
-                    continue
-                if al.alloc_type == "po_advance":
-                    added_by_payment[pid] += float(al.amount or 0.0)
-                elif al.alloc_type == "po_advance_applied":
-                    consumed_by_payment[pid] += float(al.amount or 0.0)
-
-            base_amt = float(new_inv.basic or 0.0) if (po_obj.ret_base or "total") == "basic" else float(new_inv.total or 0.0)
-            max_allowed = max(0.0, base_amt * (float(po_obj.adv_pct or 0.0) / 100.0))
-            existing_applied = db.query(PaymentAllocation).filter(
-                PaymentAllocation.alloc_type == "po_advance_applied",
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.target_inv_id == new_inv.invoice_no
-            ).all()
-            already_applied = sum(float(a.amount or 0.0) for a in existing_applied)
-            shortfall = max(0.0, max_allowed - already_applied)
-
-            if shortfall > 0:
-                for pid, added_amt in added_by_payment.items():
-                    remaining_amt = float(added_amt) - float(consumed_by_payment.get(pid, 0.0))
-                    if remaining_amt <= 0:
-                        continue
-                    take = min(shortfall, remaining_amt)
-                    if take <= 0:
-                        continue
-                    db.add(PaymentAllocation(
-                        payment_id=pid,
-                        alloc_type="po_advance_applied",
-                        target_inv_id=new_inv.invoice_no,
-                        target_po_no=inv.po_no,
-                        note_id=None,
-                        amount=float(take),
-                    ))
-                    shortfall -= take
-                    if shortfall <= 0:
-                        break
-        db.commit()
     return {"success": True, "id": new_user.id}
 
 
@@ -1340,8 +1300,6 @@ def update_purchase_order_status(po_no: str, status: POStatusSchema, current_use
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
     po = po_query.first()
     if not po:
         raise HTTPException(status_code=404, detail="PO not found")
@@ -1356,8 +1314,6 @@ def delete_purchase_order(po_no: str, current_user: User = Depends(get_current_u
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
     po = po_query.first()
     if po:
         client_id = po.client_id
@@ -4161,10 +4117,61 @@ def transfer_invoice(invoice_no: str, req: TransferRequest, request: Request, cu
         db.commit()
         recalculate_client_ledger(req.new_client_id, db)
     elif req.action == "move":
+        old_po_no = db_inv.purchase_order.po_no if db_inv.purchase_order else "UNASSIGNED"
+        reopened_unallocated_by_payment: dict[str, float] = defaultdict(float)
+        allocs = db.query(PaymentAllocation).filter(
+            or_(
+                PaymentAllocation.target_inv_id == db_inv.invoice_no,
+                PaymentAllocation.note_id == db_inv.invoice_no
+            )
+        ).all()
+        pay_map = {}
+        if allocs:
+            pids = list({a.payment_id for a in allocs if a.payment_id})
+            if pids:
+                pay_rows = db.query(PaymentHistory).filter(PaymentHistory.id.in_(pids)).all()
+                pay_map = {p.id: p for p in pay_rows}
+        linked_payment_ids = {a.payment_id for a in allocs if a.payment_id}
+        for al in allocs:
+            pay_obj = pay_map.get(al.payment_id)
+            if pay_obj and pay_obj.type == "RECEIPT" and al.alloc_type == "invoice":
+                reopened_unallocated_by_payment[al.payment_id] += float(al.amount or 0.0)
+            db.delete(al)
+        for pid in linked_payment_ids:
+            remaining = db.query(PaymentAllocation).filter(PaymentAllocation.payment_id == pid).count()
+            if remaining == 0:
+                ph = db.query(PaymentHistory).filter(
+                    PaymentHistory.id == pid,
+                    PaymentHistory.type.in_(["ADVANCE_APPLIED", "NOTE_APPLIED", "UNALLOCATED_APPLIED"])
+                ).first()
+                if ph:
+                    db.delete(ph)
+        db.flush()
+        for pay_id, reopened_amt in reopened_unallocated_by_payment.items():
+            reopened_amt = round_inr_nearest(reopened_amt)
+            if reopened_amt <= 0:
+                continue
+            db.add(UnallocatedPaymentRegister(
+                client_id=old_client_id,
+                source_payment_id=pay_id,
+                created_on=datetime.date.today(),
+                amount=float(reopened_amt),
+                balance=float(reopened_amt),
+                status="open",
+                note=_build_unallocated_register_note(
+                    "invoice_moved",
+                    f"Invoice {invoice_no} moved to client {req.new_client_id}; allocation reopened.",
+                    invoice_no=invoice_no,
+                    po_no=old_po_no,
+                ),
+            ))
         db_inv.client_id = req.new_client_id
         db_inv.po_id = None
         db_inv.advance_adj = 0
         db_inv.paid = 0
+        db_inv.balance = float(db_inv.net_payable or db_inv.total or 0.0)
+        if old_po_no and old_po_no != "UNASSIGNED":
+            _auto_apply_po_advance(old_client_id, db, old_po_no)
         db.commit()
         recalculate_client_ledger(old_client_id, db)
         recalculate_client_ledger(req.new_client_id, db)

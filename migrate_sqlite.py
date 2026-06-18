@@ -141,7 +141,6 @@ def truncate_target_tables(db):
     db.query(Client).delete()
     db.query(User).delete()
     db.query(SystemSettings).delete()
-    db.commit()
 
 
 def empty_counts() -> dict:
@@ -229,6 +228,11 @@ def assert_no_global_collisions(db, data: dict, exclude_client_id: int | None = 
     for po_no in (data.get("poTerms") or {}).keys():
         p = str(po_no or "").strip()
         if p:
+            po_nos.append(p)
+    for inv in data.get("invoices") or []:
+        inv = inv or {}
+        p = str(inv.get("poNo", "")).strip()
+        if p and p != "UNASSIGNED":
             po_nos.append(p)
 
     if invoice_nos:
@@ -730,7 +734,6 @@ def run_import(
                 assert_no_global_collisions(db, data, exclude_client_id=exclude_id)
                 if existing:
                     delete_client_for_reimport(db, existing)
-                    db.commit()
 
             block = import_client_block(db, client_name, data, used_payment_ids)
             merge_counts(report, block)
@@ -740,6 +743,11 @@ def run_import(
                 imported_client_ids.append(client_row.id)
 
         db.commit()
+        if mode == "replace":
+            RUN_MARKER_PATH.write_text(
+                datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z"),
+                encoding="utf-8",
+            )
 
         for cid in imported_client_ids:
             recalculate_client_ledger(cid, db)
@@ -756,8 +764,6 @@ def run_import(
         report["success"] = True
         report["completed_at"] = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
         STATUS_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        if mode == "replace":
-            RUN_MARKER_PATH.write_text(report["completed_at"], encoding="utf-8")
 
         print("[INFO] Legacy import completed successfully.")
         print(json.dumps(report["counts"], indent=2))

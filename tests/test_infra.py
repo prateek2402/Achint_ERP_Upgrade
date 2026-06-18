@@ -133,6 +133,25 @@ def test_lifespan_runs_schema_bootstrap_when_app_starts(client: TestClient):
     assert "uploaded_documents" in tables
 
 
+def test_startup_legacy_auto_import_skips_populated_database(client: TestClient, tmp_path, monkeypatch):
+    import migrate_sqlite
+
+    legacy_db = tmp_path / "old_erp.sqlite"
+    legacy_db.write_bytes(b"placeholder")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEGACY_DB_PATH", str(legacy_db))
+    called = {"run_import": False}
+
+    def fake_run_import(*args, **kwargs):
+        called["run_import"] = True
+
+    monkeypatch.setattr(migrate_sqlite, "run_import", fake_run_import)
+
+    app_module._maybe_run_legacy_import()
+
+    assert called["run_import"] is False
+
+
 def test_login_exposes_expiry_fields(client: TestClient):
     """The SPA caches credentials in localStorage and expires them at exactly
     the same instant the backend stops accepting the JWT. /api/login must
