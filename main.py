@@ -3712,7 +3712,7 @@ def _parse_unallocated_register_note(note: Optional[str]) -> tuple[str, Optional
         key = (k or "").strip().upper()
         val = (v or "").strip()
         if key == "SRC" and val:
-            source = "invoice_deleted" if val.lower() == "invoice_deleted" else "direct_payment"
+            source = val.lower() if val.lower() in {"invoice_deleted", "invoice_moved"} else "direct_payment"
         elif key == "INV" and val:
             inv = val
         elif key == "PO" and val:

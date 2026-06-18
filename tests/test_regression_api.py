@@ -308,10 +308,10 @@ def test_delete_then_readd_invoice_drops_old_allocations(client: TestClient):
         "client_id": client_id,
         "id": "PAY-1",
         "date": datetime.date.today().isoformat(),
-        "amount": 500.0,
+        "amount": 5.0,
         "note": "receipt",
         "mode": "targeted",
-        "targets": [{"inv_id": "INV-001", "amount": 500.0}],
+        "targets": [{"inv_id": "INV-001", "amount": 5.0}],
         "hold_ret": False,
         "hold_gst": False,
         "only_gst": False,
@@ -424,7 +424,7 @@ def test_move_invoice_reopens_old_receipt_allocation(client: TestClient):
         if r.get("source_kind") == "invoice_moved" and r.get("source_invoice_no") == "INV-001"
     ]
     assert moved_rows, f"expected invoice_moved register row, got: {registers.json()}"
-    assert moved_rows[0]["balance"] == pytest.approx(500.0)
+    assert moved_rows[0]["balance"] == pytest.approx(5.0)
 
     payments = client.get("/api/payments", headers=auth_header(token))
     assert payments.status_code == 200
