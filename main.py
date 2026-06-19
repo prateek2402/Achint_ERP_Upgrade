@@ -230,6 +230,13 @@ def _maybe_run_legacy_import():
         return
     if marker.exists():
         return
+    if _target_database_has_rows():
+        log.warning(
+            "legacy ERP snapshot %s is present but target DB is populated; "
+            "skipping automatic replace import. Run migrate_sqlite.py manually if a replace is intended.",
+            legacy_path,
+        )
+        return
     try:
         from migrate_sqlite import run_import
 
@@ -237,6 +244,25 @@ def _maybe_run_legacy_import():
         log.info("legacy ERP data imported from %s", legacy_path)
     except Exception as exc:
         log.exception("legacy import failed: %s", exc)
+
+
+def _target_database_has_rows() -> bool:
+    db = SessionLocal()
+    try:
+        populated_models = (
+            Client,
+            PurchaseOrder,
+            Invoice,
+            PaymentHistory,
+            PaymentAllocation,
+            UnallocatedPaymentRegister,
+            UnallocatedAdvanceRegister,
+            User,
+            SystemSettings,
+        )
+        return any(db.query(model.id).first() is not None for model in populated_models)
+    finally:
+        db.close()
 
 
 def ensure_schema_columns():

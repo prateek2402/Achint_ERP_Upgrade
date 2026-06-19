@@ -141,7 +141,6 @@ def truncate_target_tables(db):
     db.query(Client).delete()
     db.query(User).delete()
     db.query(SystemSettings).delete()
-    db.commit()
 
 
 def empty_counts() -> dict:
@@ -230,6 +229,11 @@ def assert_no_global_collisions(db, data: dict, exclude_client_id: int | None = 
         p = str(po_no or "").strip()
         if p:
             po_nos.append(p)
+    for inv in data.get("invoices") or []:
+        inv = inv or {}
+        p = str(inv.get("poNo", "")).strip()
+        if p and p != "UNASSIGNED":
+            po_nos.append(p)
 
     if invoice_nos:
         q = db.query(Invoice.invoice_no).filter(Invoice.invoice_no.in_(invoice_nos))
@@ -270,15 +274,36 @@ def import_users_block(db, users_rows: list, counts: dict) -> None:
         counts["users"]["inserted"] += 1
 
 
+def merge_users_block(db, users_rows: list, counts: dict) -> None:
+    counts["users"]["read"] = len(users_rows)
+    for _, username, password, role in users_rows:
+        username = str(username or "").strip()
+        if not username:
+            counts["users"]["skipped"] += 1
+            continue
+        existing = db.query(User).filter(User.username == username).first()
+        if existing:
+            existing.hashed_password = hash_password(str(password or ""))
+            existing.role = normalize_role(role)
+            continue
+        db.add(
+            User(
+                username=username,
+                hashed_password=hash_password(str(password or "")),
+                role=normalize_role(role),
+            )
+        )
+        counts["users"]["inserted"] += 1
+
+
 def import_settings_block(db, app_data: dict) -> None:
     settings_data = app_data.get("_settings", {})
-    db.query(SystemSettings).delete()
-    db.add(
-        SystemSettings(
-            exchange_rate=to_float(settings_data.get("exchangeRate", 83.0), 83.0),
-            custom_columns=json.dumps(settings_data.get("customColumns", [])),
-        )
-    )
+    settings = db.query(SystemSettings).first()
+    if not settings:
+        settings = SystemSettings()
+        db.add(settings)
+    settings.exchange_rate = to_float(settings_data.get("exchangeRate", 83.0), 83.0)
+    settings.custom_columns = json.dumps(settings_data.get("customColumns", []))
     db.flush()
 
 
@@ -703,9 +728,7 @@ def run_import(
             if mode == "replace":
                 import_users_block(db, users_rows, report["counts"])
             else:
-                db.query(User).delete()
-                db.flush()
-                import_users_block(db, users_rows, report["counts"])
+                merge_users_block(db, users_rows, report["counts"])
 
         used_payment_ids = load_existing_payment_ids(db) if mode == "merge" else set()
         report["counts"]["clients"]["read"] = len(client_names)
@@ -730,7 +753,6 @@ def run_import(
                 assert_no_global_collisions(db, data, exclude_client_id=exclude_id)
                 if existing:
                     delete_client_for_reimport(db, existing)
-                    db.commit()
 
             block = import_client_block(db, client_name, data, used_payment_ids)
             merge_counts(report, block)
