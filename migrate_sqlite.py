@@ -141,7 +141,6 @@ def truncate_target_tables(db):
     db.query(Client).delete()
     db.query(User).delete()
     db.query(SystemSettings).delete()
-    db.commit()
 
 
 def empty_counts() -> dict:
@@ -230,6 +229,11 @@ def assert_no_global_collisions(db, data: dict, exclude_client_id: int | None = 
         p = str(po_no or "").strip()
         if p:
             po_nos.append(p)
+    for inv in data.get("invoices") or []:
+        inv = inv or {}
+        p = str(inv.get("poNo", "")).strip()
+        if p and p != "UNASSIGNED":
+            po_nos.append(p)
 
     if invoice_nos:
         q = db.query(Invoice.invoice_no).filter(Invoice.invoice_no.in_(invoice_nos))
@@ -254,19 +258,27 @@ def assert_no_global_collisions(db, data: dict, exclude_client_id: int | None = 
             )
 
 
-def import_users_block(db, users_rows: list, counts: dict) -> None:
+def import_users_block(db, users_rows: list, counts: dict, skip_existing: bool = False) -> None:
     counts["users"]["read"] = len(users_rows)
+    existing_usernames = set()
+    if skip_existing:
+        existing_usernames = {row[0] for row in db.query(User.username).all()}
     for _, username, password, role in users_rows:
-        if not str(username or "").strip():
+        username = str(username or "").strip()
+        if not username:
+            counts["users"]["skipped"] += 1
+            continue
+        if username in existing_usernames:
             counts["users"]["skipped"] += 1
             continue
         db.add(
             User(
-                username=str(username).strip(),
+                username=username,
                 hashed_password=hash_password(str(password or "")),
                 role=normalize_role(role),
             )
         )
+        existing_usernames.add(username)
         counts["users"]["inserted"] += 1
 
 
@@ -693,8 +705,6 @@ def run_import(
     try:
         if mode == "replace":
             truncate_target_tables(db)
-        else:
-            db.commit()
 
         if do_settings:
             import_settings_block(db, app_data)
@@ -703,9 +713,7 @@ def run_import(
             if mode == "replace":
                 import_users_block(db, users_rows, report["counts"])
             else:
-                db.query(User).delete()
-                db.flush()
-                import_users_block(db, users_rows, report["counts"])
+                import_users_block(db, users_rows, report["counts"], skip_existing=True)
 
         used_payment_ids = load_existing_payment_ids(db) if mode == "merge" else set()
         report["counts"]["clients"]["read"] = len(client_names)
@@ -730,7 +738,6 @@ def run_import(
                 assert_no_global_collisions(db, data, exclude_client_id=exclude_id)
                 if existing:
                     delete_client_for_reimport(db, existing)
-                    db.commit()
 
             block = import_client_block(db, client_name, data, used_payment_ids)
             merge_counts(report, block)
