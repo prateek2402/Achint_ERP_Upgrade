@@ -222,6 +222,29 @@ _write_serialization_lock = threading.Lock()
 Base.metadata.create_all(bind=engine)
 
 
+def _target_database_has_rows() -> bool:
+    """Return True when auto-import would risk overwriting existing ERP data."""
+    db = SessionLocal()
+    try:
+        tracked_tables = (
+            Client,
+            PurchaseOrder,
+            Invoice,
+            PaymentHistory,
+            PaymentAllocation,
+            UnallocatedPaymentRegister,
+            UnallocatedAdvanceRegister,
+            User,
+            SystemSettings,
+        )
+        return any(db.query(model).first() is not None for model in tracked_tables)
+    except Exception as exc:
+        log.warning("legacy import skipped: could not verify target DB is empty: %s", exc)
+        return True
+    finally:
+        db.close()
+
+
 def _maybe_run_legacy_import():
     """Import legacy ERP snapshot on first boot when old_erp.sqlite is present."""
     legacy_path = Path(os.getenv("LEGACY_DB_PATH", "old_erp.sqlite"))
@@ -229,6 +252,20 @@ def _maybe_run_legacy_import():
     if not legacy_path.exists():
         return
     if marker.exists():
+        return
+    if _target_database_has_rows():
+        log.warning(
+            "legacy import skipped: %s exists but target database already contains data",
+            legacy_path,
+        )
+        try:
+            marker.write_text(
+                "skipped: target database already contained data\n"
+                f"at={datetime.datetime.now(datetime.UTC).isoformat()}\n",
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            log.warning("legacy import skip marker could not be written: %s", exc)
         return
     try:
         from migrate_sqlite import run_import
