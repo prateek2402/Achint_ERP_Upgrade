@@ -223,13 +223,29 @@ Base.metadata.create_all(bind=engine)
 
 
 def _maybe_run_legacy_import():
-    """Import legacy ERP snapshot on first boot when old_erp.sqlite is present."""
+    """Import legacy ERP snapshot only when explicitly enabled."""
+    auto_import = os.getenv("LEGACY_AUTO_IMPORT", "0").strip().lower()
+    if auto_import not in {"1", "true", "yes", "on"}:
+        return
     legacy_path = Path(os.getenv("LEGACY_DB_PATH", "old_erp.sqlite"))
     marker = Path(".legacy_import_once.marker")
     if not legacy_path.exists():
         return
     if marker.exists():
         return
+    db = SessionLocal()
+    try:
+        has_existing_data = any(
+            db.query(model.id).first() is not None
+            for model in (Client, Invoice, PaymentHistory, User, SystemSettings)
+        )
+    finally:
+        db.close()
+    if has_existing_data:
+        raise RuntimeError(
+            "Refusing legacy auto-import into a non-empty target database. "
+            "Run migrate_sqlite.py manually for an intentional replace or merge."
+        )
     try:
         from migrate_sqlite import run_import
 
@@ -237,6 +253,7 @@ def _maybe_run_legacy_import():
         log.info("legacy ERP data imported from %s", legacy_path)
     except Exception as exc:
         log.exception("legacy import failed: %s", exc)
+        raise
 
 
 def ensure_schema_columns():
@@ -3330,6 +3347,10 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
     inv_map = {inv.invoice_no: inv for inv in invoices}
     po_by_id = {po.id: po for po in db.query(PurchaseOrder).filter(PurchaseOrder.client_id == payment.client_id).all()}
 
+    def invoice_po_no(inv: Invoice) -> Optional[str]:
+        return po_by_id.get(inv.po_id).po_no if inv.po_id and po_by_id.get(inv.po_id) else None
+
+    scoped_po = payment.po_no.strip() if payment.po_no and payment.po_no.strip() else None
     selected: list[tuple[Invoice, float]] = []
     if payment.mode == "targeted" and payment.targets:
         for t in payment.targets:
@@ -3407,11 +3428,10 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
         allocs_for_db.append(("__PO__", amount_to_move))
         remaining = 0.0
     else:
-        if payment.po_no and payment.po_no.strip():
-            scoped_po = payment.po_no.strip()
+        if scoped_po:
             selected = [
                 (inv, req) for inv, req in selected
-                if (po_by_id.get(inv.po_id).po_no if inv.po_id and po_by_id.get(inv.po_id) else None) == scoped_po
+                if invoice_po_no(inv) == scoped_po
             ]
         for inv, requested in selected:
             if payment.apply_adv and not payment.only_gst and not inv.is_note:
@@ -3486,6 +3506,7 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
             [
                 i for i in invoices
                 if invoice_outstanding_balance(i) > 0.009 and i.invoice_no not in selected_ids
+                and (not scoped_po or invoice_po_no(i) == scoped_po)
             ],
             key=lambda x: invoice_ledger_sort_key(x.inv_date, x.invoice_no),
         )
