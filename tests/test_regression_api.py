@@ -1184,10 +1184,11 @@ def test_cascade_allocation_respects_po_scope(client: TestClient):
     invs = client.get("/api/invoices", headers=auth_header(token)).json()
     po1 = next(i for i in invs if i["id"] == "INV-001")
     po2 = next(i for i in invs if i["id"] == "INV-PO2")
-    assert po1["balance"] == pytest.approx(0.0, abs=0.01)
+    assert po1["paid"] == pytest.approx(500.0, abs=0.01)
+    assert po1["balance"] == pytest.approx(681.0, abs=0.01)
     assert po2["paid"] == pytest.approx(0.0, abs=0.01)
     assert pay.json()["allocation_count"] == 1
-    assert pay.json()["remaining"] > 0
+    assert pay.json()["remaining"] == pytest.approx(0.0, abs=0.01)
 
 
 def _legacy_invoice_payload(no: str, total: float = 100.0) -> dict:
