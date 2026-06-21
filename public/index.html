@@ -2508,6 +2508,17 @@
             el.classList.toggle('show');
         }
         function getMultiSelectValues(id) { return Array.from(document.querySelectorAll(`#${id} input[type="checkbox"]:checked`)).map(cb => cb.value); }
+        function getEffectivePoTdsRate(terms) {
+            if (!terms || !terms.tdsEnabled) return 0;
+            const dynamicRate = parseFloat(terms.dynamicTdsRate);
+            if (Number.isFinite(dynamicRate) && dynamicRate > 0) return dynamicRate;
+            const configuredRate = parseFloat(terms.tdsRate) || 0;
+            if (configuredRate <= 0) return 0;
+            const poBasicKnown = terms.poBasic !== undefined && terms.poBasic !== null && parseFloat(terms.poBasic) > 0;
+            const threshold = parseFloat(terms.tdsThreshold) || 0;
+            if (!poBasicKnown || threshold <= 0) return configuredRate / 100;
+            return 0;
+        }
         function updateMultiSelectLabel(containerId, labelId, defaultText) {
             const label = document.getElementById(labelId);
             const container = document.getElementById(containerId);
@@ -2712,7 +2723,7 @@
                     sqlPOs.forEach(po => {
                         const cName = clientNameById[po.client_id];
                         if (cName && appData[cName]) {
-                            appData[cName].poTerms[po.po_no] = {
+                            const hydratedTerms = {
                                 adv: po.adv_pct || 0,
                                 ret: po.ret_pct || 0,
                                 base: po.ret_base || 'basic',
@@ -2735,6 +2746,8 @@
                                     dispatch_rate: Number(item.dispatch_rate || 0)
                                 }))
                             };
+                            hydratedTerms.dynamicTdsRate = getEffectivePoTdsRate(hydratedTerms);
+                            appData[cName].poTerms[po.po_no] = hydratedTerms;
                         }
                     });
                 }
@@ -2858,7 +2871,7 @@
                     pos.forEach(po => {
                         const cName = clientNameById[po.client_id];
                         if (cName && appData[cName]) {
-                            appData[cName].poTerms[po.po_no] = {
+                            const hydratedTerms = {
                                 adv: po.adv_pct || 0,
                                 ret: po.ret_pct || 0,
                                 base: po.ret_base || 'basic',
@@ -2881,6 +2894,8 @@
                                     dispatch_rate: Number(item.dispatch_rate || 0)
                                 }))
                             };
+                            hydratedTerms.dynamicTdsRate = getEffectivePoTdsRate(hydratedTerms);
+                            appData[cName].poTerms[po.po_no] = hydratedTerms;
                         }
                     });
 
@@ -4472,7 +4487,7 @@
                 if (terms) {
                     if (terms.tdsEnabled) {
                         let baseAmtForTds = terms.tdsBase === 'total' ? total : basic;
-                        tdsInput.value = (baseAmtForTds * (terms.dynamicTdsRate || 0)).toFixed(2);
+                        tdsInput.value = (baseAmtForTds * getEffectivePoTdsRate(terms)).toFixed(2);
                     } else {
                         tdsInput.value = '0.00';
                     }
@@ -5667,6 +5682,14 @@
             if (originalPayment <= 0) {
                 return await customApplet({ title: "Validation Error", message: "Receipt amount must be greater than zero." });
             }
+            const selectedPaymentPos = getMultiSelectValues('poSelectOptions').map(v => String(v || '').trim()).filter(Boolean);
+            const scopedPaymentPo = selectedPaymentPos.length === 1 ? selectedPaymentPos[0] : null;
+            if (useCascade && !scopedPaymentPo) {
+                const msg = selectedPaymentPos.length > 1
+                    ? "Cascade allocation can only run for one PO at a time. Select a single PO or tick specific invoices."
+                    : "Select one PO before posting a cascade receipt.";
+                return await customApplet({ title: "Select One PO", message: msg });
+            }
 
             // Warn if any specific amount exceeds the invoice balance and
             // overpayment is not yet enabled, giving the user a chance to decide.
@@ -5702,6 +5725,7 @@
                 hold_gst: holdGst,
                 only_gst: onlyGst,
                 apply_adv: applyAdv,
+                po_no: scopedPaymentPo,
                 excess_action: "park",
                 allow_overpayment: allowOverpay
             };
@@ -7248,7 +7272,7 @@
                 retention = baseAmt * ((terms.ret || 0) / 100);
                 if (terms.tdsEnabled) {
                     const baseAmtForTds = terms.tdsBase === 'total' ? total : basic;
-                    tds = baseAmtForTds * (terms.dynamicTdsRate || 0);
+                    tds = baseAmtForTds * getEffectivePoTdsRate(terms);
                 }
             } else if (basic > 0) {
                 tds = basic * 0.001;
@@ -7652,7 +7676,7 @@
 
                     if (applyTds && terms.tdsEnabled) {
                         let baseAmtForTds = terms.tdsBase === 'total' ? total : basic;
-                        tds = baseAmtForTds * (terms.dynamicTdsRate || 0);
+                        tds = baseAmtForTds * getEffectivePoTdsRate(terms);
                     }
                 } else {
                     tds = applyTds ? (basic * 0.001) : 0;

@@ -1116,6 +1116,227 @@ def test_payment_allocate_validation_edge_case(client: TestClient):
     assert "greater than zero" in res.json()["detail"].lower()
 
 
+def test_cascade_allocation_respects_po_scope(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    po2 = client.post("/api/purchase-orders", json={
+        "client_id": client_id,
+        "po_no": "PO-002",
+        "contact_person": "Ops",
+        "project_name": "Kiln",
+        "adv_pct": 0.0,
+        "ret_pct": 0.0,
+        "ret_base": "basic",
+        "tds_enabled": False,
+        "tds_rate": 0.0,
+        "tds_threshold": 0.0,
+        "baseline_items": [],
+    }, headers=auth_header(token))
+    assert po2.status_code == 200, po2.text
+
+    inv2_payload = {
+        "client_id": client_id,
+        "po_no": "PO-002",
+        "invoice_no": "INV-PO2",
+        "sub_entity": "",
+        "lr_no": "",
+        "inv_date": "2026-04-02",
+        "due_date": None,
+        "basic": 100.0,
+        "gst": 0.0,
+        "total": 100.0,
+        "advance_adj": 0.0,
+        "tds_ded": 0.0,
+        "retention_held": 0.0,
+        "net_payable": 0.0,
+        "paid": 0.0,
+        "balance": 0.0,
+        "is_note": False,
+        "note_type": None,
+        "note_reason": None,
+        "dispatch_items": [],
+    }
+    inv2 = client.post("/api/invoices", json=inv2_payload, headers=auth_header(token))
+    assert inv2.status_code == 200, inv2.text
+
+    pay = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-PO-SCOPE",
+        "date": "2026-04-10",
+        "amount": 500.0,
+        "note": "po scoped receipt",
+        "mode": "cascade",
+        "targets": [],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "move_to_po": None,
+        "po_no": "PO-001",
+        "clear_po_pool": False,
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert pay.status_code == 200, pay.text
+
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    po1 = next(i for i in invs if i["id"] == "INV-001")
+    po2 = next(i for i in invs if i["id"] == "INV-PO2")
+    assert po1["paid"] == pytest.approx(500.0, abs=0.01)
+    assert po1["balance"] == pytest.approx(681.0, abs=0.01)
+    assert po2["paid"] == pytest.approx(0.0, abs=0.01)
+    assert pay.json()["allocation_count"] == 1
+    assert pay.json()["remaining"] == pytest.approx(0.0, abs=0.01)
+
+
+def _legacy_invoice_payload(no: str, total: float = 100.0) -> dict:
+    return {
+        "id": no,
+        "poNo": "UNASSIGNED",
+        "invDate": "2026-01-01",
+        "dueDate": "2026-02-01",
+        "basic": total,
+        "gst": 0.0,
+        "total": total,
+        "advance": 0.0,
+        "tds": 0.0,
+        "retention": 0.0,
+        "netPayable": total,
+        "paid": 0.0,
+        "balance": total,
+    }
+
+
+def _write_legacy_db(path: Path, app_data: dict) -> None:
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT, role TEXT)")
+    conn.execute("CREATE TABLE erp_data (id INTEGER PRIMARY KEY, json_data TEXT)")
+    conn.execute("INSERT INTO users VALUES (1, 'legacyadmin', 'pass', 'admin')")
+    conn.execute("INSERT INTO erp_data VALUES (1, ?)", (json.dumps(app_data),))
+    conn.commit()
+    conn.close()
+
+
+def _seed_import_target(SessionLocal, mig):
+    from models import Client, Invoice, User
+
+    db = SessionLocal()
+    db.add(User(username="localadmin", hashed_password=mig.hash_password("secret"), role="admin"))
+    client_a = Client(name="ClientA", active=True, excess_funds=0.0)
+    client_c = Client(name="ClientC", active=True, excess_funds=0.0)
+    db.add(client_a)
+    db.add(client_c)
+    db.flush()
+    db.add(Invoice(client_id=client_a.id, invoice_no="INV-A-OLD", basic=10.0, total=10.0, net_payable=10.0, balance=10.0))
+    db.add(Invoice(client_id=client_c.id, invoice_no="INV-C-1", basic=50.0, total=50.0, net_payable=50.0, balance=50.0))
+    db.commit()
+    db.close()
+
+
+def test_startup_legacy_import_requires_explicit_opt_in(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LEGACY_AUTO_IMPORT", raising=False)
+    Path("old_erp.sqlite").write_text("not a sqlite database", encoding="utf-8")
+    fake_migrator = types.SimpleNamespace(run_import=lambda **_: pytest.fail("legacy import ran without opt-in"))
+    monkeypatch.setitem(sys.modules, "migrate_sqlite", fake_migrator)
+
+    app_module._maybe_run_legacy_import()
+
+
+def test_startup_legacy_auto_import_refuses_non_empty_target(tmp_path, monkeypatch):
+    from models import Base, User
+
+    db_file = tmp_path / "erp.sqlite"
+    test_engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+    Base.metadata.create_all(bind=test_engine)
+    db = TestingSessionLocal()
+    db.add(User(username="existing", hashed_password=app_module.hash_password("Existing@123"), role="admin"))
+    db.commit()
+    db.close()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEGACY_AUTO_IMPORT", "1")
+    monkeypatch.setenv("LEGACY_DB_PATH", "old_erp.sqlite")
+    monkeypatch.setattr(app_module, "SessionLocal", TestingSessionLocal)
+    Path("old_erp.sqlite").write_text("placeholder", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="non-empty target database"):
+        app_module._maybe_run_legacy_import()
+
+
+def test_replace_import_failure_rolls_back_existing_data(tmp_path, monkeypatch):
+    import migrate_sqlite as mig
+    from models import Client, Invoice, User
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old.sqlite"
+    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
+    monkeypatch.chdir(tmp_path)
+
+    app_data = {
+        "_settings": {"exchangeRate": 83.0, "customColumns": []},
+        "BrokenA": {"active": True, "invoices": [_legacy_invoice_payload("INV-DUP")], "paymentHistory": [], "poTerms": {}},
+        "BrokenB": {"active": True, "invoices": [_legacy_invoice_payload("INV-DUP")], "paymentHistory": [], "poTerms": {}},
+    }
+    _write_legacy_db(legacy_db, app_data)
+
+    _, SessionLocal = mig.open_target_session()
+    _seed_import_target(SessionLocal, mig)
+
+    with pytest.raises(Exception):
+        mig.run_import(mode="replace", legacy_path=str(legacy_db), force=True)
+
+    db = SessionLocal()
+    assert sorted(c.name for c in db.query(Client).all()) == ["ClientA", "ClientC"]
+    assert db.query(Invoice).filter(Invoice.invoice_no == "INV-A-OLD").count() == 1
+    assert db.query(User).filter(User.username == "localadmin").count() == 1
+    db.close()
+    assert not Path(".legacy_import_once.marker").exists()
+
+
+def test_merge_import_failure_rolls_back_replaced_client(tmp_path, monkeypatch):
+    import migrate_sqlite as mig
+    from models import Client, Invoice
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old.sqlite"
+    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
+    monkeypatch.chdir(tmp_path)
+
+    app_data = {
+        "_settings": {"exchangeRate": 83.0, "customColumns": []},
+        "ClientA": {
+            "active": True,
+            "invoices": [_legacy_invoice_payload("INV-DUP"), _legacy_invoice_payload("INV-DUP")],
+            "paymentHistory": [],
+            "poTerms": {},
+        },
+    }
+    _write_legacy_db(legacy_db, app_data)
+
+    _, SessionLocal = mig.open_target_session()
+    _seed_import_target(SessionLocal, mig)
+
+    with pytest.raises(Exception):
+        mig.run_import(mode="merge", clients="ClientA", legacy_path=str(legacy_db))
+
+    db = SessionLocal()
+    assert sorted(c.name for c in db.query(Client).all()) == ["ClientA", "ClientC"]
+    client_a = db.query(Client).filter(Client.name == "ClientA").one()
+    inv_nos = {inv.invoice_no for inv in db.query(Invoice).filter(Invoice.client_id == client_a.id).all()}
+    assert inv_nos == {"INV-A-OLD"}
+    db.close()
+
+
 def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
     import json
     import sqlite3
