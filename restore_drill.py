@@ -138,6 +138,9 @@ def check_sqlite_openable(db_path: Path) -> dict:
 def _import_app_against_sandbox(sandbox_db: Path):
     """Set env, then import main + override SessionLocal/engine to point at sandbox."""
     os.environ["APP_DATABASE_URL"] = f"sqlite:///{sandbox_db.as_posix()}"
+    for module_name in list(sys.modules):
+        if module_name == "routers" or module_name.startswith("routers."):
+            del sys.modules[module_name]
     if "main" in sys.modules:
         del sys.modules["main"]
 

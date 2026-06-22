@@ -91,7 +91,7 @@ def normalize_role(role: str) -> str:
     return role_val
 
 
-def recalculate_client_ledger(client_id: int, db):
+def recalculate_client_ledger(client_id: int, db, commit: bool = True):
     client = db.query(Client).filter(Client.id == client_id).first()
     if not client:
         return
@@ -126,7 +126,10 @@ def recalculate_client_ledger(client_id: int, db):
             total_excess -= alloc_sum
 
     client.excess_funds = max(0.0, total_excess)
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
 
 
 def truncate_target_tables(db):
@@ -141,7 +144,7 @@ def truncate_target_tables(db):
     db.query(Client).delete()
     db.query(User).delete()
     db.query(SystemSettings).delete()
-    db.commit()
+    db.flush()
 
 
 def empty_counts() -> dict:
@@ -730,7 +733,6 @@ def run_import(
                 assert_no_global_collisions(db, data, exclude_client_id=exclude_id)
                 if existing:
                     delete_client_for_reimport(db, existing)
-                    db.commit()
 
             block = import_client_block(db, client_name, data, used_payment_ids)
             merge_counts(report, block)
@@ -739,10 +741,10 @@ def run_import(
             if client_row:
                 imported_client_ids.append(client_row.id)
 
-        db.commit()
-
         for cid in imported_client_ids:
-            recalculate_client_ledger(cid, db)
+            recalculate_client_ledger(cid, db, commit=False)
+
+        db.commit()
 
         scope_ids = imported_client_ids if mode == "merge" else None
         report["integrity"] = build_integrity_report(db, scope_ids)

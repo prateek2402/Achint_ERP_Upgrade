@@ -230,6 +230,13 @@ def _maybe_run_legacy_import():
         return
     if marker.exists():
         return
+    if _target_db_has_application_data():
+        log.warning(
+            "legacy ERP snapshot found at %s, but target database already contains data; "
+            "skipping automatic replace import",
+            legacy_path,
+        )
+        return
     try:
         from migrate_sqlite import run_import
 
@@ -237,6 +244,26 @@ def _maybe_run_legacy_import():
         log.info("legacy ERP data imported from %s", legacy_path)
     except Exception as exc:
         log.exception("legacy import failed: %s", exc)
+
+
+def _target_db_has_application_data() -> bool:
+    """Return true when startup auto-import would overwrite existing ERP data."""
+    db = SessionLocal()
+    try:
+        core_tables = (
+            User,
+            Client,
+            PurchaseOrder,
+            Invoice,
+            PaymentHistory,
+            PaymentAllocation,
+            UnallocatedPaymentRegister,
+            UnallocatedAdvanceRegister,
+            SystemSettings,
+        )
+        return any(db.query(model.id).first() is not None for model in core_tables)
+    finally:
+        db.close()
 
 
 def ensure_schema_columns():
@@ -1340,8 +1367,6 @@ def update_purchase_order_status(po_no: str, status: POStatusSchema, current_use
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
     po = po_query.first()
     if not po:
         raise HTTPException(status_code=404, detail="PO not found")
@@ -1356,8 +1381,6 @@ def delete_purchase_order(po_no: str, current_user: User = Depends(get_current_u
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
     po = po_query.first()
     if po:
         client_id = po.client_id
@@ -2456,6 +2479,48 @@ def _strip_po_advance_applied_for_po(client_id: int, po_no: str, db: Session) ->
     return len(rows)
 
 
+def _trim_po_advance_applied_to_current_caps(
+    db: Session,
+    client_id: int,
+    po: PurchaseOrder,
+    invoices: list[Invoice],
+) -> int:
+    """Keep existing PO advance application rows within current invoice caps."""
+    adv_pct = float(po.adv_pct or 0.0)
+    cap_by_invoice: dict[str, float] = {}
+    if adv_pct > 0:
+        for inv in invoices:
+            base_amt = invoice_amount_for_po_base(inv, po.ret_base or "total")
+            cap_by_invoice[str(inv.invoice_no)] = max(0.0, base_amt * (adv_pct / 100.0))
+
+    rows = db.query(PaymentAllocation).join(
+        PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id
+    ).filter(
+        PaymentHistory.client_id == client_id,
+        PaymentAllocation.alloc_type == "po_advance_applied",
+        PaymentAllocation.target_po_no == po.po_no,
+        PaymentAllocation.target_inv_id.isnot(None),
+    ).order_by(PaymentAllocation.id.asc()).all()
+
+    kept_by_invoice: dict[str, float] = defaultdict(float)
+    changed = 0
+    for row in rows:
+        inv_no = str(row.target_inv_id or "")
+        row_amount = max(0.0, float(row.amount or 0.0))
+        remaining_cap = max(0.0, float(cap_by_invoice.get(inv_no, 0.0)) - kept_by_invoice[inv_no])
+        if remaining_cap <= 0.009:
+            db.delete(row)
+            changed += 1
+            continue
+        if row_amount > remaining_cap + 0.009:
+            row.amount = remaining_cap
+            kept_by_invoice[inv_no] += remaining_cap
+            changed += 1
+            continue
+        kept_by_invoice[inv_no] += row_amount
+    return changed
+
+
 def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = None, invoice_no: Optional[str] = None):
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.client_id == client_id)
     if po_no:
@@ -2469,6 +2534,15 @@ def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = N
         if adv_pct <= 0:
             _strip_po_advance_applied_for_po(client_id, po.po_no, db)
             continue
+
+        invoices = db.query(Invoice).filter(
+            Invoice.client_id == client_id,
+            Invoice.po_id == po.id,
+            Invoice.is_note == False
+        ).all()
+        invoices.sort(key=lambda inv: invoice_ledger_sort_key(inv.inv_date, inv.invoice_no))
+        if _trim_po_advance_applied_to_current_caps(db, client_id, po, invoices):
+            db.flush()
 
         # Build per-payment advance lots for this PO.
         added_by_payment: dict[str, float] = defaultdict(float)
@@ -2498,12 +2572,6 @@ def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = N
             continue
         lot_idx = 0
 
-        invoices = db.query(Invoice).filter(
-            Invoice.client_id == client_id,
-            Invoice.po_id == po.id,
-            Invoice.is_note == False
-        ).all()
-        invoices.sort(key=lambda inv: invoice_ledger_sort_key(inv.inv_date, inv.invoice_no))
         if invoice_no:
             invoices = [inv for inv in invoices if inv.invoice_no == invoice_no]
         if not invoices:
@@ -3951,6 +4019,20 @@ def update_payment(payment_id: str, pay_update: PaymentUpdate, request: Request,
         raise HTTPException(status_code=404, detail="Payment not found")
     before_amount = float(db_pay.amount or 0.0)
     before_note = db_pay.note
+    after_amount = float(pay_update.amount or 0.0)
+    if abs(after_amount - before_amount) > 0.009:
+        linked_alloc_count = db.query(PaymentAllocation).filter(PaymentAllocation.payment_id == payment_id).count()
+        linked_payment_register_count = db.query(UnallocatedPaymentRegister).filter(
+            UnallocatedPaymentRegister.source_payment_id == payment_id
+        ).count()
+        linked_advance_register_count = db.query(UnallocatedAdvanceRegister).filter(
+            UnallocatedAdvanceRegister.source_payment_id == payment_id
+        ).count()
+        if linked_alloc_count or linked_payment_register_count or linked_advance_register_count:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot change the amount of an allocated payment. Redistribute or reverse it first.",
+            )
     db_pay.amount = pay_update.amount
     db_pay.note = pay_update.note
     record_audit(
