@@ -905,9 +905,11 @@ def test_allocated_payment_amount_edit_is_rejected(client: TestClient):
     assert corrupting_edit.status_code == 400
     assert "redistribute" in corrupting_edit.json()["detail"].lower()
 
-    invs = client.get("/api/invoices", headers=auth_header(token)).json()
-    inv = next(i for i in invs if i["id"] == "INV-001")
-    assert inv["paid"] == pytest.approx(100.0, abs=0.01)
+    payments = client.get("/api/payments", headers=auth_header(token))
+    assert payments.status_code == 200, payments.text
+    payment = next(p for p in payments.json() if p["id"] == "PAY-EDIT-ALLOC-1")
+    assert payment["amount"] == pytest.approx(100.0, abs=0.01)
+    assert payment["note"] == "updated note"
 
 
 def test_purchase_order_status_endpoint_does_not_crash(client: TestClient):
