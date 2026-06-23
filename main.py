@@ -230,6 +230,25 @@ def _maybe_run_legacy_import():
         return
     if marker.exists():
         return
+    db = SessionLocal()
+    try:
+        populated_tables = {
+            "users": db.query(User.id).first(),
+            "clients": db.query(Client.id).first(),
+            "purchase_orders": db.query(PurchaseOrder.id).first(),
+            "invoices": db.query(Invoice.id).first(),
+            "payments": db.query(PaymentHistory.id).first(),
+            "settings": db.query(SystemSettings.id).first(),
+        }
+    finally:
+        db.close()
+    existing = [name for name, row in populated_tables.items() if row is not None]
+    if existing:
+        log.warning(
+            "legacy import skipped because target database already has data in: %s",
+            ", ".join(existing),
+        )
+        return
     try:
         from migrate_sqlite import run_import
 
