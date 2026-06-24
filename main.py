@@ -222,6 +222,26 @@ _write_serialization_lock = threading.Lock()
 Base.metadata.create_all(bind=engine)
 
 
+def _target_database_has_application_rows() -> bool:
+    db = SessionLocal()
+    try:
+        for model in (
+            User,
+            Client,
+            PurchaseOrder,
+            Invoice,
+            PaymentHistory,
+            SystemSettings,
+            UnallocatedPaymentRegister,
+            UnallocatedAdvanceRegister,
+        ):
+            if db.query(model.id).first() is not None:
+                return True
+        return False
+    finally:
+        db.close()
+
+
 def _maybe_run_legacy_import():
     """Import legacy ERP snapshot on first boot when old_erp.sqlite is present."""
     legacy_path = Path(os.getenv("LEGACY_DB_PATH", "old_erp.sqlite"))
@@ -229,6 +249,12 @@ def _maybe_run_legacy_import():
     if not legacy_path.exists():
         return
     if marker.exists():
+        return
+    if _target_database_has_application_rows():
+        log.warning(
+            "legacy ERP import skipped because target database already contains data: %s",
+            legacy_path,
+        )
         return
     try:
         from migrate_sqlite import run_import
