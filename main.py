@@ -222,6 +222,21 @@ _write_serialization_lock = threading.Lock()
 Base.metadata.create_all(bind=engine)
 
 
+def _target_database_has_data() -> bool:
+    """Return True when automatic legacy import would overwrite existing data."""
+    db = SessionLocal()
+    try:
+        for model in (Client, User, Invoice, PaymentHistory, PurchaseOrder):
+            if db.query(model).first() is not None:
+                return True
+        return False
+    except Exception as exc:
+        log.warning("legacy import safety check failed; skipping automatic import: %s", exc)
+        return True
+    finally:
+        db.close()
+
+
 def _maybe_run_legacy_import():
     """Import legacy ERP snapshot on first boot when old_erp.sqlite is present."""
     legacy_path = Path(os.getenv("LEGACY_DB_PATH", "old_erp.sqlite"))
@@ -229,6 +244,13 @@ def _maybe_run_legacy_import():
     if not legacy_path.exists():
         return
     if marker.exists():
+        return
+    if _target_database_has_data():
+        log.warning(
+            "legacy ERP snapshot %s exists, but target database already contains data; "
+            "skipping automatic startup import. Run migrate_sqlite.py explicitly if a replace import is intended.",
+            legacy_path,
+        )
         return
     try:
         from migrate_sqlite import run_import
