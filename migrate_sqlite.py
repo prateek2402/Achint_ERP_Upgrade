@@ -100,24 +100,58 @@ def recalculate_client_ledger(client_id: int, db):
     inv_map = {inv.invoice_no: inv for inv in invoices}
 
     for inv in invoices:
-        inv.net_payable = (inv.total or 0.0) - (inv.advance_adj or 0.0)
+        if inv.is_note:
+            note_amt = abs(float(inv.total or 0.0))
+            ntype = str(inv.note_type or "").strip().upper()
+            inv.advance_adj = 0.0
+            inv.tds_ded = 0.0
+            inv.retention_held = 0.0
+            if ntype == "CN":
+                inv.net_payable = 0.0
+                inv.paid = 0.0
+                inv.balance = -note_amt
+                continue
+            if ntype == "DN":
+                inv.net_payable = note_amt
+            else:
+                inv.net_payable = 0.0
+                inv.paid = 0.0
+                inv.balance = float(inv.total or 0.0)
+                continue
+        else:
+            inv.net_payable = max(
+                0.0,
+                float(inv.total or 0.0)
+                - float(inv.advance_adj or 0.0)
+                - float(inv.tds_ded or 0.0),
+            )
+        inv._manual_paid_seed = float(inv.paid or 0.0)  # type: ignore[attr-defined]
         inv.paid = 0.0
         inv.balance = inv.net_payable
 
     payments = db.query(PaymentHistory).filter(PaymentHistory.client_id == client_id).all()
     total_excess = 0.0
+    alloc_paid_by_inv: dict[str, float] = {}
+    payment_alloc_sum: dict[str, float] = {}
 
     for pay in payments:
         allocations = db.query(PaymentAllocation).filter(PaymentAllocation.payment_id == pay.id).all()
-        alloc_sum = 0.0
         for al in allocations:
             if al.alloc_type == "invoice" and al.target_inv_id in inv_map:
-                inv = inv_map[al.target_inv_id]
-                inv.paid += al.amount
-                inv.balance -= al.amount
+                alloc_paid_by_inv[al.target_inv_id] = alloc_paid_by_inv.get(al.target_inv_id, 0.0) + float(al.amount or 0.0)
             if al.alloc_type in ("invoice", "po_advance", "po_advance_applied", "note_allocation"):
-                alloc_sum += al.amount
+                payment_alloc_sum[pay.id] = payment_alloc_sum.get(pay.id, 0.0) + float(al.amount or 0.0)
 
+    for inv in invoices:
+        if inv.is_note and str(inv.note_type or "").strip().upper() != "DN":
+            continue
+        manual_seed = float(getattr(inv, "_manual_paid_seed", 0.0) or 0.0)
+        alloc_paid = float(alloc_paid_by_inv.get(inv.invoice_no, 0.0))
+        inv.paid = max(manual_seed, alloc_paid)
+        inv.balance = float(inv.net_payable or 0.0) - float(inv.paid or 0.0)
+
+    for pay in payments:
+        alloc_sum = float(payment_alloc_sum.get(pay.id, 0.0))
         if pay.type == "RECEIPT":
             unallocated = pay.amount - alloc_sum
             if unallocated > 0:
@@ -126,7 +160,7 @@ def recalculate_client_ledger(client_id: int, db):
             total_excess -= alloc_sum
 
     client.excess_funds = max(0.0, total_excess)
-    db.commit()
+    db.flush()
 
 
 def truncate_target_tables(db):
@@ -141,7 +175,6 @@ def truncate_target_tables(db):
     db.query(Client).delete()
     db.query(User).delete()
     db.query(SystemSettings).delete()
-    db.commit()
 
 
 def empty_counts() -> dict:
@@ -230,6 +263,12 @@ def assert_no_global_collisions(db, data: dict, exclude_client_id: int | None = 
         p = str(po_no or "").strip()
         if p:
             po_nos.append(p)
+    for inv in data.get("invoices") or []:
+        inv = inv or {}
+        p = str(inv.get("poNo", "")).strip()
+        if p and p != "UNASSIGNED":
+            po_nos.append(p)
+    po_nos = list(dict.fromkeys(po_nos))
 
     if invoice_nos:
         q = db.query(Invoice.invoice_no).filter(Invoice.invoice_no.in_(invoice_nos))
@@ -693,8 +732,6 @@ def run_import(
     try:
         if mode == "replace":
             truncate_target_tables(db)
-        else:
-            db.commit()
 
         if do_settings:
             import_settings_block(db, app_data)
@@ -730,7 +767,6 @@ def run_import(
                 assert_no_global_collisions(db, data, exclude_client_id=exclude_id)
                 if existing:
                     delete_client_for_reimport(db, existing)
-                    db.commit()
 
             block = import_client_block(db, client_name, data, used_payment_ids)
             merge_counts(report, block)
@@ -739,10 +775,10 @@ def run_import(
             if client_row:
                 imported_client_ids.append(client_row.id)
 
-        db.commit()
-
         for cid in imported_client_ids:
             recalculate_client_ledger(cid, db)
+        db.flush()
+        db.commit()
 
         scope_ids = imported_client_ids if mode == "merge" else None
         report["integrity"] = build_integrity_report(db, scope_ids)
