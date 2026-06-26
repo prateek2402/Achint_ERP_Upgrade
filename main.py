@@ -222,18 +222,46 @@ _write_serialization_lock = threading.Lock()
 Base.metadata.create_all(bind=engine)
 
 
+def _legacy_auto_import_enabled() -> bool:
+    return os.getenv("LEGACY_AUTO_IMPORT", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _target_has_existing_business_data() -> bool:
+    db = SessionLocal()
+    try:
+        return any(
+            db.query(model.id).first() is not None
+            for model in (Client, Invoice, PaymentHistory, User)
+        )
+    finally:
+        db.close()
+
+
 def _maybe_run_legacy_import():
-    """Import legacy ERP snapshot on first boot when old_erp.sqlite is present."""
+    """Optionally import a legacy ERP snapshot on first boot when explicitly enabled."""
     legacy_path = Path(os.getenv("LEGACY_DB_PATH", "old_erp.sqlite"))
     marker = Path(".legacy_import_once.marker")
     if not legacy_path.exists():
         return
     if marker.exists():
         return
+    if not _legacy_auto_import_enabled():
+        log.warning(
+            "legacy snapshot %s is present but startup import is disabled; "
+            "run migrate_sqlite.py explicitly or set LEGACY_AUTO_IMPORT=1 for an empty target DB",
+            legacy_path,
+        )
+        return
+    if _target_has_existing_business_data():
+        log.error(
+            "refusing startup legacy import from %s because the target database already contains data",
+            legacy_path,
+        )
+        return
     try:
         from migrate_sqlite import run_import
 
-        run_import(force=False)
+        run_import(force=False, mode="replace")
         log.info("legacy ERP data imported from %s", legacy_path)
     except Exception as exc:
         log.exception("legacy import failed: %s", exc)
