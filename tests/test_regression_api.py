@@ -110,6 +110,23 @@ def create_client_po_invoice(client: TestClient, token: str):
     return client_id
 
 
+def test_admin_can_create_user(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+
+    res = client.post(
+        "/api/users",
+        json={"username": "new_ops", "password": "User@12345", "role": "user"},
+        headers=auth_header(token),
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["success"] is True
+
+    users = client.get("/api/users", headers=auth_header(token))
+    assert users.status_code == 200
+    assert any(u["username"] == "new_ops" and u["role"] == "user" for u in users.json())
+
+
 def test_invoice_ledger_sort_key_orders_by_date_fy_then_sequence():
     import datetime
 
