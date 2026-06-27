@@ -223,20 +223,48 @@ Base.metadata.create_all(bind=engine)
 
 
 def _maybe_run_legacy_import():
-    """Import legacy ERP snapshot on first boot when old_erp.sqlite is present."""
+    """Import a legacy ERP snapshot only when explicitly opted in for a blank DB."""
+    enabled = os.getenv("LEGACY_AUTO_IMPORT_ON_STARTUP", "").strip().lower() in {"1", "true", "yes", "on"}
     legacy_path = Path(os.getenv("LEGACY_DB_PATH", "old_erp.sqlite"))
     marker = Path(".legacy_import_once.marker")
+    if not enabled:
+        return
     if not legacy_path.exists():
         return
     if marker.exists():
         return
-    try:
-        from migrate_sqlite import run_import
 
-        run_import(force=False)
+    db = SessionLocal()
+    try:
+        has_existing_data = any(
+            db.query(model.id).first() is not None
+            for model in (
+                User,
+                Client,
+                PurchaseOrder,
+                Invoice,
+                PaymentHistory,
+                UnallocatedPaymentRegister,
+                UnallocatedAdvanceRegister,
+                SystemSettings,
+                UploadedDocument,
+                AuditLog,
+            )
+        )
+    finally:
+        db.close()
+    if has_existing_data:
+        log.warning("legacy auto-import skipped because the target database already contains data")
+        return
+
+    from migrate_sqlite import run_import
+
+    try:
+        run_import(force=False, legacy_path=str(legacy_path))
         log.info("legacy ERP data imported from %s", legacy_path)
-    except Exception as exc:
-        log.exception("legacy import failed: %s", exc)
+    except Exception:
+        log.exception("legacy import failed; startup aborted to protect existing data")
+        raise
 
 
 def ensure_schema_columns():
@@ -988,60 +1016,6 @@ def create_user(user_data: UserCreate, current_user: User = Depends(get_current_
     new_user = User(username=username, hashed_password=hash_password(user_data.password), role=normalized_role)
     db.add(new_user)
     db.commit()
-    if inv.po_no and inv.po_no != "UNASSIGNED":
-        po_obj = db.query(PurchaseOrder).filter(
-            PurchaseOrder.client_id == inv.client_id,
-            PurchaseOrder.po_no == inv.po_no
-        ).first()
-        if po_obj and float(po_obj.adv_pct or 0.0) > 0:
-            added_by_payment: dict[str, float] = defaultdict(float)
-            consumed_by_payment: dict[str, float] = defaultdict(float)
-            po_allocs = db.query(PaymentAllocation).join(
-                PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id
-            ).filter(
-                PaymentHistory.client_id == inv.client_id,
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.alloc_type.in_(["po_advance", "po_advance_applied"]),
-            ).all()
-            for al in po_allocs:
-                pid = str(al.payment_id or "").strip()
-                if not pid:
-                    continue
-                if al.alloc_type == "po_advance":
-                    added_by_payment[pid] += float(al.amount or 0.0)
-                elif al.alloc_type == "po_advance_applied":
-                    consumed_by_payment[pid] += float(al.amount or 0.0)
-
-            base_amt = float(new_inv.basic or 0.0) if (po_obj.ret_base or "total") == "basic" else float(new_inv.total or 0.0)
-            max_allowed = max(0.0, base_amt * (float(po_obj.adv_pct or 0.0) / 100.0))
-            existing_applied = db.query(PaymentAllocation).filter(
-                PaymentAllocation.alloc_type == "po_advance_applied",
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.target_inv_id == new_inv.invoice_no
-            ).all()
-            already_applied = sum(float(a.amount or 0.0) for a in existing_applied)
-            shortfall = max(0.0, max_allowed - already_applied)
-
-            if shortfall > 0:
-                for pid, added_amt in added_by_payment.items():
-                    remaining_amt = float(added_amt) - float(consumed_by_payment.get(pid, 0.0))
-                    if remaining_amt <= 0:
-                        continue
-                    take = min(shortfall, remaining_amt)
-                    if take <= 0:
-                        continue
-                    db.add(PaymentAllocation(
-                        payment_id=pid,
-                        alloc_type="po_advance_applied",
-                        target_inv_id=new_inv.invoice_no,
-                        target_po_no=inv.po_no,
-                        note_id=None,
-                        amount=float(take),
-                    ))
-                    shortfall -= take
-                    if shortfall <= 0:
-                        break
-        db.commit()
     return {"success": True, "id": new_user.id}
 
 
