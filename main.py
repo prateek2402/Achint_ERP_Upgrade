@@ -223,20 +223,48 @@ Base.metadata.create_all(bind=engine)
 
 
 def _maybe_run_legacy_import():
-    """Import legacy ERP snapshot on first boot when old_erp.sqlite is present."""
+    """Import a legacy ERP snapshot only when explicitly opted in for a blank DB."""
+    enabled = os.getenv("LEGACY_AUTO_IMPORT_ON_STARTUP", "").strip().lower() in {"1", "true", "yes", "on"}
     legacy_path = Path(os.getenv("LEGACY_DB_PATH", "old_erp.sqlite"))
     marker = Path(".legacy_import_once.marker")
+    if not enabled:
+        return
     if not legacy_path.exists():
         return
     if marker.exists():
         return
-    try:
-        from migrate_sqlite import run_import
 
-        run_import(force=False)
+    db = SessionLocal()
+    try:
+        has_existing_data = any(
+            db.query(model.id).first() is not None
+            for model in (
+                User,
+                Client,
+                PurchaseOrder,
+                Invoice,
+                PaymentHistory,
+                UnallocatedPaymentRegister,
+                UnallocatedAdvanceRegister,
+                SystemSettings,
+                UploadedDocument,
+                AuditLog,
+            )
+        )
+    finally:
+        db.close()
+    if has_existing_data:
+        log.warning("legacy auto-import skipped because the target database already contains data")
+        return
+
+    from migrate_sqlite import run_import
+
+    try:
+        run_import(force=False, legacy_path=str(legacy_path))
         log.info("legacy ERP data imported from %s", legacy_path)
-    except Exception as exc:
-        log.exception("legacy import failed: %s", exc)
+    except Exception:
+        log.exception("legacy import failed; startup aborted to protect existing data")
+        raise
 
 
 def ensure_schema_columns():
