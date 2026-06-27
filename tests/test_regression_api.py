@@ -182,6 +182,24 @@ def test_auth_and_permission_guards(client: TestClient):
     assert as_admin.status_code == 200
 
 
+def test_admin_can_create_user(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    res = client.post(
+        "/api/users",
+        json={"username": "new.logistics", "password": "Logi@12345", "role": "logistics"},
+        headers=auth_header(token),
+    )
+    assert res.status_code == 200, res.text
+    payload = res.json()
+    assert payload["success"] is True
+    assert isinstance(payload["id"], int)
+
+    created_token = login(client, "new.logistics", "Logi@12345")
+    me = client.get("/api/users/me", headers=auth_header(created_token))
+    assert me.status_code == 200, me.text
+    assert me.json()["role"] == "logistics"
+
+
 def test_payment_allocations_use_invid_field(client: TestClient):
     """Locks the /api/payments allocation contract so the SPA Payment Log cell keeps working.
 
