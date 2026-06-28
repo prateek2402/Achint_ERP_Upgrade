@@ -5755,6 +5755,14 @@
         }
 
         async function moveUnallocatedToPO() {
+            const selectedSourcePos = getMultiSelectValues('poSelectOptions').map(v => String(v || '').trim()).filter(Boolean);
+            if (selectedSourcePos.length !== 1) {
+                const msg = selectedSourcePos.length > 1
+                    ? "Move unallocated funds from one PO at a time. Select a single source PO."
+                    : "Select one source PO before moving unallocated funds.";
+                return await customApplet({ title: "Select One PO", message: msg });
+            }
+            const sourcePoNo = selectedSourcePos[0];
             let unalloc = getPoFilteredUnallocatedAmount(currentClient);
             if (unalloc <= 0) return await customApplet({ title: "Error", message: "No unallocated funds available." });
 
@@ -5786,7 +5794,8 @@
                 apply_adv: false,
                 advance_only: false,
                 fund_source: 'unallocated',
-                move_to_po: poNo
+                move_to_po: poNo,
+                po_no: sourcePoNo
             };
             try {
                 const response = await fetch('/api/payments/allocate', {
@@ -5807,6 +5816,14 @@
         }
 
         async function applyUnallocatedToInvoices() {
+            const selectedSourcePos = getMultiSelectValues('poSelectOptions').map(v => String(v || '').trim()).filter(Boolean);
+            if (selectedSourcePos.length !== 1) {
+                const msg = selectedSourcePos.length > 1
+                    ? "Allocate unallocated funds from one PO at a time. Select a single PO or tick specific invoice rows for a targeted allocation."
+                    : "Select one PO before allocating unallocated funds.";
+                return await customApplet({ title: "Select One PO", message: msg });
+            }
+            const sourcePoNo = selectedSourcePos[0];
             let unalloc = getPoFilteredUnallocatedAmount(currentClient);
             if (unalloc <= 0) return await customApplet({ title: "Error", message: "No unallocated funds available." });
 
@@ -5846,7 +5863,8 @@
                 only_gst: onlyGst,
                 apply_adv: false,
                 advance_only: false,
-                fund_source: 'unallocated'
+                fund_source: 'unallocated',
+                po_no: sourcePoNo
             };
 
             try {
