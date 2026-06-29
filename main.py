@@ -228,12 +228,42 @@ def _maybe_run_legacy_import():
     marker = Path(".legacy_import_once.marker")
     if not legacy_path.exists():
         return
+    enabled = os.getenv("LEGACY_IMPORT_ON_STARTUP", "").strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        log.info(
+            "legacy ERP snapshot found at %s; skipping startup import because LEGACY_IMPORT_ON_STARTUP is not enabled",
+            legacy_path,
+        )
+        return
     if marker.exists():
+        return
+    db = SessionLocal()
+    try:
+        populated = any(
+            db.query(model.id).first() is not None
+            for model in (
+                User,
+                Client,
+                PurchaseOrder,
+                Invoice,
+                PaymentHistory,
+                UnallocatedPaymentRegister,
+                UnallocatedAdvanceRegister,
+                SystemSettings,
+            )
+        )
+    finally:
+        db.close()
+    if populated:
+        log.warning(
+            "legacy ERP snapshot found at %s; skipping startup import because target database already has data",
+            legacy_path,
+        )
         return
     try:
         from migrate_sqlite import run_import
 
-        run_import(force=False)
+        run_import(force=False, mode="replace")
         log.info("legacy ERP data imported from %s", legacy_path)
     except Exception as exc:
         log.exception("legacy import failed: %s", exc)
