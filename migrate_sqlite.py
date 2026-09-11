@@ -729,8 +729,10 @@ def run_import(
                     exclude_id = existing.id
                 assert_no_global_collisions(db, data, exclude_client_id=exclude_id)
                 if existing:
+                    # Keep the wipe inside the outer transaction so a later
+                    # failure can roll the client back instead of committing
+                    # a delete and then aborting.
                     delete_client_for_reimport(db, existing)
-                    db.commit()
 
             block = import_client_block(db, client_name, data, used_payment_ids)
             merge_counts(report, block)
