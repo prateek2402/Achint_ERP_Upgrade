@@ -223,12 +223,32 @@ Base.metadata.create_all(bind=engine)
 
 
 def _maybe_run_legacy_import():
-    """Import legacy ERP snapshot on first boot when old_erp.sqlite is present."""
+    """Import a legacy snapshot on boot only when explicitly opted in.
+
+    Presence of ``old_erp.sqlite`` is not enough: replace-mode import wipes the
+    target database. Require ``LEGACY_IMPORT_ON_STARTUP=1`` and skip when the
+    live DB already has clients, invoices, or payments.
+    """
+    flag = os.getenv("LEGACY_IMPORT_ON_STARTUP", "").strip().lower()
+    if flag not in {"1", "true", "yes", "on"}:
+        return
     legacy_path = Path(os.getenv("LEGACY_DB_PATH", "old_erp.sqlite"))
     marker = Path(".legacy_import_once.marker")
-    if not legacy_path.exists():
+    if not legacy_path.exists() or marker.exists():
         return
-    if marker.exists():
+    db = SessionLocal()
+    try:
+        populated = (
+            db.query(Client).first() is not None
+            or db.query(Invoice).first() is not None
+            or db.query(PaymentHistory).first() is not None
+        )
+    finally:
+        db.close()
+    if populated:
+        log.warning(
+            "skipping startup legacy import: target database already has operational data"
+        )
         return
     try:
         from migrate_sqlite import run_import
@@ -988,60 +1008,6 @@ def create_user(user_data: UserCreate, current_user: User = Depends(get_current_
     new_user = User(username=username, hashed_password=hash_password(user_data.password), role=normalized_role)
     db.add(new_user)
     db.commit()
-    if inv.po_no and inv.po_no != "UNASSIGNED":
-        po_obj = db.query(PurchaseOrder).filter(
-            PurchaseOrder.client_id == inv.client_id,
-            PurchaseOrder.po_no == inv.po_no
-        ).first()
-        if po_obj and float(po_obj.adv_pct or 0.0) > 0:
-            added_by_payment: dict[str, float] = defaultdict(float)
-            consumed_by_payment: dict[str, float] = defaultdict(float)
-            po_allocs = db.query(PaymentAllocation).join(
-                PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id
-            ).filter(
-                PaymentHistory.client_id == inv.client_id,
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.alloc_type.in_(["po_advance", "po_advance_applied"]),
-            ).all()
-            for al in po_allocs:
-                pid = str(al.payment_id or "").strip()
-                if not pid:
-                    continue
-                if al.alloc_type == "po_advance":
-                    added_by_payment[pid] += float(al.amount or 0.0)
-                elif al.alloc_type == "po_advance_applied":
-                    consumed_by_payment[pid] += float(al.amount or 0.0)
-
-            base_amt = float(new_inv.basic or 0.0) if (po_obj.ret_base or "total") == "basic" else float(new_inv.total or 0.0)
-            max_allowed = max(0.0, base_amt * (float(po_obj.adv_pct or 0.0) / 100.0))
-            existing_applied = db.query(PaymentAllocation).filter(
-                PaymentAllocation.alloc_type == "po_advance_applied",
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.target_inv_id == new_inv.invoice_no
-            ).all()
-            already_applied = sum(float(a.amount or 0.0) for a in existing_applied)
-            shortfall = max(0.0, max_allowed - already_applied)
-
-            if shortfall > 0:
-                for pid, added_amt in added_by_payment.items():
-                    remaining_amt = float(added_amt) - float(consumed_by_payment.get(pid, 0.0))
-                    if remaining_amt <= 0:
-                        continue
-                    take = min(shortfall, remaining_amt)
-                    if take <= 0:
-                        continue
-                    db.add(PaymentAllocation(
-                        payment_id=pid,
-                        alloc_type="po_advance_applied",
-                        target_inv_id=new_inv.invoice_no,
-                        target_po_no=inv.po_no,
-                        note_id=None,
-                        amount=float(take),
-                    ))
-                    shortfall -= take
-                    if shortfall <= 0:
-                        break
-        db.commit()
     return {"success": True, "id": new_user.id}
 
 
@@ -1340,8 +1306,6 @@ def update_purchase_order_status(po_no: str, status: POStatusSchema, current_use
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
     po = po_query.first()
     if not po:
         raise HTTPException(status_code=404, detail="PO not found")
@@ -1356,8 +1320,6 @@ def delete_purchase_order(po_no: str, current_user: User = Depends(get_current_u
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
     po = po_query.first()
     if po:
         client_id = po.client_id
@@ -2470,7 +2432,63 @@ def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = N
             _strip_po_advance_applied_for_po(client_id, po.po_no, db)
             continue
 
-        # Build per-payment advance lots for this PO.
+        invoices = db.query(Invoice).filter(
+            Invoice.client_id == client_id,
+            Invoice.po_id == po.id,
+            Invoice.is_note == False
+        ).all()
+        invoices.sort(key=lambda inv: invoice_ledger_sort_key(inv.inv_date, inv.invoice_no))
+        if invoice_no:
+            invoices = [inv for inv in invoices if inv.invoice_no == invoice_no]
+        if not invoices:
+            continue
+
+        existing_applied = db.query(PaymentAllocation).join(
+            PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id
+        ).filter(
+            PaymentHistory.client_id == client_id,
+            PaymentAllocation.alloc_type == "po_advance_applied",
+            PaymentAllocation.target_po_no == po.po_no,
+            PaymentAllocation.target_inv_id.isnot(None)
+        ).all()
+        applied_rows_by_invoice: dict[str, list[PaymentAllocation]] = defaultdict(list)
+        applied_by_invoice: dict[str, float] = defaultdict(float)
+        for al in existing_applied:
+            inv_key = str(al.target_inv_id)
+            applied_rows_by_invoice[inv_key].append(al)
+            applied_by_invoice[inv_key] += float(al.amount or 0.0)
+
+        # Lowering adv_pct / invoice base must return excess applications to the pool
+        # before remaining lots are computed; otherwise advance is stranded on invoices.
+        for inv in invoices:
+            base_amt = float(inv.basic or 0.0) if (po.ret_base or "total") == "basic" else float(inv.total or 0.0)
+            max_allowed = max(0.0, base_amt * (adv_pct / 100.0))
+            current_applied = float(applied_by_invoice.get(inv.invoice_no, 0.0))
+            excess = current_applied - max_allowed
+            if excess <= 0.009:
+                continue
+            rows = sorted(
+                applied_rows_by_invoice.get(inv.invoice_no, []),
+                key=lambda r: int(r.id or 0),
+                reverse=True,
+            )
+            for row in rows:
+                if excess <= 0.009:
+                    break
+                amt = float(row.amount or 0.0)
+                if amt <= 0:
+                    continue
+                if amt <= excess + 0.009:
+                    excess -= amt
+                    applied_by_invoice[inv.invoice_no] -= amt
+                    db.delete(row)
+                else:
+                    row.amount = amt - excess
+                    applied_by_invoice[inv.invoice_no] -= excess
+                    excess = 0.0
+        db.flush()
+
+        # Build per-payment advance lots for this PO after any cap trims.
         added_by_payment: dict[str, float] = defaultdict(float)
         consumed_by_payment: dict[str, float] = defaultdict(float)
         po_allocs = db.query(PaymentAllocation).join(
@@ -2497,29 +2515,6 @@ def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = N
         if not lots:
             continue
         lot_idx = 0
-
-        invoices = db.query(Invoice).filter(
-            Invoice.client_id == client_id,
-            Invoice.po_id == po.id,
-            Invoice.is_note == False
-        ).all()
-        invoices.sort(key=lambda inv: invoice_ledger_sort_key(inv.inv_date, inv.invoice_no))
-        if invoice_no:
-            invoices = [inv for inv in invoices if inv.invoice_no == invoice_no]
-        if not invoices:
-            continue
-
-        applied_by_invoice: dict[str, float] = defaultdict(float)
-        existing_applied = db.query(PaymentAllocation).join(
-            PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id
-        ).filter(
-            PaymentHistory.client_id == client_id,
-            PaymentAllocation.alloc_type == "po_advance_applied",
-            PaymentAllocation.target_po_no == po.po_no,
-            PaymentAllocation.target_inv_id.isnot(None)
-        ).all()
-        for al in existing_applied:
-            applied_by_invoice[str(al.target_inv_id)] += float(al.amount or 0.0)
 
         for inv in invoices:
             base_amt = float(inv.basic or 0.0) if (po.ret_base or "total") == "basic" else float(inv.total or 0.0)
