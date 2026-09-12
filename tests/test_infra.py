@@ -166,3 +166,37 @@ def test_app_logging_module_emits_request_id(caplog):
     assert any(rec.message == "hello world" for rec in caplog.records)
     rec = next(r for r in caplog.records if r.message == "hello world")
     assert getattr(rec, "request_id", None) == "abcdef123456"
+
+
+def test_startup_legacy_import_skipped_without_opt_in(tmp_path, monkeypatch):
+    legacy = tmp_path / "old_erp.sqlite"
+    legacy.write_bytes(b"not-a-real-db")
+    monkeypatch.setenv("LEGACY_IMPORT_ON_STARTUP", "0")
+    monkeypatch.setenv("LEGACY_DB_PATH", str(legacy))
+    called = {"n": 0}
+
+    def _fake_import(**_kwargs):
+        called["n"] += 1
+
+    monkeypatch.setattr("migrate_sqlite.run_import", _fake_import)
+    app_module._maybe_run_legacy_import()
+    assert called["n"] == 0
+
+
+def test_startup_legacy_import_skips_populated_target(client: TestClient, tmp_path, monkeypatch):
+    token = login(client, "admin", "Admin@1234")
+    created = client.post("/api/clients", json={"name": "LiveClient"}, headers=auth_header(token))
+    assert created.status_code == 200, created.text
+
+    legacy = tmp_path / "old_erp.sqlite"
+    legacy.write_bytes(b"not-a-real-db")
+    monkeypatch.setenv("LEGACY_IMPORT_ON_STARTUP", "1")
+    monkeypatch.setenv("LEGACY_DB_PATH", str(legacy))
+    called = {"n": 0}
+
+    def _fake_import(**_kwargs):
+        called["n"] += 1
+
+    monkeypatch.setattr("migrate_sqlite.run_import", _fake_import)
+    app_module._maybe_run_legacy_import()
+    assert called["n"] == 0
