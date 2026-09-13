@@ -138,8 +138,12 @@ def check_sqlite_openable(db_path: Path) -> dict:
 def _import_app_against_sandbox(sandbox_db: Path):
     """Set env, then import main + override SessionLocal/engine to point at sandbox."""
     os.environ["APP_DATABASE_URL"] = f"sqlite:///{sandbox_db.as_posix()}"
-    if "main" in sys.modules:
-        del sys.modules["main"]
+    # Routers import auth/db helpers from main at module load. If a previous
+    # import of main stays cached (pytest) or routers stay bound to a stale
+    # SECRET_KEY, login against the sandbox uses the wrong JWT secret.
+    for name in list(sys.modules):
+        if name == "main" or name == "routers" or name.startswith("routers."):
+            del sys.modules[name]
 
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
