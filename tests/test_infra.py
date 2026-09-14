@@ -153,6 +153,28 @@ def test_login_exposes_expiry_fields(client: TestClient):
     assert delta <= app_module.JWT_EXPIRY_HOURS * 3600 + 5  # allow a tiny slop
 
 
+def test_startup_legacy_import_is_opt_in_and_skips_populated_db(tmp_path, monkeypatch):
+    """A leftover old_erp.sqlite must not wipe a live database on boot."""
+    calls = []
+
+    def _fake_run_import(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("run_import must not be called")
+
+    monkeypatch.setenv("LEGACY_DB_PATH", str(tmp_path / "old_erp.sqlite"))
+    (tmp_path / "old_erp.sqlite").write_bytes(b"not-a-real-db")
+    monkeypatch.delenv("LEGACY_IMPORT_ON_STARTUP", raising=False)
+    monkeypatch.setattr("migrate_sqlite.run_import", _fake_run_import, raising=False)
+
+    app_module._maybe_run_legacy_import()
+    assert calls == []
+
+    monkeypatch.setenv("LEGACY_IMPORT_ON_STARTUP", "1")
+    monkeypatch.setattr(app_module, "_target_has_business_data", lambda: True)
+    app_module._maybe_run_legacy_import()
+    assert calls == []
+
+
 def test_app_logging_module_emits_request_id(caplog):
     from app_logging import REQUEST_ID, configure_logging, get_logger
     configure_logging()

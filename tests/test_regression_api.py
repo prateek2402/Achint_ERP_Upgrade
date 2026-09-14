@@ -1215,3 +1215,122 @@ def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
     assert db.query(User).filter(User.username == "localadmin").count() == 1
     assert db.query(User).filter(User.username == "legacyadmin").count() == 0
     db.close()
+
+
+def test_admin_can_create_user(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    res = client.post(
+        "/api/users",
+        json={"username": "new.ops", "password": "OpsPass@123", "role": "user"},
+        headers=auth_header(token),
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["success"] is True
+    assert isinstance(body["id"], int)
+
+    listing = client.get("/api/users", headers=auth_header(token))
+    assert listing.status_code == 200
+    usernames = {u["username"] for u in listing.json()}
+    assert "new.ops" in usernames
+
+
+def test_po_status_and_delete_do_not_crash(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    create_client_po_invoice(client, token)
+
+    status = client.put(
+        "/api/purchase-orders/PO-001/status",
+        json={"is_completed": True, "is_hidden": False},
+        headers=auth_header(token),
+    )
+    assert status.status_code == 200, status.text
+    assert status.json()["success"] is True
+
+    listed = client.get("/api/purchase-orders?include_completed=true", headers=auth_header(token))
+    assert listed.status_code == 200, listed.text
+    match = next(po for po in listed.json() if po["po_no"] == "PO-001")
+    assert match["is_completed"] is True
+
+    deleted = client.delete("/api/purchase-orders/PO-001", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+    remaining = client.get("/api/purchase-orders?include_completed=true", headers=auth_header(token))
+    assert remaining.status_code == 200
+    assert all(po["po_no"] != "PO-001" for po in remaining.json())
+
+
+def test_merge_import_rolls_back_client_delete_on_failure(tmp_path, monkeypatch):
+    import json
+    import sqlite3
+
+    import migrate_sqlite as mig
+    from models import Client, Invoice, User
+
+    target_db = tmp_path / "erp.sqlite"
+    legacy_db = tmp_path / "old.sqlite"
+    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{target_db.as_posix()}")
+    monkeypatch.chdir(tmp_path)
+
+    app_data = {
+        "_settings": {"exchangeRate": 83.0, "customColumns": []},
+        "ClientA": {
+            "active": True,
+            "excess": 0.0,
+            "invoices": [{
+                "id": "INV-A-NEW",
+                "poNo": "UNASSIGNED",
+                "invDate": "2026-01-01",
+                "dueDate": "2026-02-01",
+                "basic": 100.0,
+                "gst": 0.0,
+                "total": 100.0,
+                "advance": 0.0,
+                "tds": 0.0,
+                "retention": 0.0,
+                "netPayable": 100.0,
+                "paid": 0.0,
+                "balance": 100.0,
+            }],
+            "paymentHistory": [],
+            "poTerms": {},
+        },
+    }
+    conn = sqlite3.connect(str(legacy_db))
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT, role TEXT)")
+    conn.execute("CREATE TABLE erp_data (id INTEGER PRIMARY KEY, json_data TEXT)")
+    conn.execute("INSERT INTO users VALUES (1, 'legacyadmin', 'pass', 'admin')")
+    conn.execute("INSERT INTO erp_data VALUES (1, ?)", (json.dumps(app_data),))
+    conn.commit()
+    conn.close()
+
+    _, SessionLocal = mig.open_target_session()
+    db = SessionLocal()
+    db.add(User(username="localadmin", hashed_password=mig.hash_password("secret"), role="admin"))
+    client_a = Client(name="ClientA", active=True, excess_funds=0.0)
+    db.add(client_a)
+    db.flush()
+    db.add(
+        Invoice(
+            client_id=client_a.id,
+            invoice_no="INV-A-OLD",
+            basic=10.0,
+            total=10.0,
+            net_payable=10.0,
+            balance=10.0,
+        )
+    )
+    db.commit()
+    db.close()
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated import failure")
+
+    monkeypatch.setattr(mig, "import_client_block", _boom)
+    with pytest.raises(RuntimeError, match="simulated import failure"):
+        mig.run_import(mode="merge", clients="ClientA", legacy_path=str(legacy_db))
+
+    db = SessionLocal()
+    surviving = db.query(Client).filter(Client.name == "ClientA").one()
+    inv_nos = {inv.invoice_no for inv in db.query(Invoice).filter(Invoice.client_id == surviving.id).all()}
+    assert "INV-A-OLD" in inv_nos
+    db.close()
