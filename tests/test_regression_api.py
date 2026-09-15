@@ -182,6 +182,71 @@ def test_auth_and_permission_guards(client: TestClient):
     assert as_admin.status_code == 200
 
 
+def test_admin_can_create_user(client: TestClient):
+    """POST /api/users must not crash on leftover invoice/PO-advance locals."""
+    token = login(client, "admin", "Admin@1234")
+    resp = client.post(
+        "/api/users",
+        json={"username": "clerk.one", "password": "Clerk@12345", "role": "user"},
+        headers=auth_header(token),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["success"] is True
+    assert isinstance(body["id"], int)
+
+    listed = client.get("/api/users", headers=auth_header(token))
+    assert listed.status_code == 200, listed.text
+    usernames = {u["username"] for u in listed.json()}
+    assert "clerk.one" in usernames
+
+
+def test_po_status_and_delete_do_not_crash(client: TestClient):
+    """PO status/delete handlers must not reference a non-existent payload.client_id."""
+    token = login(client, "admin", "Admin@1234")
+    created = client.post("/api/clients", json={"name": "PO-OPS"}, headers=auth_header(token))
+    assert created.status_code == 200, created.text
+    client_id = created.json()["id"]
+
+    po = client.post(
+        "/api/purchase-orders",
+        json={
+            "client_id": client_id,
+            "po_no": "PO-STATUS-1",
+            "contact_person": "Ops",
+            "project_name": "Kiln",
+            "adv_pct": 0.0,
+            "ret_pct": 0.0,
+            "ret_base": "total",
+            "tds_enabled": False,
+            "tds_rate": 0.0,
+            "tds_threshold": 0.0,
+            "baseline_items": [],
+        },
+        headers=auth_header(token),
+    )
+    assert po.status_code == 200, po.text
+
+    status = client.put(
+        "/api/purchase-orders/PO-STATUS-1/status",
+        json={"is_completed": True, "is_hidden": False},
+        headers=auth_header(token),
+    )
+    assert status.status_code == 200, status.text
+    assert status.json()["success"] is True
+
+    listed = client.get("/api/purchase-orders", headers=auth_header(token))
+    assert listed.status_code == 200, listed.text
+    row = next(p for p in listed.json() if p["po_no"] == "PO-STATUS-1")
+    assert row["is_completed"] is True
+
+    deleted = client.delete("/api/purchase-orders/PO-STATUS-1", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+    remaining = client.get("/api/purchase-orders", headers=auth_header(token))
+    assert remaining.status_code == 200, remaining.text
+    assert all(p["po_no"] != "PO-STATUS-1" for p in remaining.json())
+
+
 def test_payment_allocations_use_invid_field(client: TestClient):
     """Locks the /api/payments allocation contract so the SPA Payment Log cell keeps working.
 
