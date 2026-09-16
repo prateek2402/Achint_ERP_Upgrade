@@ -1215,3 +1215,110 @@ def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
     assert db.query(User).filter(User.username == "localadmin").count() == 1
     assert db.query(User).filter(User.username == "legacyadmin").count() == 0
     db.close()
+
+
+def test_admin_can_create_user(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    created = client.post(
+        "/api/users",
+        json={"username": "ops.user", "password": "OpsUser@1234", "role": "user"},
+        headers=auth_header(token),
+    )
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body.get("success") is True
+    assert body.get("id")
+
+    listed = client.get("/api/users", headers=auth_header(token))
+    assert listed.status_code == 200, listed.text
+    usernames = {u["username"] for u in listed.json()}
+    assert "ops.user" in usernames
+
+
+def test_po_status_and_delete_do_not_crash(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    status = client.put(
+        "/api/purchase-orders/PO-001/status",
+        json={"is_completed": True, "is_hidden": False},
+        headers=auth_header(token),
+    )
+    assert status.status_code == 200, status.text
+    assert status.json().get("success") is True
+
+    deleted = client.delete("/api/purchase-orders/PO-001", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json().get("success") is True
+
+    leftover = client.get("/api/purchase-orders", headers=auth_header(token))
+    assert leftover.status_code == 200, leftover.text
+    assert not any(p.get("po_no") == "PO-001" for p in leftover.json())
+
+
+def test_po_create_does_not_overwrite_another_clients_po(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    client_a = create_client_po_invoice(client, token)
+
+    client_b = client.post("/api/clients", json={"name": "OTHERCO"}, headers=auth_header(token))
+    assert client_b.status_code == 200, client_b.text
+    client_b_id = client_b.json()["id"]
+
+    clash = client.post(
+        "/api/purchase-orders",
+        json={
+            "client_id": client_b_id,
+            "po_no": "PO-001",
+            "contact_person": "Should Not Apply",
+            "project_name": "Hijack",
+            "adv_pct": 99.0,
+            "ret_pct": 0.0,
+            "ret_base": "total",
+            "tds_enabled": False,
+            "tds_rate": 0.0,
+            "tds_threshold": 0.0,
+            "baseline_items": [
+                {"description": "Hijacked SKU", "ordered_qty": 1, "inspected_qty": 0, "uom": "Nos"},
+            ],
+        },
+        headers=auth_header(token),
+    )
+    assert clash.status_code == 400, clash.text
+    assert "another client" in clash.json()["detail"].lower()
+
+    pos = client.get("/api/purchase-orders", headers=auth_header(token))
+    assert pos.status_code == 200, pos.text
+    po_a = next(p for p in pos.json() if p.get("po_no") == "PO-001")
+    assert po_a["client_id"] == client_a
+    assert float(po_a["adv_pct"]) == pytest.approx(5.0)
+    descriptions = {str(b.get("description") or "") for b in (po_a.get("baseline_items") or [])}
+    assert "Brick A" in descriptions
+    assert "Hijacked SKU" not in descriptions
+
+    hijack_inv = client.post(
+        "/api/invoices",
+        json={
+            "client_id": client_b_id,
+            "po_no": "PO-001",
+            "invoice_no": "INV-HIJACK",
+            "sub_entity": "",
+            "lr_no": "",
+            "inv_date": "2026-04-20",
+            "due_date": None,
+            "basic": 10.0,
+            "gst": 0.0,
+            "total": 10.0,
+            "advance_adj": 0.0,
+            "tds_ded": 0.0,
+            "retention_held": 0.0,
+            "net_payable": 0.0,
+            "paid": 0.0,
+            "balance": 0.0,
+            "is_note": False,
+            "note_type": None,
+            "note_reason": None,
+            "dispatch_items": [{"description": "Hijacked SKU", "qty": 9, "inspected_qty": 0, "uom": "Nos"}],
+        },
+        headers=auth_header(token),
+    )
+    assert hijack_inv.status_code == 400, hijack_inv.text
