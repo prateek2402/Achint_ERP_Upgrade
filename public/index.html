@@ -4333,10 +4333,11 @@
         async function togglePoCompletion(poNo, targetCompleted) {
             const token = ErpAuth.getToken();
             try {
+                const clientId = (appData[currentClient] && appData[currentClient].sql_id) || undefined;
                 const response = await fetch(`/api/purchase-orders/${encodeURIComponent(poNo)}/status`, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
-                    body: JSON.stringify({ is_completed: !!targetCompleted, is_hidden: false })
+                    body: JSON.stringify({ is_completed: !!targetCompleted, is_hidden: false, client_id: clientId })
                 });
                 const result = await response.json().catch(() => ({}));
                 if (!response.ok) throw new Error(result.detail || 'Failed to update PO status.');
@@ -4442,7 +4443,9 @@
             if (!await customApplet({ title: "Remove Terms", message: `Delete payment terms for PO ${po}?`, type: "confirm" })) return;
             const token = ErpAuth.getToken();
             try {
-                const response = await fetch(`/api/purchase-orders/${encodeURIComponent(po)}`, {
+                const clientId = appData[currentClient] && appData[currentClient].sql_id;
+                const qs = clientId ? `?client_id=${encodeURIComponent(clientId)}` : '';
+                const response = await fetch(`/api/purchase-orders/${encodeURIComponent(po)}${qs}`, {
                     method: 'DELETE',
                     headers: { 'Authorization': 'Bearer ' + token }
                 });

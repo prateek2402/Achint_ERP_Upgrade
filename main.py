@@ -988,60 +988,6 @@ def create_user(user_data: UserCreate, current_user: User = Depends(get_current_
     new_user = User(username=username, hashed_password=hash_password(user_data.password), role=normalized_role)
     db.add(new_user)
     db.commit()
-    if inv.po_no and inv.po_no != "UNASSIGNED":
-        po_obj = db.query(PurchaseOrder).filter(
-            PurchaseOrder.client_id == inv.client_id,
-            PurchaseOrder.po_no == inv.po_no
-        ).first()
-        if po_obj and float(po_obj.adv_pct or 0.0) > 0:
-            added_by_payment: dict[str, float] = defaultdict(float)
-            consumed_by_payment: dict[str, float] = defaultdict(float)
-            po_allocs = db.query(PaymentAllocation).join(
-                PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id
-            ).filter(
-                PaymentHistory.client_id == inv.client_id,
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.alloc_type.in_(["po_advance", "po_advance_applied"]),
-            ).all()
-            for al in po_allocs:
-                pid = str(al.payment_id or "").strip()
-                if not pid:
-                    continue
-                if al.alloc_type == "po_advance":
-                    added_by_payment[pid] += float(al.amount or 0.0)
-                elif al.alloc_type == "po_advance_applied":
-                    consumed_by_payment[pid] += float(al.amount or 0.0)
-
-            base_amt = float(new_inv.basic or 0.0) if (po_obj.ret_base or "total") == "basic" else float(new_inv.total or 0.0)
-            max_allowed = max(0.0, base_amt * (float(po_obj.adv_pct or 0.0) / 100.0))
-            existing_applied = db.query(PaymentAllocation).filter(
-                PaymentAllocation.alloc_type == "po_advance_applied",
-                PaymentAllocation.target_po_no == inv.po_no,
-                PaymentAllocation.target_inv_id == new_inv.invoice_no
-            ).all()
-            already_applied = sum(float(a.amount or 0.0) for a in existing_applied)
-            shortfall = max(0.0, max_allowed - already_applied)
-
-            if shortfall > 0:
-                for pid, added_amt in added_by_payment.items():
-                    remaining_amt = float(added_amt) - float(consumed_by_payment.get(pid, 0.0))
-                    if remaining_amt <= 0:
-                        continue
-                    take = min(shortfall, remaining_amt)
-                    if take <= 0:
-                        continue
-                    db.add(PaymentAllocation(
-                        payment_id=pid,
-                        alloc_type="po_advance_applied",
-                        target_inv_id=new_inv.invoice_no,
-                        target_po_no=inv.po_no,
-                        note_id=None,
-                        amount=float(take),
-                    ))
-                    shortfall -= take
-                    if shortfall <= 0:
-                        break
-        db.commit()
     return {"success": True, "id": new_user.id}
 
 
@@ -1108,6 +1054,7 @@ class ClientCurrencySchema(BaseModel):
 class POStatusSchema(BaseModel):
     is_completed: bool
     is_hidden: bool = False
+    client_id: Optional[int] = None
 
 # --- PHASE 4: GLOBAL SETTINGS ---
 @app.get("/api/settings")
@@ -1258,8 +1205,15 @@ def create_purchase_order(po: POCreate, request: Request, current_user: User = D
     if current_user.role not in ["admin", "logistics", "user"]:
         raise HTTPException(status_code=403, detail="Authorized operations access required")
     
-    existing_po = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po.po_no).first()
-    
+    existing_po = db.query(PurchaseOrder).filter(
+        PurchaseOrder.po_no == po.po_no,
+        PurchaseOrder.client_id == po.client_id,
+    ).first()
+    if not existing_po:
+        other_client_po = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po.po_no).first()
+        if other_client_po:
+            raise HTTPException(status_code=400, detail="PO number already exists for another client.")
+
     if existing_po:
         # UPSERT: Update the existing lazily-created PO with strict financial terms
         existing_po.contact_person = po.contact_person
@@ -1340,8 +1294,8 @@ def update_purchase_order_status(po_no: str, status: POStatusSchema, current_use
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
+    if status.client_id:
+        po_query = po_query.filter(PurchaseOrder.client_id == status.client_id)
     po = po_query.first()
     if not po:
         raise HTTPException(status_code=404, detail="PO not found")
@@ -1352,12 +1306,17 @@ def update_purchase_order_status(po_no: str, status: POStatusSchema, current_use
     return {"success": True}
 
 @app.delete("/api/purchase-orders/{po_no:path}")
-def delete_purchase_order(po_no: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def delete_purchase_order(
+    po_no: str,
+    client_id: Optional[int] = Query(default=None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no)
-    if payload.client_id:
-        po_query = po_query.filter(PurchaseOrder.client_id == payload.client_id)
+    if client_id:
+        po_query = po_query.filter(PurchaseOrder.client_id == client_id)
     po = po_query.first()
     if po:
         client_id = po.client_id
@@ -2745,6 +2704,28 @@ def get_invoices(fiscal_years: Optional[str] = Query(default=None, description="
     result.sort(key=lambda r: invoice_ledger_sort_key_from_strings(r.get("invDate"), r.get("id")))
     return result
 
+def _resolve_purchase_order_for_client(db: Session, client_id: int, po_no: Optional[str], *, create_if_missing: bool = False):
+    """Return the PO for this client, or reject a number that belongs to another client."""
+    po_no_val = (po_no or "").strip()
+    if not po_no_val or po_no_val == "UNASSIGNED":
+        return None
+    po = db.query(PurchaseOrder).filter(
+        PurchaseOrder.po_no == po_no_val,
+        PurchaseOrder.client_id == client_id,
+    ).first()
+    if po:
+        return po
+    other = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == po_no_val).first()
+    if other:
+        raise HTTPException(status_code=400, detail="PO number already exists for another client.")
+    if not create_if_missing:
+        return None
+    po = PurchaseOrder(client_id=client_id, po_no=po_no_val)
+    db.add(po)
+    db.flush()
+    return po
+
+
 @app.post("/api/invoices")
 def create_invoice(inv: InvoiceCreate, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if current_user.role not in ["admin", "logistics", "user"]:
@@ -2755,12 +2736,8 @@ def create_invoice(inv: InvoiceCreate, request: Request, current_user: User = De
         raise HTTPException(status_code=400, detail="Invoice number already exists.")
 
     po_id = None
-    if inv.po_no and inv.po_no.strip() and inv.po_no != 'UNASSIGNED':
-        po = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == inv.po_no).first()
-        if not po:
-            po = PurchaseOrder(client_id=inv.client_id, po_no=inv.po_no)
-            db.add(po)
-            db.flush() 
+    po = _resolve_purchase_order_for_client(db, inv.client_id, inv.po_no, create_if_missing=True)
+    if po:
         po_id = po.id
 
     inv_d = datetime.datetime.strptime(inv.inv_date, '%Y-%m-%d').date() if inv.inv_date else None
@@ -2838,12 +2815,8 @@ def update_invoice(invoice_no: str, inv: InvoiceUpdate, request: Request, curren
     }
         
     po_id = None
-    if inv.po_no and inv.po_no.strip() and inv.po_no != 'UNASSIGNED':
-        po = db.query(PurchaseOrder).filter(PurchaseOrder.po_no == inv.po_no).first()
-        if not po:
-            po = PurchaseOrder(client_id=inv.client_id, po_no=inv.po_no)
-            db.add(po)
-            db.flush() 
+    po = _resolve_purchase_order_for_client(db, inv.client_id, inv.po_no, create_if_missing=True)
+    if po:
         po_id = po.id
 
     db_inv.po_id = po_id
