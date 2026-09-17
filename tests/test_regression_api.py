@@ -1215,3 +1215,131 @@ def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
     assert db.query(User).filter(User.username == "localadmin").count() == 1
     assert db.query(User).filter(User.username == "legacyadmin").count() == 0
     db.close()
+
+
+def test_admin_can_create_user(client):
+    token = login(client, "admin", "Admin@1234")
+    res = client.post(
+        "/api/users",
+        json={"username": "newops", "password": "Newops@1234", "role": "user"},
+        headers=auth_header(token),
+    )
+    assert res.status_code == 200, res.text
+    assert res.json().get("success") is True
+    users = client.get("/api/users", headers=auth_header(token))
+    assert users.status_code == 200
+    assert "newops" in {u["username"] for u in users.json()}
+
+
+def test_po_status_and_delete_do_not_crash(client):
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    status = client.put(
+        "/api/purchase-orders/PO-001/status",
+        json={"is_completed": True, "is_hidden": False, "client_id": client_id},
+        headers=auth_header(token),
+    )
+    assert status.status_code == 200, status.text
+
+    status_legacy = client.put(
+        "/api/purchase-orders/PO-001/status",
+        json={"is_completed": False, "is_hidden": False},
+        headers=auth_header(token),
+    )
+    assert status_legacy.status_code == 200, status_legacy.text
+
+    deleted = client.delete(
+        f"/api/purchase-orders/PO-001?client_id={client_id}",
+        headers=auth_header(token),
+    )
+    assert deleted.status_code == 200, deleted.text
+    pos = client.get("/api/purchase-orders", headers=auth_header(token))
+    assert pos.status_code == 200
+    assert all(p["po_no"] != "PO-001" for p in pos.json())
+
+
+def test_po_create_does_not_overwrite_another_clients_po(client):
+    token = login(client, "admin", "Admin@1234")
+    headers = auth_header(token)
+
+    alpha = client.post("/api/clients", json={"name": "AlphaCo"}, headers=headers)
+    beta = client.post("/api/clients", json={"name": "BetaCo"}, headers=headers)
+    assert alpha.status_code == 200, alpha.text
+    assert beta.status_code == 200, beta.text
+    alpha_id = alpha.json()["id"]
+    beta_id = beta.json()["id"]
+
+    po_a = {
+        "client_id": alpha_id,
+        "po_no": "PO-SHARED",
+        "contact_person": "A",
+        "project_name": "Alpha kiln",
+        "adv_pct": 5.0,
+        "ret_pct": 0.0,
+        "ret_base": "total",
+        "tds_enabled": False,
+        "tds_rate": 0.0,
+        "tds_threshold": 0.0,
+        "baseline_items": [
+            {"description": "Brick A", "ordered_qty": 100, "inspected_qty": 0, "uom": "Nos", "material_type": "brick"},
+        ],
+    }
+    created = client.post("/api/purchase-orders", json=po_a, headers=headers)
+    assert created.status_code == 200, created.text
+    alpha_po_id = created.json()["po_id"]
+
+    hijack = client.post(
+        "/api/purchase-orders",
+        json={
+            **po_a,
+            "client_id": beta_id,
+            "contact_person": "B",
+            "project_name": "Beta kiln",
+            "baseline_items": [
+                {"description": "Castable B", "ordered_qty": 10, "inspected_qty": 0, "uom": "Bags", "material_type": "castable_mortar"},
+            ],
+        },
+        headers=headers,
+    )
+    assert hijack.status_code == 400, hijack.text
+
+    pos = client.get("/api/purchase-orders", headers=headers)
+    assert pos.status_code == 200
+    shared = [p for p in pos.json() if p["po_no"] == "PO-SHARED"]
+    assert len(shared) == 1
+    assert shared[0]["client_id"] == alpha_id
+    assert [i["description"] for i in shared[0]["baseline_items"]] == ["Brick A"]
+
+    inv_hijack = client.post(
+        "/api/invoices",
+        json={
+            "client_id": beta_id,
+            "po_no": "PO-SHARED",
+            "invoice_no": "INV-BETA-1",
+            "sub_entity": "Unit-B",
+            "lr_no": "",
+            "inv_date": "2026-04-01",
+            "due_date": "2026-04-15",
+            "basic": 100.0,
+            "gst": 18.0,
+            "total": 118.0,
+            "advance_adj": 0.0,
+            "tds_ded": 0.0,
+            "retention_held": 0.0,
+            "net_payable": 118.0,
+            "paid": 0.0,
+            "balance": 118.0,
+            "is_note": False,
+            "note_type": None,
+            "note_reason": None,
+            "dispatch_items": [],
+        },
+        headers=headers,
+    )
+    assert inv_hijack.status_code == 400, inv_hijack.text
+
+    invoices = client.get("/api/invoices", headers=headers)
+    assert invoices.status_code == 200
+    assert all(row["id"] != "INV-BETA-1" for row in invoices.json())
+    assert any(p["id"] == alpha_po_id and p["client_id"] == alpha_id for p in pos.json())
