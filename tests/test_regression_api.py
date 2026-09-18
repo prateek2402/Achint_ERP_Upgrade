@@ -1215,3 +1215,47 @@ def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
     assert db.query(User).filter(User.username == "localadmin").count() == 1
     assert db.query(User).filter(User.username == "legacyadmin").count() == 0
     db.close()
+
+
+def test_admin_can_create_user(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    res = client.post(
+        "/api/users",
+        json={"username": "ops.user", "password": "OpsUser@123", "role": "user"},
+        headers=auth_header(token),
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body.get("success") is True
+    assert body.get("id")
+
+    listed = client.get("/api/users", headers=auth_header(token))
+    assert listed.status_code == 200, listed.text
+    usernames = {u["username"] for u in listed.json()}
+    assert "ops.user" in usernames
+
+
+def test_po_status_and_delete_do_not_crash(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    create_client_po_invoice(client, token)
+
+    status_res = client.put(
+        "/api/purchase-orders/PO-001/status",
+        json={"is_completed": True, "is_hidden": False},
+        headers=auth_header(token),
+    )
+    assert status_res.status_code == 200, status_res.text
+    assert status_res.json().get("success") is True
+
+    listed = client.get("/api/purchase-orders", headers=auth_header(token))
+    assert listed.status_code == 200, listed.text
+    po_row = next(po for po in listed.json() if po.get("po_no") == "PO-001")
+    assert po_row.get("is_completed") is True
+
+    delete_res = client.delete("/api/purchase-orders/PO-001", headers=auth_header(token))
+    assert delete_res.status_code == 200, delete_res.text
+    assert delete_res.json().get("success") is True
+
+    listed_after = client.get("/api/purchase-orders", headers=auth_header(token))
+    assert listed_after.status_code == 200, listed_after.text
+    assert all(po.get("po_no") != "PO-001" for po in listed_after.json())
