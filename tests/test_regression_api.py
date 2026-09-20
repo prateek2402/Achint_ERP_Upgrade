@@ -161,6 +161,35 @@ def test_net_payable_balance_ignore_retention_row(client: TestClient):
     assert row["balance"] == pytest.approx(500.0)
 
 
+def test_admin_can_create_user(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    resp = client.post(
+        "/api/users",
+        json={"username": "newops", "password": "OpsUser@123", "role": "user"},
+        headers=auth_header(token),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("success") is True
+    assert body.get("id")
+
+
+def test_po_status_and_delete_do_not_crash(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    create_client_po_invoice(client, token)
+    status_resp = client.put(
+        "/api/purchase-orders/PO-001/status",
+        json={"is_completed": True, "is_hidden": False},
+        headers=auth_header(token),
+    )
+    assert status_resp.status_code == 200, status_resp.text
+    assert status_resp.json().get("success") is True
+
+    delete_resp = client.delete("/api/purchase-orders/PO-001", headers=auth_header(token))
+    assert delete_resp.status_code == 200, delete_resp.text
+    assert delete_resp.json().get("success") is True
+
+
 def test_auth_and_permission_guards(client: TestClient):
     no_token = client.get("/api/clients")
     assert no_token.status_code in (401, 403)
