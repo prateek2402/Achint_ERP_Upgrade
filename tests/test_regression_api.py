@@ -1215,3 +1215,70 @@ def test_merge_import_one_client_preserves_others(tmp_path, monkeypatch):
     assert db.query(User).filter(User.username == "localadmin").count() == 1
     assert db.query(User).filter(User.username == "legacyadmin").count() == 0
     db.close()
+
+
+def test_admin_can_create_user(client: TestClient):
+    """Admin user create used leftover invoice PO-advance code (NameError: inv)."""
+    token = login(client, "admin", "Admin@1234")
+    created = client.post(
+        "/api/users",
+        json={"username": "ops.user", "password": "OpsUser@1234", "role": "user"},
+        headers=auth_header(token),
+    )
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["success"] is True
+    assert isinstance(body["id"], int)
+
+    users = client.get("/api/users", headers=auth_header(token))
+    assert users.status_code == 200
+    assert any(u["username"] == "ops.user" and u["role"] == "user" for u in users.json())
+
+    new_token = login(client, "ops.user", "OpsUser@1234")
+    me = client.get("/api/users/me", headers=auth_header(new_token))
+    assert me.status_code == 200
+    assert me.json()["username"] == "ops.user"
+
+
+def test_po_status_and_delete_do_not_crash(client: TestClient):
+    """PO complete/hide and delete referenced an undefined payload.client_id."""
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    status = client.put(
+        "/api/purchase-orders/PO-001/status",
+        json={"is_completed": True, "is_hidden": False},
+        headers=auth_header(token),
+    )
+    assert status.status_code == 200, status.text
+    assert status.json()["success"] is True
+
+    pos = client.get("/api/purchase-orders", headers=auth_header(token))
+    assert pos.status_code == 200, pos.text
+    po_row = next(p for p in pos.json() if p["po_no"] == "PO-001")
+    assert po_row["is_completed"] is True
+
+    extra = client.post("/api/purchase-orders", json={
+        "client_id": client_id,
+        "po_no": "PO-DEL",
+        "contact_person": "Ops",
+        "project_name": "Spare",
+        "adv_pct": 0.0,
+        "ret_pct": 0.0,
+        "ret_base": "total",
+        "tds_enabled": False,
+        "tds_rate": 0.0,
+        "tds_threshold": 0.0,
+        "baseline_items": [],
+    }, headers=auth_header(token))
+    assert extra.status_code == 200, extra.text
+
+    deleted = client.delete("/api/purchase-orders/PO-DEL", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["success"] is True
+
+    pos_after = client.get("/api/purchase-orders", headers=auth_header(token))
+    assert pos_after.status_code == 200
+    po_nos = {p["po_no"] for p in pos_after.json()}
+    assert "PO-DEL" not in po_nos
+    assert "PO-001" in po_nos
