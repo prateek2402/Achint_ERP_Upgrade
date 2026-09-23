@@ -1088,6 +1088,69 @@ def test_dispatch_column_rename_merges_duplicates(client: TestClient):
     assert data["dispatch_renamed"] >= 0
 
 
+def test_admin_can_create_user(client: TestClient):
+    """User create must return success. A pasted invoice block used to NameError after commit."""
+    token = login(client, "admin", "Admin@1234")
+    created = client.post(
+        "/api/users",
+        json={"username": "clerk1", "password": "Clerk@12345", "role": "user"},
+        headers=auth_header(token),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["success"] is True
+
+    listed = client.get("/api/users", headers=auth_header(token))
+    assert listed.status_code == 200, listed.text
+    assert any(u["username"] == "clerk1" and u["role"] == "user" for u in listed.json())
+
+    login(client, "clerk1", "Clerk@12345")
+
+
+def test_po_status_and_delete_do_not_crash(client: TestClient):
+    """PO complete/hide and delete must not NameError on an undefined payload."""
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "POSTATUS"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+    po_payload = {
+        "client_id": client_id,
+        "po_no": "PO-STATUS-1",
+        "contact_person": "Ops",
+        "project_name": "Kiln",
+        "adv_pct": 0.0,
+        "ret_pct": 0.0,
+        "ret_base": "total",
+        "tds_enabled": False,
+        "tds_rate": 0.0,
+        "tds_threshold": 0.0,
+        "baseline_items": [],
+    }
+    created = client.post("/api/purchase-orders", json=po_payload, headers=auth_header(token))
+    assert created.status_code == 200, created.text
+
+    status = client.put(
+        "/api/purchase-orders/PO-STATUS-1/status",
+        json={"is_completed": True, "is_hidden": False},
+        headers=auth_header(token),
+    )
+    assert status.status_code == 200, status.text
+    assert status.json()["success"] is True
+
+    listed = client.get("/api/purchase-orders", headers=auth_header(token))
+    assert listed.status_code == 200, listed.text
+    row = next(p for p in listed.json() if p["po_no"] == "PO-STATUS-1")
+    assert row["is_completed"] is True
+    assert row["client_id"] == client_id
+
+    deleted = client.delete("/api/purchase-orders/PO-STATUS-1", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["success"] is True
+
+    listed_after = client.get("/api/purchase-orders", headers=auth_header(token))
+    assert listed_after.status_code == 200, listed_after.text
+    assert all(p["po_no"] != "PO-STATUS-1" for p in listed_after.json())
+
+
 def test_payment_allocate_validation_edge_case(client: TestClient):
     token = login(client, "admin", "Admin@1234")
     client_id = create_client_po_invoice(client, token)
