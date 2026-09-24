@@ -584,11 +584,21 @@ def record_login_failure(user_key: str):
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     write_methods = {"POST", "PUT", "PATCH", "DELETE"}
-    if request.method.upper() in write_methods:
-        with _write_serialization_lock:
-            response: Response = await call_next(request)
-    else:
+    is_write = request.method.upper() in write_methods
+    # Serialize SQLite writes without taking the lock on the event-loop thread.
+    # `with lock: await ...` deadlocks the process: the next write blocks inside
+    # Lock.acquire() on that same thread, so the request holding the lock can
+    # never resume and release it. Acquire in a worker thread instead;
+    # threading.Lock.release() is allowed from the event-loop thread.
+    acquired = False
+    if is_write:
+        await asyncio.to_thread(_write_serialization_lock.acquire)
+        acquired = True
+    try:
         response: Response = await call_next(request)
+    finally:
+        if acquired:
+            _write_serialization_lock.release()
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
