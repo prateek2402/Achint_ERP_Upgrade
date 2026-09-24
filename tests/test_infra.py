@@ -8,6 +8,9 @@ test_regression_api so they exercise the actual app, not a stub.
 from __future__ import annotations
 
 import datetime
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -166,3 +169,63 @@ def test_app_logging_module_emits_request_id(caplog):
     assert any(rec.message == "hello world" for rec in caplog.records)
     rec = next(r for r in caplog.records if r.message == "hello world")
     assert getattr(rec, "request_id", None) == "abcdef123456"
+
+
+def test_concurrent_write_requests_do_not_deadlock_the_server(tmp_path):
+    """Two overlapping POST/PUT/PATCH/DELETE calls must both finish.
+
+    The write lock used to be held on the event-loop thread across ``await``.
+    The second write then blocked that thread inside ``Lock.acquire()``, so
+    the first request could never release the lock and the process hung.
+    """
+    script = r"""
+import asyncio, os, time
+os.environ.setdefault("JWT_SECRET_KEY", "test-secret-for-lock")
+import main as app_module
+app_module._backup_thread_started = True
+
+@app_module.app.post("/api/_slow_write_probe")
+def slow_write_probe():
+    time.sleep(0.3)
+    return {"ok": True}
+
+async def main():
+    import httpx
+    transport = httpx.ASGITransport(app=app_module.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async def one():
+            r = await client.post("/api/_slow_write_probe")
+            if r.status_code != 200:
+                raise SystemExit(f"status {r.status_code} {r.text}")
+        started = time.perf_counter()
+        await asyncio.wait_for(asyncio.gather(one(), one()), timeout=5)
+        elapsed = time.perf_counter() - started
+        # Two 0.3s handlers must not overlap; the write lock serializes them.
+        if elapsed < 0.5:
+            raise SystemExit(f"writes overlapped: {elapsed:.3f}s")
+    print("ok")
+
+asyncio.run(main())
+"""
+    env = os.environ.copy()
+    root = Path(__file__).resolve().parents[1]
+    db_file = tmp_path / "lock_probe.sqlite"
+    env["PYTHONPATH"] = str(root) + os.pathsep + env.get("PYTHONPATH", "")
+    env["JWT_SECRET_KEY"] = "test-secret-for-lock"
+    env["APP_DATABASE_URL"] = f"sqlite:///{db_file}"
+    env.pop("BOOTSTRAP_ADMIN_USERNAME", None)
+    env.pop("BOOTSTRAP_ADMIN_PASSWORD", None)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=25,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(
+            "concurrent write requests deadlocked the server"
+        ) from exc
+    assert proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
