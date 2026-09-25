@@ -902,6 +902,9 @@ class PaymentAllocateRequest(BaseModel):
     clear_po_pool: bool = False
     excess_action: str = "park"  # park | allocate_pending
     allow_overpayment: bool = False  # if True, allow allocating > invoice balance → negative balance
+    # When drawing from the unallocated pool, only these register rows may be consumed.
+    # Empty means legacy FIFO across every open row for the client.
+    register_entry_ids: list[int] = []
 
 class TransferRequest(BaseModel):
     new_client_id: int
@@ -3356,9 +3359,21 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
         raise HTTPException(status_code=404, detail="Client not found")
 
     available_unallocated = float(client.excess_funds or 0.0)
+    scoped_register_ids: list[int] = []
     if payment.fund_source == "unallocated":
         if available_unallocated <= 0:
             raise HTTPException(status_code=400, detail="No unallocated funds available.")
+        scoped_register_ids = _normalize_register_entry_ids(payment.register_entry_ids)
+        if scoped_register_ids:
+            missing_ids, open_rows = _selected_open_unallocated_rows(db, payment.client_id, scoped_register_ids)
+            if missing_ids:
+                raise HTTPException(status_code=400, detail="Unallocated entry not found for this client.")
+            if not open_rows:
+                raise HTTPException(status_code=400, detail="Selected unallocated entries are no longer available.")
+            available_unallocated = min(
+                available_unallocated,
+                sum(float(row.balance or 0.0) for row in open_rows),
+            )
         if payment.amount > 0:
             remaining = min(float(payment.amount), available_unallocated)
         else:
@@ -3585,7 +3600,12 @@ def allocate_payment(payment: PaymentAllocateRequest, current_user: User = Depen
         _auto_apply_po_advance(payment.client_id, db, payment.move_to_po.strip())
 
     if payment.fund_source == "unallocated" and payment_amount > 0:
-        _drain_unallocated_register(db, payment.client_id, payment_amount)
+        _drain_unallocated_register(
+            db,
+            payment.client_id,
+            payment_amount,
+            entry_ids=scoped_register_ids or None,
+        )
 
     db.commit()
     recalculate_client_ledger(payment.client_id, db)
@@ -3661,21 +3681,67 @@ def _build_unallocated_register_note(source_kind: str, raw_note: Optional[str], 
     return f"[{payload}] {tail}".strip()
 
 
-def _drain_unallocated_register(db: Session, client_id: int, amount: float) -> None:
-    """Consume open register balances FIFO when drawing from the unallocated pool."""
-    to_deduct = round_inr_nearest(max(0.0, float(amount or 0.0)))
-    if to_deduct <= 0:
-        return
-    open_regs = (
+def _normalize_register_entry_ids(raw_ids: Optional[list[int]]) -> list[int]:
+    ids: list[int] = []
+    seen: set[int] = set()
+    for raw in raw_ids or []:
+        try:
+            entry_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if entry_id <= 0 or entry_id in seen:
+            continue
+        seen.add(entry_id)
+        ids.append(entry_id)
+    return ids
+
+
+def _selected_open_unallocated_rows(
+    db: Session,
+    client_id: int,
+    entry_ids: list[int],
+) -> tuple[list[int], list]:
+    """Return (missing ids, open rows) for a client-scoped register selection."""
+    rows = (
         db.query(UnallocatedPaymentRegister)
         .filter(
             UnallocatedPaymentRegister.client_id == client_id,
-            UnallocatedPaymentRegister.status == "open",
-            UnallocatedPaymentRegister.balance > 0,
+            UnallocatedPaymentRegister.id.in_(entry_ids),
         )
-        .order_by(UnallocatedPaymentRegister.id.asc())
         .all()
     )
+    found = {int(row.id) for row in rows}
+    missing = [entry_id for entry_id in entry_ids if entry_id not in found]
+    open_rows = [
+        row for row in rows
+        if str(row.status or "").lower() == "open" and float(row.balance or 0.0) > 0.009
+    ]
+    open_rows.sort(key=lambda row: int(row.id))
+    return missing, open_rows
+
+
+def _drain_unallocated_register(
+    db: Session,
+    client_id: int,
+    amount: float,
+    entry_ids: Optional[list[int]] = None,
+) -> None:
+    """Consume open register balances FIFO when drawing from the unallocated pool.
+
+    ``entry_ids`` limits the drain to the rows the user selected. Without it,
+    every open row for the client is eligible (oldest first).
+    """
+    to_deduct = round_inr_nearest(max(0.0, float(amount or 0.0)))
+    if to_deduct <= 0:
+        return
+    reg_query = db.query(UnallocatedPaymentRegister).filter(
+        UnallocatedPaymentRegister.client_id == client_id,
+        UnallocatedPaymentRegister.status == "open",
+        UnallocatedPaymentRegister.balance > 0,
+    )
+    if entry_ids:
+        reg_query = reg_query.filter(UnallocatedPaymentRegister.id.in_(entry_ids))
+    open_regs = reg_query.order_by(UnallocatedPaymentRegister.id.asc()).all()
     for reg in open_regs:
         if to_deduct <= 0:
             break

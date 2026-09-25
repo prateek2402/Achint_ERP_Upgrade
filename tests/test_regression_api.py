@@ -446,6 +446,125 @@ def test_reverse_unallocated_applied_restores_register_for_applet(client: TestCl
     assert sum(float(r["balance"]) for r in open_after_reverse) == pytest.approx(300.0, abs=0.02)
 
 
+def _post_plain_invoice(client: TestClient, token: str, client_id: int, invoice_no: str, total: float):
+    resp = client.post(
+        "/api/invoices",
+        json={
+            "client_id": client_id,
+            "po_no": "UNASSIGNED",
+            "invoice_no": invoice_no,
+            "sub_entity": "",
+            "lr_no": "",
+            "inv_date": "2026-04-01",
+            "due_date": None,
+            "basic": total,
+            "gst": 0.0,
+            "total": total,
+            "advance_adj": 0.0,
+            "tds_ded": 0.0,
+            "retention_held": 0.0,
+            "net_payable": 0.0,
+            "paid": 0.0,
+            "balance": 0.0,
+            "is_note": False,
+            "note_type": None,
+            "note_reason": None,
+            "dispatch_items": [],
+        },
+        headers=auth_header(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def _park_partial_receipt(client: TestClient, token: str, client_id: int, pay_id: str, invoice_no: str, amount: float, applied: float):
+    resp = client.post(
+        "/api/payments/allocate",
+        json={
+            "client_id": client_id,
+            "id": pay_id,
+            "date": datetime.date.today().isoformat(),
+            "amount": amount,
+            "note": pay_id,
+            "mode": "targeted",
+            "targets": [{"inv_id": invoice_no, "amount": applied}],
+            "hold_ret": False,
+            "hold_gst": False,
+            "only_gst": False,
+            "apply_adv": False,
+            "advance_only": False,
+            "fund_source": "receipt",
+            "move_to_po": None,
+            "po_no": None,
+            "clear_po_pool": False,
+            "excess_action": "park",
+        },
+        headers=auth_header(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_unallocated_allocation_drains_only_selected_register_row(client: TestClient):
+    """Allocating one unallocated entry must not consume an older entry's balance."""
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "UNALLOC-SCOPE-CLIENT"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+    _post_plain_invoice(client, token, client_id, "INV-SCOPE-A", 4000.0)
+    _post_plain_invoice(client, token, client_id, "INV-SCOPE-B", 4000.0)
+    _park_partial_receipt(client, token, client_id, "PAY-SCOPE-OLD", "INV-SCOPE-A", 1500.0, 500.0)
+    _park_partial_receipt(client, token, client_id, "PAY-SCOPE-NEW", "INV-SCOPE-B", 2500.0, 500.0)
+
+    regs = client.get(
+        f"/api/registers/unallocated-payments?client_id={client_id}",
+        headers=auth_header(token),
+    ).json()
+    old_row = next(r for r in regs if r.get("source_payment_id") == "PAY-SCOPE-OLD")
+    new_row = next(r for r in regs if r.get("source_payment_id") == "PAY-SCOPE-NEW")
+    assert float(old_row["balance"]) == pytest.approx(1000.0, abs=0.02)
+    assert float(new_row["balance"]) == pytest.approx(2000.0, abs=0.02)
+    assert int(old_row["id"]) < int(new_row["id"])
+
+    applied = client.post(
+        "/api/payments/allocate",
+        json={
+            "client_id": client_id,
+            "id": "PAY-SCOPE-APPLY",
+            "date": datetime.date.today().isoformat(),
+            "amount": 99999.0,
+            "note": "from newer pool row only",
+            "mode": "targeted",
+            "targets": [{"inv_id": "INV-SCOPE-B", "amount": 99999.0}],
+            "hold_ret": False,
+            "hold_gst": False,
+            "only_gst": False,
+            "apply_adv": False,
+            "advance_only": False,
+            "fund_source": "unallocated",
+            "move_to_po": None,
+            "po_no": None,
+            "clear_po_pool": False,
+            "excess_action": "park",
+            "register_entry_ids": [int(new_row["id"])],
+        },
+        headers=auth_header(token),
+    )
+    assert applied.status_code == 200, applied.text
+    assert float(applied.json().get("unallocated_consumed") or 0) == pytest.approx(2000.0, abs=0.02)
+
+    regs_after = client.get(
+        f"/api/registers/unallocated-payments?client_id={client_id}",
+        headers=auth_header(token),
+    ).json()
+    old_after = next(r for r in regs_after if r.get("source_payment_id") == "PAY-SCOPE-OLD")
+    new_after = next(r for r in regs_after if r.get("source_payment_id") == "PAY-SCOPE-NEW")
+    assert float(old_after["balance"]) == pytest.approx(1000.0, abs=0.02)
+    assert float(new_after["balance"]) == pytest.approx(0.0, abs=0.02)
+
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    inv_b = next(i for i in invs if i["id"] == "INV-SCOPE-B")
+    assert inv_b["paid"] == pytest.approx(2500.0, abs=0.02)
+
+
 def test_delete_payment_unallocates_invoices_and_restores_balance(client: TestClient):
     token = login(client, "admin", "Admin@1234")
     cr = client.post("/api/clients", json={"name": "PAY-DEL-CLIENT"}, headers=auth_header(token))

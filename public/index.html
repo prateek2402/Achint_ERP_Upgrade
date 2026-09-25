@@ -5128,23 +5128,28 @@
             return appData[name]._unallocatedRegister || [];
         }
 
-        function getPoFilteredUnallocatedAmount(clientName) {
+        function listOpenUnallocatedEntriesForPoFilter(clientName) {
             const name = String(clientName || '').trim();
-            if (!name || !appData[name]) return 0;
+            if (!name || !appData[name]) return [];
             const rows = Array.isArray(appData[name]._unallocatedRegister) ? appData[name]._unallocatedRegister : [];
-            if (!rows.length) return 0;
+            if (!rows.length) return [];
             const poFilterSet = getSelectedLedgerPoFilterSet();
-            if (!poFilterSet || !poFilterSet.size) return 0;
-            let total = 0;
+            if (!poFilterSet || !poFilterSet.size) return [];
+            const matched = [];
             rows.forEach((entry) => {
                 const status = String(entry.status || '').toLowerCase();
                 const bal = Number(entry.balance || 0);
                 if (status !== 'open' || bal <= 0) return;
                 const po = deriveUnallocatedSourcePo(entry, name);
                 if (po === 'MULTI' || !poFilterSet.has(po)) return;
-                total += bal;
+                matched.push(entry);
             });
-            return Number(total || 0);
+            return matched;
+        }
+
+        function getPoFilteredUnallocatedAmount(clientName) {
+            return listOpenUnallocatedEntriesForPoFilter(clientName)
+                .reduce((sum, entry) => sum + Number(entry.balance || 0), 0);
         }
 
         function paymentLogMatchesPoFilter(log, poFilterSet, invoicePoById) {
@@ -5394,7 +5399,8 @@
                 apply_adv: false,
                 advance_only: false,
                 fund_source: 'unallocated',
-                allow_overpayment: allowOverpay
+                allow_overpayment: allowOverpay,
+                register_entry_ids: [Number(entryId)]
             };
             try {
                 const resp = await fetch('/api/payments/allocate', {
@@ -5755,7 +5761,8 @@
         }
 
         async function moveUnallocatedToPO() {
-            let unalloc = getPoFilteredUnallocatedAmount(currentClient);
+            const poolEntries = listOpenUnallocatedEntriesForPoFilter(currentClient);
+            let unalloc = poolEntries.reduce((sum, entry) => sum + Number(entry.balance || 0), 0);
             if (unalloc <= 0) return await customApplet({ title: "Error", message: "No unallocated funds available." });
 
             let paymentNote = document.getElementById('paymentNote') ? document.getElementById('paymentNote').value.trim() : '';
@@ -5786,7 +5793,8 @@
                 apply_adv: false,
                 advance_only: false,
                 fund_source: 'unallocated',
-                move_to_po: poNo
+                move_to_po: poNo,
+                register_entry_ids: poolEntries.map(entry => Number(entry.id)).filter(id => id > 0)
             };
             try {
                 const response = await fetch('/api/payments/allocate', {
@@ -5807,7 +5815,8 @@
         }
 
         async function applyUnallocatedToInvoices() {
-            let unalloc = getPoFilteredUnallocatedAmount(currentClient);
+            const poolEntries = listOpenUnallocatedEntriesForPoFilter(currentClient);
+            let unalloc = poolEntries.reduce((sum, entry) => sum + Number(entry.balance || 0), 0);
             if (unalloc <= 0) return await customApplet({ title: "Error", message: "No unallocated funds available." });
 
             let paymentNote = document.getElementById('paymentNote') ? document.getElementById('paymentNote').value.trim() : '';
@@ -5846,7 +5855,8 @@
                 only_gst: onlyGst,
                 apply_adv: false,
                 advance_only: false,
-                fund_source: 'unallocated'
+                fund_source: 'unallocated',
+                register_entry_ids: poolEntries.map(entry => Number(entry.id)).filter(id => id > 0)
             };
 
             try {
