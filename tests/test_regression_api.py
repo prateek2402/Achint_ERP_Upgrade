@@ -446,6 +446,132 @@ def test_reverse_unallocated_applied_restores_register_for_applet(client: TestCl
     assert sum(float(r["balance"]) for r in open_after_reverse) == pytest.approx(300.0, abs=0.02)
 
 
+def _simple_invoice(client: TestClient, token: str, client_id: int, invoice_no: str, total: float = 1000.0):
+    inv = client.post("/api/invoices", json={
+        "client_id": client_id,
+        "po_no": "UNASSIGNED",
+        "invoice_no": invoice_no,
+        "sub_entity": "",
+        "lr_no": "",
+        "inv_date": "2026-04-01",
+        "due_date": None,
+        "basic": total,
+        "gst": 0.0,
+        "total": total,
+        "advance_adj": 0.0,
+        "tds_ded": 0.0,
+        "retention_held": 0.0,
+        "net_payable": 0.0,
+        "paid": 0.0,
+        "balance": 0.0,
+        "is_note": False,
+        "note_type": None,
+        "note_reason": None,
+        "dispatch_items": [],
+    }, headers=auth_header(token))
+    assert inv.status_code == 200, inv.text
+
+
+def _open_register_balance(client: TestClient, token: str, client_id: int) -> float:
+    rows = client.get(
+        f"/api/registers/unallocated-payments?client_id={client_id}",
+        headers=auth_header(token),
+    ).json()
+    return sum(
+        float(r.get("balance") or 0.0)
+        for r in rows
+        if str(r.get("status") or "").lower() == "open"
+    )
+
+
+def test_receipt_amount_edit_cannot_understate_allocated_cash(client: TestClient):
+    """Editing a bank receipt must not leave invoices paid for cash the receipt no longer has."""
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "RECEIPT-EDIT-CLIENT"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+    _simple_invoice(client, token, client_id, "INV-RE-1", 1000.0)
+    _simple_invoice(client, token, client_id, "INV-RE-2", 1000.0)
+
+    seed = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-RE-1",
+        "date": "2026-04-02",
+        "amount": 1000.0,
+        "note": "bank",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-RE-1", "amount": 400.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert seed.status_code == 200, seed.text
+    assert _open_register_balance(client, token, client_id) == pytest.approx(600.0, abs=0.02)
+
+    shrunk = client.put("/api/payments/PAY-RE-1", json={"amount": 100.0, "note": "too small"}, headers=auth_header(token))
+    assert shrunk.status_code == 400, shrunk.text
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    inv1 = next(i for i in invs if i["id"] == "INV-RE-1")
+    assert float(inv1["paid"]) == pytest.approx(400.0, abs=0.02)
+    payments = client.get("/api/payments", headers=auth_header(token)).json()
+    receipt = next(p for p in payments if p["id"] == "PAY-RE-1")
+    assert float(receipt["amount"]) == pytest.approx(1000.0, abs=0.02)
+    assert _open_register_balance(client, token, client_id) == pytest.approx(600.0, abs=0.02)
+
+    trimmed = client.put("/api/payments/PAY-RE-1", json={"amount": 700.0, "note": "trimmed"}, headers=auth_header(token))
+    assert trimmed.status_code == 200, trimmed.text
+    assert _open_register_balance(client, token, client_id) == pytest.approx(300.0, abs=0.02)
+    clients = client.get("/api/clients", headers=auth_header(token)).json()
+    excess = next(c["excess_funds"] for c in clients if c["id"] == client_id)
+    assert float(excess) == pytest.approx(300.0, abs=0.02)
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    inv1 = next(i for i in invs if i["id"] == "INV-RE-1")
+    assert float(inv1["paid"]) == pytest.approx(400.0, abs=0.02)
+
+    raised = client.put("/api/payments/PAY-RE-1", json={"amount": 1500.0, "note": "raised"}, headers=auth_header(token))
+    assert raised.status_code == 200, raised.text
+    assert _open_register_balance(client, token, client_id) == pytest.approx(1100.0, abs=0.02)
+
+    drawn = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-RE-DRAW",
+        "date": "2026-04-03",
+        "amount": 200.0,
+        "note": "from pool",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-RE-2", "amount": 200.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "unallocated",
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert drawn.status_code == 200, drawn.text
+    assert _open_register_balance(client, token, client_id) == pytest.approx(900.0, abs=0.02)
+
+    # 400 still on the invoice + 200 already drawn from the pool => floor is 600.
+    blocked = client.put("/api/payments/PAY-RE-1", json={"amount": 500.0, "note": "below drawn"}, headers=auth_header(token))
+    assert blocked.status_code == 400, blocked.text
+    payments = client.get("/api/payments", headers=auth_header(token)).json()
+    receipt = next(p for p in payments if p["id"] == "PAY-RE-1")
+    assert float(receipt["amount"]) == pytest.approx(1500.0, abs=0.02)
+
+    fitted = client.put("/api/payments/PAY-RE-1", json={"amount": 700.0, "note": "fits drawn"}, headers=auth_header(token))
+    assert fitted.status_code == 200, fitted.text
+    assert _open_register_balance(client, token, client_id) == pytest.approx(100.0, abs=0.02)
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    inv1 = next(i for i in invs if i["id"] == "INV-RE-1")
+    inv2 = next(i for i in invs if i["id"] == "INV-RE-2")
+    assert float(inv1["paid"]) == pytest.approx(400.0, abs=0.02)
+    assert float(inv2["paid"]) == pytest.approx(200.0, abs=0.02)
+
+
 def test_delete_payment_unallocates_invoices_and_restores_balance(client: TestClient):
     token = login(client, "admin", "Admin@1234")
     cr = client.post("/api/clients", json={"name": "PAY-DEL-CLIENT"}, headers=auth_header(token))

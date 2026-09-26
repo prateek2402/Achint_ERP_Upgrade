@@ -3942,6 +3942,97 @@ def redistribute_payment(payment_id: str, current_user: User = Depends(get_curre
     recalculate_client_ledger(client_id, db)
     return {"success": True, "payment": response_payload}
 
+_RECEIPT_COMMITTED_ALLOC_TYPES = ("invoice", "po_advance", "po_advance_applied", "note_allocation")
+
+
+def _money2(value: Optional[float]) -> float:
+    return round(float(value or 0.0), 2)
+
+
+def _sync_receipt_amount_to_register(db: Session, payment: PaymentHistory, new_amount: float) -> None:
+    """Align a bank receipt's amount with allocations and its unallocated register.
+
+    Invoice ``paid`` is derived only from allocation rows. Lowering a receipt
+    below money already allocated, or already drawn from its unallocated
+    remainder, would leave invoices looking collected for cash the receipt no
+    longer contains. Raising it without a matching register row would hide the
+    extra cash from the unallocated applet, which spends register balances.
+    """
+    alloc_rows = db.query(PaymentAllocation).filter(PaymentAllocation.payment_id == payment.id).all()
+    alloc_total = _money2(sum(
+        float(a.amount or 0.0)
+        for a in alloc_rows
+        if a.alloc_type in _RECEIPT_COMMITTED_ALLOC_TYPES
+    ))
+    regs = (
+        db.query(UnallocatedPaymentRegister)
+        .filter(
+            UnallocatedPaymentRegister.source_payment_id == payment.id,
+            UnallocatedPaymentRegister.status.in_(["open", "used"]),
+        )
+        .order_by(UnallocatedPaymentRegister.id.asc())
+        .all()
+    )
+    consumed = _money2(sum(
+        max(0.0, float(r.amount or 0.0) - float(r.balance or 0.0))
+        for r in regs
+    ))
+    committed = _money2(alloc_total + consumed)
+    updated = _money2(new_amount)
+    if updated + 0.009 < committed:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Receipt amount ({updated:.2f}) is below the {committed:.2f} already "
+                "allocated or drawn from this receipt. Reverse or redistribute the payment first."
+            ),
+        )
+
+    target_open = _money2(max(0.0, updated - committed))
+    current_open = _money2(sum(float(r.balance or 0.0) for r in regs))
+    delta = _money2(target_open - current_open)
+    if delta > 0.009:
+        host = next(
+            (r for r in reversed(regs) if str(r.status or "") == "open" and float(r.balance or 0.0) > 0.009),
+            None,
+        )
+        if host is None and regs:
+            host = regs[-1]
+        if host is None:
+            db.add(UnallocatedPaymentRegister(
+                client_id=payment.client_id,
+                source_payment_id=payment.id,
+                created_on=payment.date or datetime.date.today(),
+                amount=target_open,
+                balance=target_open,
+                status="open",
+                note=_build_unallocated_register_note("direct_payment", payment.note),
+            ))
+        else:
+            host.amount = _money2(float(host.amount or 0.0) + delta)
+            host.balance = _money2(float(host.balance or 0.0) + delta)
+            host.status = "open"
+    elif delta < -0.009:
+        need = _money2(-delta)
+        for row in regs:
+            bal = float(row.balance or 0.0)
+            if bal <= 0.009 or need <= 0.009:
+                continue
+            take = min(bal, need)
+            row.balance = _money2(bal - take)
+            row.amount = _money2(max(0.0, float(row.amount or 0.0) - take))
+            if row.balance < 0.01:
+                row.balance = 0.0
+            if row.amount < 0.01 and row.balance < 0.01:
+                db.delete(row)
+            elif row.balance < 0.01:
+                row.status = "used"
+            else:
+                row.status = "open"
+            need = _money2(need - take)
+    payment.amount = updated
+
+
 @app.put("/api/payments/{payment_id}")
 def update_payment(payment_id: str, pay_update: PaymentUpdate, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if current_user.role != "admin":
@@ -3951,7 +4042,10 @@ def update_payment(payment_id: str, pay_update: PaymentUpdate, request: Request,
         raise HTTPException(status_code=404, detail="Payment not found")
     before_amount = float(db_pay.amount or 0.0)
     before_note = db_pay.note
-    db_pay.amount = pay_update.amount
+    if db_pay.type == "RECEIPT":
+        if float(pay_update.amount or 0.0) <= 0:
+            raise HTTPException(status_code=400, detail="Receipt amount must be greater than zero.")
+        _sync_receipt_amount_to_register(db, db_pay, float(pay_update.amount))
     db_pay.note = pay_update.note
     record_audit(
         db,
