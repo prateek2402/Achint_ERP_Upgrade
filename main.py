@@ -2456,6 +2456,64 @@ def _strip_po_advance_applied_for_po(client_id: int, po_no: str, db: Session) ->
     return len(rows)
 
 
+def _po_advance_cap_for_invoice(inv: Invoice, po: PurchaseOrder) -> float:
+    """Maximum PO advance this invoice may consume under the current terms."""
+    adv_pct = float(po.adv_pct or 0.0)
+    if adv_pct <= 0:
+        return 0.0
+    base_amt = float(inv.basic or 0.0) if (po.ret_base or "total") == "basic" else float(inv.total or 0.0)
+    return max(0.0, base_amt * (adv_pct / 100.0))
+
+
+def _trim_po_advance_applied_to_caps(db: Session, client_id: int, po: PurchaseOrder) -> None:
+    """Release po_advance_applied amounts that exceed the current per-invoice cap.
+
+    Ledger display already caps ``advance_adj``, but the allocation rows still
+    consume the pool. After a term cut or an invoice basic/total reduction,
+    that gap is stranded: it no longer reduces the invoice and it is not
+    available for later invoices. Shrink newest applications first.
+    """
+    invoices = db.query(Invoice).filter(
+        Invoice.client_id == client_id,
+        Invoice.po_id == po.id,
+        Invoice.is_note == False
+    ).all()
+    if not invoices:
+        return
+    caps = {inv.invoice_no: _po_advance_cap_for_invoice(inv, po) for inv in invoices}
+    rows = (
+        db.query(PaymentAllocation)
+        .join(PaymentHistory, PaymentAllocation.payment_id == PaymentHistory.id)
+        .filter(
+            PaymentHistory.client_id == client_id,
+            PaymentAllocation.alloc_type == "po_advance_applied",
+            PaymentAllocation.target_po_no == po.po_no,
+            PaymentAllocation.target_inv_id.in_(list(caps.keys())),
+        )
+        .all()
+    )
+    by_inv: dict[str, list[PaymentAllocation]] = defaultdict(list)
+    for row in rows:
+        by_inv[str(row.target_inv_id)].append(row)
+    for inv_no, cap in caps.items():
+        applied_rows = by_inv.get(inv_no, [])
+        applied = sum(float(r.amount or 0.0) for r in applied_rows)
+        overflow = applied - cap
+        if overflow <= 0.01:
+            continue
+        applied_rows.sort(key=lambda r: int(r.id or 0), reverse=True)
+        for row in applied_rows:
+            if overflow <= 0.01:
+                break
+            amt = float(row.amount or 0.0)
+            if amt <= overflow + 0.01:
+                overflow -= amt
+                db.delete(row)
+            else:
+                row.amount = amt - overflow
+                overflow = 0.0
+
+
 def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = None, invoice_no: Optional[str] = None):
     po_query = db.query(PurchaseOrder).filter(PurchaseOrder.client_id == client_id)
     if po_no:
@@ -2469,6 +2527,11 @@ def _auto_apply_po_advance(client_id: int, db: Session, po_no: Optional[str] = N
         if adv_pct <= 0:
             _strip_po_advance_applied_for_po(client_id, po.po_no, db)
             continue
+
+        # Return over-cap applications to the pool before building lots, including
+        # when the pool currently looks empty because every rupee is over-applied.
+        _trim_po_advance_applied_to_caps(db, client_id, po)
+        db.flush()
 
         # Build per-payment advance lots for this PO.
         added_by_payment: dict[str, float] = defaultdict(float)
