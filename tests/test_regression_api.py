@@ -722,6 +722,118 @@ def test_po_advance_auto_apply_existing_and_new_invoices(client: TestClient):
     assert inv3["advance"] == pytest.approx(40.0, abs=0.05)
 
 
+def test_shrinking_invoice_releases_over_cap_po_advance_to_later_invoice(client: TestClient):
+    """Advance already applied above the new cap must return to the pool.
+
+    Ledger math caps the displayed advance, but without trimming allocation
+    rows the extra cash stays consumed and never reaches the next invoice.
+    """
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+
+    inv_b = client.post(
+        "/api/invoices",
+        json={
+            "client_id": client_id,
+            "po_no": "PO-001",
+            "invoice_no": "INV-ADV-LATER",
+            "sub_entity": "",
+            "lr_no": "",
+            "inv_date": "2026-04-02",
+            "due_date": None,
+            "basic": 1000.0,
+            "gst": 0.0,
+            "total": 1000.0,
+            "advance_adj": 0.0,
+            "tds_ded": 0.0,
+            "retention_held": 0.0,
+            "net_payable": 0.0,
+            "paid": 0.0,
+            "balance": 0.0,
+            "is_note": False,
+            "note_type": None,
+            "note_reason": None,
+            "dispatch_items": [],
+        },
+        headers=auth_header(token),
+    )
+    assert inv_b.status_code == 200, inv_b.text
+
+    parked = client.post(
+        "/api/payments/allocate",
+        json={
+            "client_id": client_id,
+            "id": "PAY-PO-ADV-CAP",
+            "date": datetime.date.today().isoformat(),
+            "amount": 50.0,
+            "note": "po advance exactly first invoice cap",
+            "mode": "targeted",
+            "targets": [],
+            "hold_ret": False,
+            "hold_gst": False,
+            "only_gst": False,
+            "apply_adv": False,
+            "advance_only": False,
+            "fund_source": "receipt",
+            "move_to_po": "PO-001",
+            "po_no": "PO-001",
+            "clear_po_pool": False,
+            "excess_action": "park",
+        },
+        headers=auth_header(token),
+    )
+    assert parked.status_code == 200, parked.text
+
+    before = client.get("/api/invoices", headers=auth_header(token)).json()
+    first = next(i for i in before if i["id"] == "INV-001")
+    later = next(i for i in before if i["id"] == "INV-ADV-LATER")
+    # 5% of rounded basic 1000. The whole 50 is consumed by the earlier invoice.
+    assert first["advance"] == pytest.approx(50.0, abs=0.05)
+    assert later["advance"] == pytest.approx(0.0, abs=0.05)
+
+    shrunk = client.put(
+        "/api/invoices/INV-001",
+        json={
+            "client_id": client_id,
+            "po_no": "PO-001",
+            "invoice_no": "INV-001",
+            "sub_entity": "Unit-1",
+            "lr_no": "LR-11",
+            "inv_date": "2026-04-01",
+            "due_date": "2026-04-15",
+            "basic": 200.0,
+            "gst": 0.0,
+            "total": 200.0,
+            "advance_adj": 0.0,
+            "tds_ded": 0.0,
+            "retention_held": 0.0,
+            "net_payable": 0.0,
+            "paid": 0.0,
+            "balance": 0.0,
+            "is_note": False,
+            "note_type": None,
+            "note_reason": None,
+            "dispatch_items": [],
+        },
+        headers=auth_header(token),
+    )
+    assert shrunk.status_code == 200, shrunk.text
+
+    after = client.get("/api/invoices", headers=auth_header(token)).json()
+    first_after = next(i for i in after if i["id"] == "INV-001")
+    later_after = next(i for i in after if i["id"] == "INV-ADV-LATER")
+    # New cap is 5% of 200 = 10. The released 40 must land on the later invoice.
+    assert first_after["advance"] == pytest.approx(10.0, abs=0.05)
+    assert later_after["advance"] == pytest.approx(40.0, abs=0.05)
+
+    pools = client.get(f"/api/clients/{client_id}/po-advance-pools", headers=auth_header(token))
+    assert pools.status_code == 200, pools.text
+    po_entry = next(p for p in pools.json()["pools"] if p.get("po_no") == "PO-001")
+    assert po_entry["pool_remaining"] == pytest.approx(0.0, abs=0.05)
+    first_row = next(i for i in po_entry["invoices"] if i["invoice_no"] == "INV-001")
+    assert first_row["allocated_from_pool"] == pytest.approx(10.0, abs=0.05)
+
+
 def test_po_advance_pools_api_and_manual_recalculate(client: TestClient):
     token = login(client, "admin", "Admin@1234")
     client_id = create_client_po_invoice(client, token)
