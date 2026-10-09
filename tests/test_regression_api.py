@@ -446,6 +446,167 @@ def test_reverse_unallocated_applied_restores_register_for_applet(client: TestCl
     assert sum(float(r["balance"]) for r in open_after_reverse) == pytest.approx(300.0, abs=0.02)
 
 
+def _open_unallocated_balance(client: TestClient, token: str, client_id: int) -> float:
+    rows = client.get(
+        f"/api/registers/unallocated-payments?client_id={client_id}",
+        headers=auth_header(token),
+    ).json()
+    return sum(
+        float(r.get("balance") or 0)
+        for r in rows
+        if str(r.get("status") or "").lower() == "open" and float(r.get("balance") or 0) > 0
+    )
+
+
+def test_delete_invoice_returns_unallocated_pool_cash(client: TestClient):
+    """Deleting an invoice must put pool-applied cash back on the register.
+
+    Direct receipt allocations are reopened as invoice_deleted rows. Cash that
+    was later drawn from that pool (UNALLOCATED_APPLIED) used to vanish: the
+    invoice delete removed the payment log without crediting the register, so
+    the allocation applet could no longer spend it.
+    """
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "INV-DEL-POOL"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+
+    seed = client.post(
+        "/api/payments/allocate",
+        json={
+            "client_id": client_id,
+            "id": "PAY-POOL-SEED",
+            "date": datetime.date.today().isoformat(),
+            "amount": 800.0,
+            "note": "parked receipt",
+            "mode": "targeted",
+            "targets": [],
+            "hold_ret": False,
+            "hold_gst": False,
+            "only_gst": False,
+            "apply_adv": False,
+            "advance_only": False,
+            "fund_source": "receipt",
+            "move_to_po": None,
+            "po_no": None,
+            "clear_po_pool": False,
+            "excess_action": "park",
+        },
+        headers=auth_header(token),
+    )
+    assert seed.status_code == 200, seed.text
+    assert _open_unallocated_balance(client, token, client_id) == pytest.approx(800.0, abs=0.02)
+
+    def _invoice(invoice_no: str):
+        resp = client.post(
+            "/api/invoices",
+            json={
+                "client_id": client_id,
+                "po_no": "UNASSIGNED",
+                "invoice_no": invoice_no,
+                "sub_entity": "",
+                "lr_no": "",
+                "inv_date": "2026-04-02",
+                "due_date": None,
+                "basic": 1000.0,
+                "gst": 0.0,
+                "total": 1000.0,
+                "advance_adj": 0.0,
+                "tds_ded": 0.0,
+                "retention_held": 0.0,
+                "net_payable": 0.0,
+                "paid": 0.0,
+                "balance": 0.0,
+                "is_note": False,
+                "note_type": None,
+                "note_reason": None,
+                "dispatch_items": [],
+            },
+            headers=auth_header(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+    _invoice("INV-POOL-A")
+    _invoice("INV-POOL-B")
+
+    direct = client.post(
+        "/api/payments/allocate",
+        json={
+            "client_id": client_id,
+            "id": "PAY-POOL-DIRECT",
+            "date": datetime.date.today().isoformat(),
+            "amount": 200.0,
+            "note": "direct to A",
+            "mode": "targeted",
+            "targets": [{"inv_id": "INV-POOL-A", "amount": 200.0}],
+            "hold_ret": False,
+            "hold_gst": False,
+            "only_gst": False,
+            "apply_adv": False,
+            "advance_only": False,
+            "fund_source": "receipt",
+            "move_to_po": None,
+            "po_no": None,
+            "clear_po_pool": False,
+            "excess_action": "park",
+        },
+        headers=auth_header(token),
+    )
+    assert direct.status_code == 200, direct.text
+
+    applied = client.post(
+        "/api/payments/allocate",
+        json={
+            "client_id": client_id,
+            "id": "PAY-POOL-APPLY",
+            "date": datetime.date.today().isoformat(),
+            "amount": 400.0,
+            "note": "pool to A and B",
+            "mode": "targeted",
+            "targets": [
+                {"inv_id": "INV-POOL-A", "amount": 300.0},
+                {"inv_id": "INV-POOL-B", "amount": 100.0},
+            ],
+            "hold_ret": False,
+            "hold_gst": False,
+            "only_gst": False,
+            "apply_adv": False,
+            "advance_only": False,
+            "fund_source": "unallocated",
+            "move_to_po": None,
+            "po_no": None,
+            "clear_po_pool": False,
+            "excess_action": "park",
+        },
+        headers=auth_header(token),
+    )
+    assert applied.status_code == 200, applied.text
+    # 800 parked + nothing left from the 200 direct receipt; 400 drawn from the pool.
+    assert _open_unallocated_balance(client, token, client_id) == pytest.approx(400.0, abs=0.02)
+
+    deleted = client.delete("/api/invoices/INV-POOL-A", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+
+    # A held 200 direct + 300 from the pool. B still holds 100 from the pool.
+    # Open register must be 800 + 200 - 100 = 900, not 600 (the pre-fix gap).
+    assert _open_unallocated_balance(client, token, client_id) == pytest.approx(900.0, abs=0.02)
+
+    clients = client.get("/api/clients", headers=auth_header(token))
+    assert clients.status_code == 200
+    acct = next(c for c in clients.json() if c["id"] == client_id)
+    assert float(acct["excess_funds"]) == pytest.approx(900.0, abs=0.02)
+
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    assert all(i["id"] != "INV-POOL-A" for i in invs)
+    inv_b = next(i for i in invs if i["id"] == "INV-POOL-B")
+    assert float(inv_b["paid"]) == pytest.approx(100.0, abs=0.02)
+
+    payments = client.get("/api/payments", headers=auth_header(token)).json()
+    pool_pay = next(p for p in payments if p["id"] == "PAY-POOL-APPLY")
+    assert pool_pay["type"] == "UNALLOCATED_APPLIED"
+    assert [a["invId"] for a in pool_pay["allocations"]] == ["INV-POOL-B"]
+
+
 def test_delete_payment_unallocates_invoices_and_restores_balance(client: TestClient):
     token = login(client, "admin", "Admin@1234")
     cr = client.post("/api/clients", json={"name": "PAY-DEL-CLIENT"}, headers=auth_header(token))
