@@ -2939,10 +2939,17 @@ def delete_invoice(invoice_no: str, request: Request, current_user: User = Depen
                 pay_rows = db.query(PaymentHistory).filter(PaymentHistory.id.in_(pids)).all()
                 pay_map = {p.id: p for p in pay_rows}
         linked_payment_ids = {a.payment_id for a in allocs if a.payment_id}
+        # Cash already drawn from the unallocated register (UNALLOCATED_APPLIED)
+        # is not reopened by the RECEIPT branch below. Invoice delete also drops
+        # that payment log when nothing else remains, so delete_payment's restore
+        # never runs and the applet permanently loses the amount.
+        unallocated_applied_to_restore = 0.0
         for al in allocs:
             pay_obj = pay_map.get(al.payment_id)
             if pay_obj and pay_obj.type == "RECEIPT" and al.alloc_type == "invoice":
                 reopened_unallocated_by_payment[al.payment_id] += float(al.amount or 0.0)
+            elif pay_obj and pay_obj.type == "UNALLOCATED_APPLIED" and al.alloc_type == "invoice":
+                unallocated_applied_to_restore += float(al.amount or 0.0)
             db.delete(al)
         # Cleanup any auto-generated payment logs that no longer have allocations.
         for pid in linked_payment_ids:
@@ -2955,6 +2962,13 @@ def delete_invoice(invoice_no: str, request: Request, current_user: User = Depen
                 if ph:
                     db.delete(ph)
         db.flush()
+        if unallocated_applied_to_restore > 0.009:
+            _restore_unallocated_register_consumption(
+                db,
+                client_id,
+                unallocated_applied_to_restore,
+                note=f"Invoice {invoice_no} deleted; unallocated allocation returned.",
+            )
         po_no = db_inv.purchase_order.po_no if db_inv.purchase_order else "UNASSIGNED"
         for pay_id, reopened_amt in reopened_unallocated_by_payment.items():
             reopened_amt = round_inr_nearest(reopened_amt)
