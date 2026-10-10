@@ -510,6 +510,151 @@ def test_delete_payment_unallocates_invoices_and_restores_balance(client: TestCl
     assert inv_after_delete["balance"] == pytest.approx(inv_after_delete["netPayable"])
 
 
+def _invoice_payload(client_id: int, invoice_no: str, total: float = 1000.0) -> dict:
+    return {
+        "client_id": client_id,
+        "po_no": "UNASSIGNED",
+        "invoice_no": invoice_no,
+        "sub_entity": "",
+        "lr_no": "",
+        "inv_date": "2026-04-01",
+        "due_date": None,
+        "basic": total,
+        "gst": 0.0,
+        "total": total,
+        "advance_adj": 0.0,
+        "tds_ded": 0.0,
+        "retention_held": 0.0,
+        "net_payable": 0.0,
+        "paid": 0.0,
+        "balance": 0.0,
+        "is_note": False,
+        "note_type": None,
+        "note_reason": None,
+        "dispatch_items": [],
+    }
+
+
+def _allocate(client: TestClient, token: str, payload: dict):
+    resp = client.post("/api/payments/allocate", json=payload, headers=auth_header(token))
+    assert resp.status_code == 200, resp.text
+    return resp
+
+
+def test_delete_receipt_blocked_when_unallocated_pool_already_applied(client: TestClient):
+    """Deleting a receipt must not leave invoices paid by cash that receipt no longer contains."""
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "RECEIPT-POOL-DEL"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+    inv = client.post("/api/invoices", json=_invoice_payload(client_id, "INV-POOL-DEL"), headers=auth_header(token))
+    assert inv.status_code == 200, inv.text
+
+    today = datetime.date.today().isoformat()
+    _allocate(client, token, {
+        "client_id": client_id,
+        "id": "PAY-POOL-SRC",
+        "date": today,
+        "amount": 500.0,
+        "note": "bank receipt",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-POOL-DEL", "amount": 200.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "move_to_po": None,
+        "po_no": None,
+        "clear_po_pool": False,
+        "excess_action": "park",
+    })
+    _allocate(client, token, {
+        "client_id": client_id,
+        "id": "PAY-POOL-APPLY",
+        "date": today,
+        "amount": 150.0,
+        "note": "from pool",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-POOL-DEL", "amount": 150.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "unallocated",
+        "move_to_po": None,
+        "po_no": None,
+        "clear_po_pool": False,
+        "excess_action": "park",
+    })
+
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    paid_before = float(next(i for i in invs if i["id"] == "INV-POOL-DEL")["paid"])
+    assert paid_before == pytest.approx(350.0)
+
+    deleted = client.delete("/api/payments/PAY-POOL-SRC", headers=auth_header(token))
+    assert deleted.status_code == 400, deleted.text
+    assert "unallocated" in deleted.json()["detail"].lower()
+
+    redistributed = client.post("/api/payments/PAY-POOL-SRC/redistribute", headers=auth_header(token))
+    assert redistributed.status_code == 400, redistributed.text
+
+    invs_after = client.get("/api/invoices", headers=auth_header(token)).json()
+    assert float(next(i for i in invs_after if i["id"] == "INV-POOL-DEL")["paid"]) == pytest.approx(350.0)
+    payments = client.get("/api/payments", headers=auth_header(token)).json()
+    assert any(p["id"] == "PAY-POOL-SRC" for p in payments)
+    assert any(p["id"] == "PAY-POOL-APPLY" for p in payments)
+
+    # Reversing the pool draw lets the source receipt be removed, and both
+    # applications come off the invoice.
+    assert client.delete("/api/payments/PAY-POOL-APPLY", headers=auth_header(token)).status_code == 200
+    assert client.delete("/api/payments/PAY-POOL-SRC", headers=auth_header(token)).status_code == 200
+    invs_cleared = client.get("/api/invoices", headers=auth_header(token)).json()
+    assert float(next(i for i in invs_cleared if i["id"] == "INV-POOL-DEL")["paid"]) == pytest.approx(0.0)
+
+
+def test_delete_receipt_allowed_when_parked_cash_is_untouched(client: TestClient):
+    token = login(client, "admin", "Admin@1234")
+    cr = client.post("/api/clients", json={"name": "RECEIPT-POOL-FREE"}, headers=auth_header(token))
+    assert cr.status_code == 200, cr.text
+    client_id = cr.json()["id"]
+    inv = client.post("/api/invoices", json=_invoice_payload(client_id, "INV-POOL-FREE"), headers=auth_header(token))
+    assert inv.status_code == 200, inv.text
+
+    _allocate(client, token, {
+        "client_id": client_id,
+        "id": "PAY-POOL-FREE",
+        "date": datetime.date.today().isoformat(),
+        "amount": 500.0,
+        "note": "partial receipt",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-POOL-FREE", "amount": 200.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "move_to_po": None,
+        "po_no": None,
+        "clear_po_pool": False,
+        "excess_action": "park",
+    })
+
+    deleted = client.delete("/api/payments/PAY-POOL-FREE", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    row = next(i for i in invs if i["id"] == "INV-POOL-FREE")
+    assert float(row["paid"]) == pytest.approx(0.0)
+    regs = client.get(
+        f"/api/registers/unallocated-payments?client_id={client_id}",
+        headers=auth_header(token),
+    ).json()
+    assert all(r.get("source_payment_id") != "PAY-POOL-FREE" for r in regs)
+
+
 def test_po_terms_update_recalculates_client_ledger(client: TestClient):
     token = login(client, "admin", "Admin@1234")
     client_id = create_client_po_invoice(client, token)
