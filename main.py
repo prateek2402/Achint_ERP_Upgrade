@@ -3835,6 +3835,48 @@ def reverse_unallocated_advance_entry(entry_id: int, current_user: User = Depend
     recalculate_client_ledger(row.client_id, db)
     return {"success": True}
 
+def _receipt_unallocated_cash_already_applied(db: Session, payment_id: str) -> float:
+    """Pool cash from this receipt that a later payment already drew down.
+
+    Open and used register rows record that drawdown as original amount minus
+    the balance still sitting on the row. Reversed rows are write-offs of the
+    remainder and are not treated as invoice applications.
+    """
+    rows = (
+        db.query(UnallocatedPaymentRegister)
+        .filter(
+            UnallocatedPaymentRegister.source_payment_id == payment_id,
+            UnallocatedPaymentRegister.status.in_(("open", "used")),
+        )
+        .all()
+    )
+    spent = 0.0
+    for row in rows:
+        spent += max(0.0, float(row.amount or 0.0) - float(row.balance or 0.0))
+    return spent
+
+
+def _reject_if_receipt_pool_already_applied(db: Session, payment: PaymentHistory) -> None:
+    """Refuse to drop a receipt whose parked cash is already on other payments.
+
+    Direct allocations on the receipt itself are removed with it. Cash that was
+    parked on the unallocated register and later applied (or moved to a PO)
+    lives on a separate UNALLOCATED_APPLIED payment. Deleting the receipt would
+    erase the source row and leave those invoices collected with no receipt.
+    """
+    if payment.type != "RECEIPT":
+        return
+    spent = _receipt_unallocated_cash_already_applied(db, payment.id)
+    if spent > 0.009:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"This receipt still funds {spent:.2f} that was applied from the unallocated pool. "
+                "Reverse those unallocated applications before removing this receipt."
+            ),
+        )
+
+
 @app.delete("/api/payments/{payment_id}")
 def delete_payment(payment_id: str, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if current_user.role != "admin":
@@ -3842,6 +3884,7 @@ def delete_payment(payment_id: str, request: Request, current_user: User = Depen
     
     db_pay = db.query(PaymentHistory).filter(PaymentHistory.id == payment_id).first()
     if db_pay:
+        _reject_if_receipt_pool_already_applied(db, db_pay)
         client_id = db_pay.client_id
         if db_pay.type == "UNALLOCATED_APPLIED":
             _restore_unallocated_register_consumption(
@@ -3912,6 +3955,7 @@ def redistribute_payment(payment_id: str, current_user: User = Depends(get_curre
         "amount": float(db_pay.amount or 0.0),
         "note": db_pay.note or ""
     }
+    _reject_if_receipt_pool_already_applied(db, db_pay)
     client_id = db_pay.client_id
     if db_pay.type == "UNALLOCATED_APPLIED":
         _restore_unallocated_register_consumption(
