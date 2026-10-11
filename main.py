@@ -4122,6 +4122,89 @@ def manual_apply_po_advance_pool(
     return {"success": True, "pool_remaining": pool_after}
 
 
+def _release_invoice_payment_links(db: Session, invoice_no: str, client_id: int) -> None:
+    """Drop allocations aimed at this invoice and return that cash to ``client_id``.
+
+    Move-transfer clears the document's paid figure on the destination. The
+    source client's receipt and unallocated-pool rows must be reopened first,
+    otherwise that money stays attached to an invoice the source no longer
+    holds while the destination can collect it again.
+    """
+    allocs = db.query(PaymentAllocation).filter(
+        or_(
+            PaymentAllocation.target_inv_id == invoice_no,
+            PaymentAllocation.note_id == invoice_no,
+        )
+    ).all()
+    if not allocs:
+        return
+
+    pids = list({a.payment_id for a in allocs if a.payment_id})
+    pay_map = {}
+    if pids:
+        pay_map = {
+            p.id: p
+            for p in db.query(PaymentHistory).filter(PaymentHistory.id.in_(pids)).all()
+        }
+
+    reopened_receipt: dict[str, float] = defaultdict(float)
+    restore_unallocated: dict[str, float] = defaultdict(float)
+    for al in allocs:
+        pay_obj = pay_map.get(al.payment_id)
+        amt = float(al.amount or 0.0)
+        if pay_obj and pay_obj.client_id == client_id and amt > 0:
+            if pay_obj.type == "RECEIPT" and al.alloc_type == "invoice":
+                reopened_receipt[al.payment_id] += amt
+            elif pay_obj.type == "UNALLOCATED_APPLIED" and al.alloc_type == "invoice":
+                restore_unallocated[al.payment_id] += amt
+        db.delete(al)
+    db.flush()
+
+    for pid, amt in restore_unallocated.items():
+        pay_obj = pay_map.get(pid)
+        _restore_unallocated_register_consumption(
+            db,
+            client_id,
+            amt,
+            note=(pay_obj.note if pay_obj else "") or "",
+            source_payment_id=pid,
+        )
+        if pay_obj is not None:
+            # A later delete of a still-partial pool draw restores ``amount``.
+            # Shrink it so the slice already returned here is not credited twice.
+            pay_obj.amount = round_inr_nearest(max(0.0, float(pay_obj.amount or 0.0) - amt))
+
+    for pid in pids:
+        remaining = db.query(PaymentAllocation).filter(PaymentAllocation.payment_id == pid).count()
+        if remaining != 0:
+            continue
+        ph = db.query(PaymentHistory).filter(
+            PaymentHistory.id == pid,
+            PaymentHistory.type.in_(["ADVANCE_APPLIED", "NOTE_APPLIED", "UNALLOCATED_APPLIED"]),
+        ).first()
+        if ph:
+            db.delete(ph)
+    db.flush()
+
+    for pay_id, reopened_amt in reopened_receipt.items():
+        reopened_amt = round_inr_nearest(reopened_amt)
+        if reopened_amt <= 0:
+            continue
+        db.add(UnallocatedPaymentRegister(
+            client_id=client_id,
+            source_payment_id=pay_id,
+            created_on=datetime.date.today(),
+            amount=float(reopened_amt),
+            balance=float(reopened_amt),
+            status="open",
+            note=_build_unallocated_register_note(
+                "invoice_transferred",
+                f"Invoice {invoice_no} moved; allocation reopened.",
+                invoice_no=invoice_no,
+            ),
+        ))
+
+
 @app.post("/api/invoices/{invoice_no:path}/transfer")
 def transfer_invoice(invoice_no: str, req: TransferRequest, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if current_user.role != "admin":
@@ -4161,6 +4244,8 @@ def transfer_invoice(invoice_no: str, req: TransferRequest, request: Request, cu
         db.commit()
         recalculate_client_ledger(req.new_client_id, db)
     elif req.action == "move":
+        if req.new_client_id != old_client_id:
+            _release_invoice_payment_links(db, db_inv.invoice_no, old_client_id)
         db_inv.client_id = req.new_client_id
         db_inv.po_id = None
         db_inv.advance_adj = 0
