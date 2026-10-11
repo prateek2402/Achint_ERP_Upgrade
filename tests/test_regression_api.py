@@ -1040,6 +1040,334 @@ def test_note_issue_trims_target_invoice_id_for_linking(client: TestClient):
     assert cn["noteTargetInvoice"] == "INV-001"
 
 
+def _invoice_payload(client_id: int, invoice_no: str, total: float, inv_date: str = "2026-04-01") -> dict:
+    return {
+        "client_id": client_id,
+        "po_no": "UNASSIGNED",
+        "invoice_no": invoice_no,
+        "sub_entity": "",
+        "lr_no": "",
+        "inv_date": inv_date,
+        "due_date": None,
+        "basic": total,
+        "gst": 0.0,
+        "total": total,
+        "advance_adj": 0.0,
+        "tds_ded": 0.0,
+        "retention_held": 0.0,
+        "net_payable": 0.0,
+        "paid": 0.0,
+        "balance": 0.0,
+        "is_note": False,
+        "note_type": None,
+        "note_reason": None,
+        "dispatch_items": [],
+    }
+
+
+def _open_register_balance(client: TestClient, token: str, client_id: int) -> float:
+    rows = client.get(
+        f"/api/registers/unallocated-payments?client_id={client_id}",
+        headers=auth_header(token),
+    ).json()
+    return sum(float(r.get("balance") or 0.0) for r in rows if r.get("status") == "open")
+
+
+def test_move_invoice_returns_receipt_cash_to_source_client(client: TestClient):
+    """Moving a partly paid invoice must not leave that cash stuck on the source client.
+
+    The transfer dialog promises allocations are wiped so ledger pools stay intact.
+    The destination invoice is unpaid (it can be collected again). The source
+    receipt must therefore reopen the moved slice into the unallocated register.
+    """
+    token = login(client, "admin", "Admin@1234")
+    src = client.post("/api/clients", json={"name": "MOVE-SRC"}, headers=auth_header(token))
+    dst = client.post("/api/clients", json={"name": "MOVE-DST"}, headers=auth_header(token))
+    assert src.status_code == 200 and dst.status_code == 200
+    src_id = src.json()["id"]
+    dst_id = dst.json()["id"]
+
+    for inv_no, day in (("INV-MOVE", "2026-04-01"), ("INV-STAY", "2026-04-02")):
+        created = client.post(
+            "/api/invoices",
+            json=_invoice_payload(src_id, inv_no, 1000.0, day),
+            headers=auth_header(token),
+        )
+        assert created.status_code == 200, created.text
+
+    paid = client.post("/api/payments/allocate", json={
+        "client_id": src_id,
+        "id": "PAY-MOVE-SPLIT",
+        "date": "2026-04-03",
+        "amount": 1000.0,
+        "note": "split receipt",
+        "mode": "targeted",
+        "targets": [
+            {"inv_id": "INV-MOVE", "amount": 600.0},
+            {"inv_id": "INV-STAY", "amount": 400.0},
+        ],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert paid.status_code == 200, paid.text
+
+    moved = client.post("/api/invoices/INV-MOVE/transfer", json={
+        "new_client_id": dst_id,
+        "action": "move",
+    }, headers=auth_header(token))
+    assert moved.status_code == 200, moved.text
+
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    moved_inv = next(i for i in invs if i["id"] == "INV-MOVE")
+    stayed = next(i for i in invs if i["id"] == "INV-STAY")
+    assert moved_inv["client_id"] == dst_id
+    assert float(moved_inv["paid"]) == pytest.approx(0.0, abs=0.01)
+    assert float(moved_inv["balance"]) == pytest.approx(1000.0, abs=0.01)
+    assert stayed["client_id"] == src_id
+    assert float(stayed["paid"]) == pytest.approx(400.0, abs=0.01)
+    assert float(stayed["balance"]) == pytest.approx(600.0, abs=0.01)
+
+    payments = client.get("/api/payments", headers=auth_header(token)).json()
+    receipt = next(p for p in payments if p["id"] == "PAY-MOVE-SPLIT")
+    assert not any(a.get("invId") == "INV-MOVE" for a in receipt.get("allocations", []))
+    assert any(a.get("invId") == "INV-STAY" and float(a.get("amount") or 0) == pytest.approx(400.0, abs=0.01) for a in receipt.get("allocations", []))
+
+    assert _open_register_balance(client, token, src_id) == pytest.approx(600.0, abs=0.02)
+    src_row = next(c for c in client.get("/api/clients", headers=auth_header(token)).json() if c["id"] == src_id)
+    assert float(src_row["excess_funds"]) == pytest.approx(600.0, abs=0.02)
+
+    reuse = client.post("/api/payments/allocate", json={
+        "client_id": src_id,
+        "id": "PAY-MOVE-REUSE",
+        "date": "2026-04-04",
+        "amount": 600.0,
+        "note": "reuse freed cash",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-STAY", "amount": 600.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "unallocated",
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert reuse.status_code == 200, reuse.text
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    stayed = next(i for i in invs if i["id"] == "INV-STAY")
+    assert float(stayed["paid"]) == pytest.approx(1000.0, abs=0.01)
+    assert float(stayed["balance"]) == pytest.approx(0.0, abs=0.01)
+
+
+def test_move_invoice_returns_unallocated_pool_cash(client: TestClient):
+    """Cash drawn from the unallocated pool must come back when its invoice is moved."""
+    token = login(client, "admin", "Admin@1234")
+    src = client.post("/api/clients", json={"name": "MOVE-POOL-SRC"}, headers=auth_header(token))
+    dst = client.post("/api/clients", json={"name": "MOVE-POOL-DST"}, headers=auth_header(token))
+    assert src.status_code == 200 and dst.status_code == 200
+    src_id = src.json()["id"]
+    dst_id = dst.json()["id"]
+
+    created = client.post(
+        "/api/invoices",
+        json=_invoice_payload(src_id, "INV-POOL-MOVE", 1000.0),
+        headers=auth_header(token),
+    )
+    assert created.status_code == 200, created.text
+
+    seed = client.post("/api/payments/allocate", json={
+        "client_id": src_id,
+        "id": "PAY-POOL-SEED",
+        "date": "2026-04-03",
+        "amount": 500.0,
+        "note": "seed",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-POOL-MOVE", "amount": 200.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert seed.status_code == 200, seed.text
+
+    applied = client.post("/api/payments/allocate", json={
+        "client_id": src_id,
+        "id": "PAY-POOL-APPLY",
+        "date": "2026-04-04",
+        "amount": 150.0,
+        "note": "from pool",
+        "mode": "targeted",
+        "targets": [{"inv_id": "INV-POOL-MOVE", "amount": 150.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "unallocated",
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert applied.status_code == 200, applied.text
+    assert _open_register_balance(client, token, src_id) == pytest.approx(150.0, abs=0.02)
+
+    moved = client.post("/api/invoices/INV-POOL-MOVE/transfer", json={
+        "new_client_id": dst_id,
+        "action": "move",
+    }, headers=auth_header(token))
+    assert moved.status_code == 200, moved.text
+
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    moved_inv = next(i for i in invs if i["id"] == "INV-POOL-MOVE")
+    assert moved_inv["client_id"] == dst_id
+    assert float(moved_inv["paid"]) == pytest.approx(0.0, abs=0.01)
+    assert float(moved_inv["balance"]) == pytest.approx(1000.0, abs=0.01)
+
+    payments = client.get("/api/payments", headers=auth_header(token)).json()
+    assert all(
+        a.get("invId") != "INV-POOL-MOVE"
+        for p in payments
+        for a in p.get("allocations", [])
+    )
+    assert _open_register_balance(client, token, src_id) == pytest.approx(500.0, abs=0.02)
+    src_row = next(c for c in client.get("/api/clients", headers=auth_header(token)).json() if c["id"] == src_id)
+    assert float(src_row["excess_funds"]) == pytest.approx(500.0, abs=0.02)
+
+
+def test_move_one_invoice_does_not_double_credit_shared_pool_draw(client: TestClient):
+    """A pool payment split across two invoices must return only the moved slice."""
+    token = login(client, "admin", "Admin@1234")
+    src = client.post("/api/clients", json={"name": "MOVE-SPLIT-SRC"}, headers=auth_header(token))
+    dst = client.post("/api/clients", json={"name": "MOVE-SPLIT-DST"}, headers=auth_header(token))
+    assert src.status_code == 200 and dst.status_code == 200
+    src_id = src.json()["id"]
+    dst_id = dst.json()["id"]
+
+    seed = client.post("/api/payments/allocate", json={
+        "client_id": src_id,
+        "id": "PAY-SPLIT-SEED",
+        "date": "2026-04-01",
+        "amount": 500.0,
+        "note": "parked before invoices",
+        "mode": "targeted",
+        "targets": [],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert seed.status_code == 200, seed.text
+
+    for inv_no in ("INV-SPLIT-A", "INV-SPLIT-B"):
+        created = client.post(
+            "/api/invoices",
+            json=_invoice_payload(src_id, inv_no, 1000.0),
+            headers=auth_header(token),
+        )
+        assert created.status_code == 200, created.text
+
+    applied = client.post("/api/payments/allocate", json={
+        "client_id": src_id,
+        "id": "PAY-SPLIT-APPLY",
+        "date": "2026-04-02",
+        "amount": 300.0,
+        "note": "split pool",
+        "mode": "targeted",
+        "targets": [
+            {"inv_id": "INV-SPLIT-A", "amount": 200.0},
+            {"inv_id": "INV-SPLIT-B", "amount": 100.0},
+        ],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "unallocated",
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert applied.status_code == 200, applied.text
+
+    moved = client.post("/api/invoices/INV-SPLIT-A/transfer", json={
+        "new_client_id": dst_id,
+        "action": "move",
+    }, headers=auth_header(token))
+    assert moved.status_code == 200, moved.text
+    assert _open_register_balance(client, token, src_id) == pytest.approx(400.0, abs=0.02)
+
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    stayed = next(i for i in invs if i["id"] == "INV-SPLIT-B")
+    assert float(stayed["paid"]) == pytest.approx(100.0, abs=0.01)
+
+    deleted = client.delete("/api/payments/PAY-SPLIT-APPLY", headers=auth_header(token))
+    assert deleted.status_code == 200, deleted.text
+    assert _open_register_balance(client, token, src_id) == pytest.approx(500.0, abs=0.02)
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    stayed = next(i for i in invs if i["id"] == "INV-SPLIT-B")
+    assert float(stayed["paid"]) == pytest.approx(0.0, abs=0.01)
+
+
+def test_move_invoice_returns_po_advance_to_source_pool(client: TestClient):
+    """PO advance applied to a moved invoice must return to that PO's pool."""
+    token = login(client, "admin", "Admin@1234")
+    src_id = create_client_po_invoice(client, token)
+    dst = client.post("/api/clients", json={"name": "MOVE-ADV-DST"}, headers=auth_header(token))
+    assert dst.status_code == 200, dst.text
+    dst_id = dst.json()["id"]
+
+    parked = client.post("/api/payments/allocate", json={
+        "client_id": src_id,
+        "id": "PAY-MOVE-ADV",
+        "date": "2026-04-05",
+        "amount": 200.0,
+        "note": "park advance",
+        "mode": "targeted",
+        "targets": [],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "move_to_po": "PO-001",
+        "po_no": "PO-001",
+        "clear_po_pool": False,
+        "excess_action": "park",
+    }, headers=auth_header(token))
+    assert parked.status_code == 200, parked.text
+
+    before = client.get(f"/api/clients/{src_id}/po-advance-pools", headers=auth_header(token)).json()
+    pool_before = next(p for p in before["pools"] if p["po_no"] == "PO-001")
+    assert float(pool_before["pool_remaining"]) < 200.0 - 0.01
+
+    moved = client.post("/api/invoices/INV-001/transfer", json={
+        "new_client_id": dst_id,
+        "action": "move",
+    }, headers=auth_header(token))
+    assert moved.status_code == 200, moved.text
+
+    after = client.get(f"/api/clients/{src_id}/po-advance-pools", headers=auth_header(token)).json()
+    pool_after = next(p for p in after["pools"] if p["po_no"] == "PO-001")
+    assert float(pool_after["pool_remaining"]) == pytest.approx(200.0, abs=0.02)
+
+    invs = client.get("/api/invoices", headers=auth_header(token)).json()
+    moved_inv = next(i for i in invs if i["id"] == "INV-001")
+    assert moved_inv["client_id"] == dst_id
+    assert float(moved_inv["advance"] or 0) == pytest.approx(0.0, abs=0.01)
+    payments = client.get("/api/payments", headers=auth_header(token)).json()
+    receipt = next(p for p in payments if p["id"] == "PAY-MOVE-ADV")
+    assert not any(a.get("type") == "po_advance_applied" and a.get("invId") == "INV-001" for a in receipt.get("allocations", []))
+    assert any(a.get("type") == "po_advance" and a.get("po") == "PO-001" for a in receipt.get("allocations", []))
+
+
 def test_dispatch_column_rename_merges_duplicates(client: TestClient):
     token = login(client, "admin", "Admin@1234")
     client_id = create_client_po_invoice(client, token)
