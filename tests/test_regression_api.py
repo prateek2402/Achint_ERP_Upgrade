@@ -1014,6 +1014,118 @@ def test_debit_note_api_balance_reflects_payments(client: TestClient):
     assert float(after["balance"]) == pytest.approx(60.0, abs=0.01)
 
 
+def _invoice_editor_payload(client_id: int, invoice_no: str, **overrides):
+    payload = {
+        "client_id": client_id,
+        "po_no": "PO-001",
+        "invoice_no": invoice_no,
+        "sub_entity": "Unit-1",
+        "lr_no": "LR-EDIT",
+        "inv_date": "2026-04-20",
+        "due_date": "2026-05-01",
+        "basic": 500.0,
+        "gst": 90.0,
+        "total": 590.0,
+        "advance_adj": 0.0,
+        "tds_ded": 0.0,
+        "retention_held": 0.0,
+        "net_payable": 590.0,
+        "paid": 0.0,
+        "balance": 590.0,
+        "is_note": False,
+        "note_type": None,
+        "note_reason": None,
+        "dispatch_items": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_invoice_editor_cannot_convert_paid_note_into_invoice(client: TestClient):
+    """The ledger pencil posts a normal invoice body. That must not turn a CN
+    into a receivable or clear a DN's note type so collected cash falls off the row.
+    """
+    token = login(client, "admin", "Admin@1234")
+    client_id = create_client_po_invoice(client, token)
+    headers = auth_header(token)
+    client.post(f"/api/clients/{client_id}/ledger/recalculate", headers=headers)
+
+    dn = client.post("/api/notes/issue", json={
+        "client_id": client_id,
+        "note_no": "DN-EDIT-001",
+        "date": "2026-04-13",
+        "note_type": "DN",
+        "amount": 100.0,
+        "reason": "extra freight",
+        "target_invoice_id": "INV-001",
+    }, headers=headers)
+    assert dn.status_code == 200, dn.text
+
+    alloc = client.post("/api/payments/allocate", json={
+        "client_id": client_id,
+        "id": "PAY-DN-EDIT-001",
+        "date": "2026-04-14",
+        "amount": 40.0,
+        "note": "partial on DN",
+        "mode": "targeted",
+        "targets": [{"inv_id": "DN-EDIT-001", "amount": 40.0}],
+        "hold_ret": False,
+        "hold_gst": False,
+        "only_gst": False,
+        "apply_adv": False,
+        "advance_only": False,
+        "fund_source": "receipt",
+        "excess_action": "park",
+    }, headers=headers)
+    assert alloc.status_code == 200, alloc.text
+
+    cn = client.post("/api/notes/issue", json={
+        "client_id": client_id,
+        "note_no": "CN-EDIT-001",
+        "date": "2026-04-15",
+        "note_type": "CN",
+        "amount": 50.0,
+        "reason": "quality discount",
+        "target_invoice_id": "INV-001",
+    }, headers=headers)
+    assert cn.status_code == 200, cn.text
+
+    # Same shape the invoice form sends: is_note false, note_type omitted, basic+GST total.
+    blocked_dn = client.put(
+        "/api/invoices/DN-EDIT-001",
+        json=_invoice_editor_payload(client_id, "DN-EDIT-001"),
+        headers=headers,
+    )
+    assert blocked_dn.status_code == 400, blocked_dn.text
+
+    blocked_cn = client.put(
+        "/api/invoices/CN-EDIT-001",
+        json=_invoice_editor_payload(client_id, "CN-EDIT-001"),
+        headers=headers,
+    )
+    assert blocked_cn.status_code == 400, blocked_cn.text
+
+    # Dispatch bill-value edits clamp totals at zero, which would erase a credit note.
+    blocked_total = client.patch(
+        "/api/invoices/CN-EDIT-001/inline",
+        json={"total": 0},
+        headers=headers,
+    )
+    assert blocked_total.status_code == 400, blocked_total.text
+
+    invs = client.get("/api/invoices", headers=headers).json()
+    dn_row = next(i for i in invs if i["id"] == "DN-EDIT-001")
+    cn_row = next(i for i in invs if i["id"] == "CN-EDIT-001")
+    assert dn_row["isNote"] is True
+    assert dn_row["noteType"] == "DN"
+    assert float(dn_row["paid"]) == pytest.approx(40.0, abs=0.01)
+    assert float(dn_row["balance"]) == pytest.approx(60.0, abs=0.01)
+    assert cn_row["isNote"] is True
+    assert cn_row["noteType"] == "CN"
+    assert float(cn_row["balance"]) == pytest.approx(-50.0, abs=0.01)
+    assert float(cn_row["total"]) == pytest.approx(-50.0, abs=0.01)
+
+
 def test_note_issue_trims_target_invoice_id_for_linking(client: TestClient):
     token = login(client, "admin", "Admin@1234")
     client_id = create_client_po_invoice(client, token)

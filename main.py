@@ -2826,6 +2826,16 @@ def update_invoice(invoice_no: str, inv: InvoiceUpdate, request: Request, curren
     db_inv = db.query(Invoice).filter(Invoice.invoice_no == invoice_no).first()
     if not db_inv:
         raise HTTPException(status_code=404, detail="Invoice not found.")
+    # The ledger editor always posts is_note=false and a basic+GST total, and it
+    # omits note_type. Applying that payload to a CN/DN converts the note into a
+    # normal invoice (a credit becomes a new receivable) and, when note_type is
+    # cleared, recalculate stops applying receipt allocations so a paid debit
+    # note looks unpaid and can be collected again.
+    if db_inv.is_note:
+        raise HTTPException(
+            status_code=400,
+            detail="Credit and debit notes cannot be edited as invoices. Delete the note and issue a new one.",
+        )
     before = {
         "basic": float(db_inv.basic or 0.0),
         "total": float(db_inv.total or 0.0),
@@ -3140,6 +3150,11 @@ def update_invoice_inline_fields(invoice_no: str, payload: InvoiceInlineUpdate, 
     if payload.lr_no is not None:
         inv.lr_no = (payload.lr_no or "").strip()
     if payload.total is not None:
+        if inv.is_note:
+            raise HTTPException(
+                status_code=400,
+                detail="Credit and debit note amounts cannot be changed from the invoice editor. Delete the note and issue a new one.",
+            )
         inv.total = max(0.0, round_inr_nearest(payload.total))
         # Keep payable consistency when total is edited inline.
         inv.net_payable = max(
