@@ -4500,6 +4500,14 @@
             if (currentClient === 'ALL') return;
             const inv = appData[currentClient].invoices.find(i => i.id === id);
             if (!inv) return;
+            if (inv.isNote) {
+                const kind = String(inv.noteType || '').toUpperCase() === 'CN' ? 'Credit note' : 'Debit note';
+                customApplet({
+                    title: "Notes cannot be edited here",
+                    message: `${kind} ${inv.id} is a separate ledger entry. The invoice form would replace it with a normal invoice and drop its balance, including any amount already received. Delete the note and issue a new one if it needs to change.`
+                });
+                return;
+            }
 
             let poVal = inv.poNo === 'UNASSIGNED' ? '' : inv.poNo;
             document.getElementById('poNo').value = poVal;
@@ -7509,6 +7517,15 @@
 
             const invNo = document.getElementById('invNo').value.trim();
             if (!invNo) return await customApplet({ title: "Validation Error", message: "Invoice No. is mandatory." });
+            if (isEditing) {
+                const existing = (appData[currentClient].invoices || []).find(i => i.id === invNo);
+                if (existing && existing.isNote) {
+                    return await customApplet({
+                        title: "Notes cannot be edited here",
+                        message: "Credit and debit notes cannot be saved from the invoice form. Delete the note and issue a new one if it needs to change."
+                    });
+                }
+            }
 
             const subEntity = document.getElementById('subEntity').value.trim();
             const lrNo = document.getElementById('lrNo').value.trim();
@@ -7570,7 +7587,7 @@
                     body: JSON.stringify(payload)
                 });
                 const saveResult = await response.json().catch(() => ({}));
-                if (!response.ok) throw new Error("Database update failed");
+                if (!response.ok) throw new Error(saveResult.detail || "Database update failed");
 
                 if (isEditing) {
                     cancelEdit();
@@ -7589,7 +7606,7 @@
 
             } catch (error) {
                 console.error("Save error:", error);
-                await customApplet({ title: "Database Error", message: "Failed to save invoice." });
+                await customApplet({ title: "Database Error", message: error.message || "Failed to save invoice." });
             }
         }
 
